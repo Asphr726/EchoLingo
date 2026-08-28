@@ -86,9 +86,12 @@ class CloudQwenMtBackend:
         self, request: TranslationRequest, *, model: str, stream: bool
     ) -> dict:
         terms = request.terms or self.glossary
-        memory = list(request.translation_memory)
+        memory = [
+            {"source": item.source, "target": item.target}
+            for item in request.translation_memory
+        ]
         memory.extend(
-            type("Memory", (), {"source": item.source, "target": item.target})
+            {"source": item.source, "target": item.target}
             for item in request.context
             if item.target
         )
@@ -101,18 +104,18 @@ class CloudQwenMtBackend:
                 {"source": item.source, "target": item.target} for item in terms
             ]
         if memory:
-            options["tm_list"] = [
-                {"source": item.source, "target": item.target} for item in memory[-10:]
-            ]
+            options["tm_list"] = memory[-10:]
         if request.domain:
             options["domains"] = request.domain
-        return {
+        payload = {
             "model": model,
             "messages": [{"role": "user", "content": request.source_text}],
             "translation_options": options,
             "stream": stream,
-            "stream_options": {"include_usage": True} if stream else None,
         }
+        if stream:
+            payload["stream_options"] = {"include_usage": True}
+        return payload
 
     @staticmethod
     def _raise_status(response: httpx.Response) -> None:
@@ -243,4 +246,3 @@ class CloudQwenMtBackend:
     async def close(self) -> None:
         if self._owns_client:
             await self.client.aclose()
-

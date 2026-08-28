@@ -81,6 +81,7 @@ class CloudQwenAsrBackend:
         self._connected = asyncio.Event()
         self._session_finished = asyncio.Event()
         self._closing = False
+        self._finishing = False
         self._send_lock = asyncio.Lock()
         self._pending: list[AsrAudioChunk] = []
         self._pending_samples = 0
@@ -134,26 +135,26 @@ class CloudQwenAsrBackend:
             if status in {401, 403}:
                 raise AuthenticationError("Cloud Qwen ASR authentication failed") from error
             raise
+        transcription: dict[str, object] = {}
+        if self.config.language != "auto":
+            transcription["language"] = self.config.language
+        if self.config.context:
+            transcription["corpus"] = {"text": self.config.context}
+        session: dict[str, object] = {
+            "modalities": ["text"],
+            "input_audio_format": "pcm",
+            "sample_rate": 16_000,
+            "turn_detection": {
+                "type": "server_vad",
+                "threshold": self.turn_detection_threshold,
+                "silence_duration_ms": self.silence_duration_ms,
+            },
+        }
+        if transcription:
+            session["input_audio_transcription"] = transcription
         await self._websocket.send(
             json.dumps(
-                {
-                    "event_id": str(uuid.uuid4()),
-                    "type": "session.update",
-                    "session": {
-                        "modalities": ["text"],
-                        "input_audio_format": "pcm",
-                        "sample_rate": 16_000,
-                        "input_audio_transcription": {
-                            "language": None if self.config.language == "auto" else self.config.language,
-                            "corpus": {"text": self.config.context},
-                        },
-                        "turn_detection": {
-                            "type": "server_vad",
-                            "threshold": self.turn_detection_threshold,
-                            "silence_duration_ms": self.silence_duration_ms,
-                        },
-                    },
-                }
+                {"event_id": str(uuid.uuid4()), "type": "session.update", "session": session}
             )
         )
         self._connected.set()
@@ -242,7 +243,7 @@ class CloudQwenAsrBackend:
             streaming_mode=self.streaming_mode,
             committed_text=committed,
             unstable_text=unstable,
-            audio_cursor_ms=self.ring._chunks[-1].end_ms if self.ring._chunks else 0.0,
+            audio_cursor_ms=self.ring.latest_end_ms,
             locality=BackendLocality.CLOUD,
             provider="qwen_cloud",
             model=self.model,
@@ -330,7 +331,7 @@ class CloudQwenAsrBackend:
 
     async def _reconnect(self, cause: Exception) -> bool:
         self._connected.clear()
-        if self._closing:
+        if self._closing or self._finishing:
             return False
         for delay in self.retry.delays():
             await asyncio.sleep(delay)
@@ -383,6 +384,7 @@ class CloudQwenAsrBackend:
                 await self._send_chunks(self._pending)
             self._pending.clear()
             self._pending_samples = 0
+        self._finishing = True
         if self._connected.is_set():
             await self._send_json({"event_id": str(uuid.uuid4()), "type": "session.finish"})
             try:
@@ -397,6 +399,7 @@ class CloudQwenAsrBackend:
                         recoverable=True,
                     )
                 )
+        self._closing = True
         await self._events.end()
 
     async def close(self) -> None:
@@ -407,4 +410,3 @@ class CloudQwenAsrBackend:
         if self._websocket is not None:
             await self._websocket.close()
         await self._events.end()
-
