@@ -1,0 +1,86 @@
+[audio]
+capture_rate_hz = 48000
+asr_rate_hz = 16000
+frame_ms = 10
+channels = 0 # 0 means all available input channels
+queue_frames = 500
+
+[frontend]
+profile = "webrtc_ns_agc"
+noise_suppression_level = 1
+agc_max_gain_db = 30.0
+agc_headroom_db = 5.0
+agc_max_gain_change_db_per_second = 6.0
+agc_max_output_noise_level_dbfs = -50.0
+
+[vad]
+backend = "auto"
+start_probability = 0.25
+continue_probability = 0.15
+min_speech_ms = 100
+min_silence_ms = 1000
+hard_gate = false
+
+[inference]
+mode = "auto"
+
+[privacy]
+audio_upload_allowed = false
+transcript_upload_allowed = false
+
+[asr]
+provider = "none"
+language = "en"
+sample_rate_hz = 16000
+local_profile = "lightweight"
+
+[asr.qwen_local]
+quality_model = "qwen3-asr-1.7b"
+lightweight_model = "qwen3-asr-0.6b"
+url = "ws://127.0.0.1:8000/asr"
+
+[asr.qwen_cloud]
+region = "singapore"
+model = "qwen3-asr-flash-realtime"
+workspace_id_env = "DASHSCOPE_WORKSPACE_ID"
+api_key_env = "DASHSCOPE_API_KEY"
+turn_detection_threshold = 0.0
+silence_duration_ms = 1200
+send_batch_ms = 100
+
+[translation]
+provider = "none"
+source_language = "auto"
+target_language = "zh"
+context_segments = 5
+
+[translation.qwen_cloud]
+region = "singapore"
+interactive_model = "qwen-mt-flash"
+quality_model = "qwen-mt-plus"
+workspace_id_env = "DASHSCOPE_WORKSPACE_ID"
+api_key_env = "DASHSCOPE_API_KEY"
+
+[translation.hymt_local]
+quality_model = "tencent/Hy-MT2-7B"
+lightweight_model = "tencent/Hy-MT2-1.8B"
+base_url = "http://127.0.0.1:8010/v1"
+api_key_env = "ECHOLINGO_LOCAL_MT_API_KEY"
+
+[runtime]
+calibration_seconds = 8.0
+asr_rtf_max = 0.8
+asr_first_token_ms_max = 2000.0
+translation_tokens_per_second_min = 12.0
+translation_first_delta_ms_max = 1000.0
+memory_headroom_fraction = 0.2
+
+[network]
+audio_ring_buffer_ms = 30000
+replay_overlap_ms = 500
+reconnect_budget_s = 30.0
+backoff_initial_s = 0.25
+backoff_max_s = 4.0
+
+[cost]
+meter_cloud_usage = true

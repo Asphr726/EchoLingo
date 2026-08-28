@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "echolingo"
+version = "0.1.0"
+description = "Far-field multilingual streaming ASR spike"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = "Apache-2.0"
+dependencies = [
+  "numpy>=2.2,<3",
+  "rich>=14,<15",
+  "websockets>=15,<17",
+  "httpx>=0.28,<0.29",
+  "platformdirs>=4.3,<5",
+]
+
+[project.optional-dependencies]
+audio = [
+  "onnxruntime==1.29.0",
+  "pywebrtc-audio==0.1.0",
+  "samplerate==0.2.4",
+  "sounddevice==0.5.5",
+  "soundfile>=0.13,<0.14",
+]
+dev = [
+  "pytest>=8.4,<10",
+  "pytest-asyncio>=1.2,<2",
+]
+qwen = [
+  "whisperlivekit[qwen3-streaming]==0.2.24",
+]
+whisper = [
+  "whisperlivekit[mlx-whisper]==0.2.24; platform_system == 'Darwin' and platform_machine == 'arm64'",
+  "whisperlivekit[faster-whisper]==0.2.24; platform_system != 'Darwin' or platform_machine != 'arm64'",
+]
+
+[project.scripts]
+echolingo = "echolingo.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+asyncio_mode = "auto"

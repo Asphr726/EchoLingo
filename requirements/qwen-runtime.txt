@@ -1,0 +1,6 @@
+# Install the project first with: python -m pip install -e '.[audio,dev]'
+# Heavy model runtime is intentionally kept out of the core environment path.
+whisperlivekit[qwen3-streaming]==0.2.24
+qwen-asr==0.0.6
+transformers==4.57.6
+
