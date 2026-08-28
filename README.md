@@ -30,6 +30,7 @@ echolingo listen --language en --frontend webrtc_ns_agc
 echolingo replay input.wav --language en --frontend raw
 echolingo benchmark input.wav --duration-limit 60
 echolingo farfield-proxy input.wav --distances 0.3 3 5 8 --snr-db 10
+echolingo --config configs/lecture.toml doctor --json
 ```
 
 `listen` and `replay` always collect metrics. Add `--asr wlk --wlk-url
@@ -39,8 +40,14 @@ speech gating in its own pipeline; the WLK server must likewise be started
 with VAC/VAD/pause gating disabled.
 
 Run artifacts are written under `runs/spike1/<timestamp>/`: resolved config,
-JSONL metrics/transcript events, environment metadata, and optionally raw and
-enhanced WAV audio.
+JSONL metrics/transcript/translation events, environment metadata, and
+optionally raw and enhanced WAV audio.
+
+Cloud credentials are read only from `DASHSCOPE_API_KEY` and
+`DASHSCOPE_WORKSPACE_ID`. Cloud ASR additionally requires explicit
+`privacy.audio_upload_allowed=true`; Cloud translation requires
+`privacy.transcript_upload_allowed=true`. Credential values are never written
+to resolved configuration or logs.
 
 `farfield-proxy` uses a selected OpenSLR SLR26 room impulse response, distance
 attenuation, and deterministic HVAC-like noise. Its manifest deliberately says

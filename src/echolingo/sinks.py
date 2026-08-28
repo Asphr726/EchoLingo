@@ -74,6 +74,7 @@ class RunRecorder:
             "numpy", "onnxruntime", "pywebrtc-audio", "samplerate",
             "sounddevice", "whisperlivekit", "qwen-asr", "torch",
             "transformers",
+            "httpx", "websockets", "platformdirs",
         ]
         versions: dict[str, str | None] = {}
         for name in names:

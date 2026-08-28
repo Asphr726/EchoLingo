@@ -15,9 +15,14 @@ Status checked on 2026-08-28. Versions are pinned in `pyproject.toml`.
 | DeepFilterNet 0.5.6 | optional offline enhancement A/B | MIT/Apache-2.0 | language-agnostic DSP | Upstream active, but Python/native release is old; not a live default |
 | Google FLEURS | four-language smoke data | CC-BY-4.0 | zh/en/ja/ko and more | Fixed revision/sample IDs and attribution required |
 | OpenSLR SLR26 | simulated RIR data | Apache-2.0 | language-agnostic | 16 kHz simulated room impulse responses |
+| Hy-MT2 1.8B/7B | local translation | Apache-2.0 | includes zh/en/ja/ko | Active 2026 release; Transformers/vLLM/SGLang/GGUF routes, runtime benchmark required |
+| Alibaba Cloud Qwen3 ASR realtime | cloud ASR service | commercial service terms | includes zh/en/ja/ko | Dedicated Beijing/Singapore WebSocket endpoints; provider-managed runtime |
+| Alibaba Cloud Qwen-MT Flash/Plus | cloud translation service | commercial service terms | 92 languages | Flash supports incremental output; Plus is quality/cumulative output |
+| HTTPX 0.28 | async Qwen-MT/local service transport | BSD-3-Clause | n/a | Cross-platform Python HTTP/SSE client |
 
 Primary sources: QwenLM/Qwen3-ASR, ufal/SimulStreaming,
 QuentinFuxa/WhisperLiveKit, spatialaudio/python-sounddevice,
 strands-labs/pywebrtc-audio, snakers4/silero-vad,
 tuxu/python-samplerate, Rikorose/DeepFilterNet, Google FLEURS, and OpenSLR.
-
+Cloud protocol sources: Alibaba Cloud Model Studio realtime ASR interaction
+flow and Qwen-MT API reference. Hy-MT2 source: Tencent's official model cards.

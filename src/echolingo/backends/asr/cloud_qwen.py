@@ -93,9 +93,13 @@ class CloudQwenAsrBackend:
         self._last_speech_end_ms = 0.0
         self._sent_times: deque[tuple[float, int]] = deque(maxlen=100)
         self._rtts: deque[float] = deque(maxlen=20)
+        self._session_started_ns: int | None = None
+        self._audio_origin_ns: int | None = None
+        self._first_text_seen = False
         self.cloud_roundtrip_latency_ms: float | None = None
         self.network_jitter_ms: float | None = None
         self.reconnect_count = 0
+        self.cloud_audio_uploaded_ms = 0.0
         self.lag_ms: float | None = None
 
     @property
@@ -167,6 +171,7 @@ class CloudQwenAsrBackend:
                 "DASHSCOPE_API_KEY and DASHSCOPE_WORKSPACE_ID are required"
             )
         self.config = config
+        self._session_started_ns = time.monotonic_ns()
         await self._connect()
         self._receiver = asyncio.create_task(self._receive_loop())
 
@@ -191,9 +196,12 @@ class CloudQwenAsrBackend:
                 "audio": base64.b64encode(pcm).decode("ascii"),
             }
         )
+        self.cloud_audio_uploaded_ms += len(pcm) / 2 / 16_000 * 1000.0
         self._sent_times.append((chunks[-1].end_ms, time.monotonic_ns()))
 
     async def push_audio(self, chunk: AsrAudioChunk) -> None:
+        if self._audio_origin_ns is None:
+            self._audio_origin_ns = chunk.sent_at_monotonic_ns - int(chunk.start_ms * 1_000_000)
         self.ring.append(chunk)
         async with self._send_lock:
             self._pending.append(chunk)
@@ -219,6 +227,11 @@ class CloudQwenAsrBackend:
         self._rtts.append(value)
         if len(self._rtts) >= 2:
             self.network_jitter_ms = statistics.pstdev(self._rtts)
+        if self._audio_origin_ns is not None:
+            self.lag_ms = max(
+                0.0,
+                (now - self._audio_origin_ns) / 1_000_000.0 - self.ring.latest_end_ms,
+            )
 
     def _canonical(
         self,
@@ -231,6 +244,20 @@ class CloudQwenAsrBackend:
         error_code: str | None = None,
         recoverable: bool | None = None,
     ) -> CanonicalTranscriptEvent:
+        now_ns = time.monotonic_ns()
+        first_token_latency_ms = None
+        if kind in {TranscriptKind.PARTIAL, TranscriptKind.STABLE} and not self._first_text_seen:
+            self._first_text_seen = True
+            if self._session_started_ns is not None:
+                first_token_latency_ms = (now_ns - self._session_started_ns) / 1_000_000.0
+        commit_latency_ms = None
+        if (
+            kind == TranscriptKind.FINAL
+            and self._audio_origin_ns is not None
+            and self._last_speech_end_ms
+        ):
+            audio_end_ns = self._audio_origin_ns + int(self._last_speech_end_ms * 1_000_000)
+            commit_latency_ms = max(0.0, (now_ns - audio_end_ns) / 1_000_000.0)
         return CanonicalTranscriptEvent(
             session_id=self.config.session_id,
             event_id=str(uuid.uuid4()),
@@ -238,7 +265,7 @@ class CloudQwenAsrBackend:
             kind=kind,
             text=text,
             language=self.config.language,
-            emitted_at_monotonic_ns=time.monotonic_ns(),
+            emitted_at_monotonic_ns=now_ns,
             backend=self.name,
             streaming_mode=self.streaming_mode,
             committed_text=committed,
@@ -251,6 +278,8 @@ class CloudQwenAsrBackend:
             provider_event_id=provider_event.get("event_id"),
             error_code=error_code,
             recoverable=recoverable,
+            first_token_latency_ms=first_token_latency_ms,
+            commit_latency_ms=commit_latency_ms,
         )
 
     async def _handle_message(self, message: dict) -> None:

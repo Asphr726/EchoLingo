@@ -95,6 +95,7 @@ async def test_cloud_qwen_asr_maps_provider_events_and_uses_lecture_vad() -> Non
         TranscriptKind.FINAL,
     ]
     assert events[-1].text == "hello world"
+    assert events[0].first_token_latency_ms is not None
     assert "ap-southeast-1" in captured["url"]
     session = websocket.sent[0]["session"]
     assert session["turn_detection"] == {
@@ -103,6 +104,7 @@ async def test_cloud_qwen_asr_maps_provider_events_and_uses_lecture_vad() -> Non
         "silence_duration_ms": 1200,
     }
     assert any(message["type"] == "input_audio_buffer.append" for message in websocket.sent)
+    assert backend.cloud_audio_uploaded_ms == 100
 
 
 async def test_cloud_qwen_asr_reconnects_and_replays_local_ring() -> None:

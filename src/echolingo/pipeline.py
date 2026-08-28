@@ -99,6 +99,9 @@ class FarFieldPipeline:
             reconnect_count=int(getattr(self.asr, "reconnect_count", 0)),
             buffered_audio_ms=float(getattr(self.asr, "buffered_audio_ms", 0.0)),
             dropped_audio_ms=float(getattr(self.asr, "dropped_audio_ms", 0.0)),
+            cloud_audio_uploaded_ms=float(
+                getattr(self.asr, "cloud_audio_uploaded_ms", 0.0)
+            ),
         )
         self._previous_speech = speech
         return ProcessedFrame(frame, enhanced, asr_samples, metrics)

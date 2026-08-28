@@ -100,6 +100,7 @@ class AudioMetrics:
     reconnect_count: int = 0
     buffered_audio_ms: float = 0.0
     dropped_audio_ms: float = 0.0
+    cloud_audio_uploaded_ms: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
