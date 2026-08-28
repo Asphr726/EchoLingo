@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .models import ProcessedFrame, TranscriptEvent
+from .models import CanonicalTranslationEvent, ProcessedFrame, TranscriptEvent
 
 
 class RunRecorder:
@@ -32,6 +32,7 @@ class RunRecorder:
         self.run_dir.mkdir(parents=True)
         self._metrics = (self.run_dir / "metrics.jsonl").open("w", encoding="utf-8")
         self._transcripts = (self.run_dir / "transcripts.jsonl").open("w", encoding="utf-8")
+        self._translations = (self.run_dir / "translations.jsonl").open("w", encoding="utf-8")
         (self.run_dir / "config.resolved.json").write_text(
             json.dumps(resolved_config, indent=2, sort_keys=True), encoding="utf-8"
         )
@@ -104,11 +105,20 @@ class RunRecorder:
         if self.console:
             print(f"\n[{event.kind.value}/{event.revision_id}] {event.text}")
 
+    def write_translation(self, event: CanonicalTranslationEvent) -> None:
+        self._translations.write(
+            json.dumps(event.to_dict(), ensure_ascii=False, sort_keys=True) + "\n"
+        )
+        self._translations.flush()
+        if self.console:
+            print(f"\n[translation:{event.kind.value}/{event.revision_id}] {event.text}")
+
     def close(self) -> None:
         if self.console:
             print()
         self._metrics.close()
         self._transcripts.close()
+        self._translations.close()
         if self._raw_wav is not None:
             self._raw_wav.close()
             self._enhanced_wav.close()

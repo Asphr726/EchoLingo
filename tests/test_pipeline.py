@@ -6,8 +6,11 @@ import asyncio
 import numpy as np
 
 from echolingo.models import AudioFrame, BackendDescriptor, BackendLocality
+from echolingo.backends.asr.mock import MockStreamingAsrBackend
+from echolingo.backends.translation.mock import MockTranslationBackend
 from echolingo.pipeline import FarFieldPipeline, rms_dbfs
 from echolingo.streaming import LectureSpeechPolicy
+from echolingo.translation import StreamingTranslationCoordinator
 
 
 class FakeSource:
@@ -73,6 +76,7 @@ class MemorySink:
     def __init__(self) -> None:
         self.frames = []
         self.events = []
+        self.translations = []
         self.closed = False
 
     def write_frame(self, frame):
@@ -80,6 +84,9 @@ class MemorySink:
 
     def write_transcript(self, event):
         self.events.append(event)
+
+    def write_translation(self, event):
+        self.translations.append(event)
 
     def close(self):
         self.closed = True
@@ -107,3 +114,24 @@ async def test_vad_false_never_gates_asr_audio() -> None:
 def test_rms_dbfs_known_values() -> None:
     assert rms_dbfs(np.ones(10, dtype=np.float32)) == 0.0
     assert rms_dbfs(np.zeros(10, dtype=np.float32)) == -120.0
+
+
+async def test_pipeline_runs_translation_without_coupling_audio_to_backend_type() -> None:
+    frame = AudioFrame(0, 0, 0.0, 16_000, 1, np.ones((160, 1), dtype=np.float32), "test")
+    source = FakeSource([frame])
+    sink = MemorySink()
+    translation = StreamingTranslationCoordinator(
+        MockTranslationBackend(), source_lang="en", target_lang="zh"
+    )
+    pipeline = FarFieldPipeline(
+        IdentityProcessor(),
+        AlwaysSilentVad(),
+        LectureSpeechPolicy(),
+        MockStreamingAsrBackend(),
+        sink,
+        16_000,
+        translation,
+    )
+    await pipeline.run(source)
+    assert sink.translations
+    assert sink.translations[-1].committed_text == "译:mock 1"

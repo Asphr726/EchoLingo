@@ -15,6 +15,7 @@ from .pipeline import FarFieldPipeline
 from .runtime import BackendFactory, CapabilityDetector, RuntimeRouter
 from .sinks import RunRecorder
 from .streaming import LectureSpeechPolicy
+from .translation import StreamingTranslationCoordinator
 from .vad import make_vad
 
 
@@ -34,6 +35,10 @@ def _add_pipeline_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mode", choices=["auto", "local", "cloud"])
     parser.add_argument("--allow-audio-upload", action="store_true")
     parser.add_argument("--allow-transcript-upload", action="store_true")
+    parser.add_argument(
+        "--translation", choices=["none", "hymt_local", "qwen_cloud", "mock"]
+    )
+    parser.add_argument("--target-language", choices=["en", "zh", "ja", "ko"])
     parser.add_argument("--run-root", type=Path, default=Path("runs/spike1"))
     parser.add_argument("--duration-limit", type=float)
     parser.add_argument("--no-record-audio", action="store_true")
@@ -107,6 +112,10 @@ def _resolve_config(args):
         config.privacy.audio_upload_allowed = True
     if getattr(args, "allow_transcript_upload", False):
         config.privacy.transcript_upload_allowed = True
+    if getattr(args, "translation", None):
+        config.translation.provider = args.translation
+    if getattr(args, "target_language", None):
+        config.translation.target_language = args.target_language
     config.validate()
     return config
 
@@ -130,6 +139,15 @@ async def _run_source(source, args) -> Path:
         config.vad.min_silence_ms,
     )
     asr = BackendFactory(config).asr(route.asr_provider)
+    translation_backend = BackendFactory(config).translation(route.translation_provider)
+    translation = None
+    if translation_backend is not None:
+        translation = StreamingTranslationCoordinator(
+            translation_backend,
+            source_lang=config.asr.language,
+            target_lang=config.translation.target_language,
+            context_segments=config.translation.context_segments,
+        )
     resolved = config.redacted_dict()
     resolved["route"] = asdict(route)
     resolved["route"]["status"] = route.status.value
@@ -141,7 +159,9 @@ async def _run_source(source, args) -> Path:
         record_audio=not args.no_record_audio,
         console=not args.quiet,
     )
-    pipeline = FarFieldPipeline(processor, vad, policy, asr, sink, source.sample_rate_hz)
+    pipeline = FarFieldPipeline(
+        processor, vad, policy, asr, sink, source.sample_rate_hz, translation
+    )
     await pipeline.run(source, args.duration_limit)
     return sink.run_dir
 

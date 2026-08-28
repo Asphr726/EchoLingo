@@ -3,6 +3,7 @@ import numpy as np
 from echolingo.backends.asr.mock import MockStreamingAsrBackend
 from echolingo.models import AsrAudioChunk, AsrSessionConfig, TranscriptKind
 from echolingo.networking import AudioRingBuffer, RetryPolicy
+from echolingo.runtime.calibration import CalibrationStore, InferenceCalibrator
 
 
 def chunk(sequence: int, start: float, end: float) -> AsrAudioChunk:
@@ -32,3 +33,16 @@ def test_retry_policy_is_bounded() -> None:
     delays = list(RetryPolicy(initial_s=0.25, maximum_s=1, budget_s=2).delays(lambda: 1.0))
     assert delays == [0.25, 0.5, 1]
     assert sum(delays) <= 2
+
+
+async def test_calibrator_measures_and_persists_mock_asr(tmp_path) -> None:
+    store = CalibrationStore(tmp_path / "calibration.json")
+    record = await InferenceCalibrator(store).calibrate_asr(
+        MockStreamingAsrBackend(),
+        [chunk(index, index * 10, (index + 1) * 10) for index in range(10)],
+        language="en",
+        runtime_fingerprint="test-runtime",
+    )
+    assert record.asr_realtime_factor is not None
+    assert record.first_token_latency_ms is not None
+    assert store.find("mock", "scripted", "test-runtime") is not None

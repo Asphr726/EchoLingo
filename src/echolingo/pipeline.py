@@ -34,8 +34,13 @@ class NoiseFloorTracker:
         return self.value_dbfs
 
 
+_TRANSLATION_END = object()
+
+
 class FarFieldPipeline:
-    def __init__(self, processor, vad, policy, asr, sink, input_rate_hz: int) -> None:
+    def __init__(
+        self, processor, vad, policy, asr, sink, input_rate_hz: int, translation=None
+    ) -> None:
         self.processor = processor
         self.vad = vad
         self.policy = policy
@@ -46,6 +51,8 @@ class FarFieldPipeline:
         self.captured_audio_ms = 0.0
         self.asr_audio_ms = 0.0
         self._previous_speech = False
+        self.translation = translation
+        self._translation_queue: asyncio.Queue[object] = asyncio.Queue()
 
     def process_frame(
         self, frame: AudioFrame, queue_depth: int = 0, dropped_frames: int = 0
@@ -97,12 +104,29 @@ class FarFieldPipeline:
         return ProcessedFrame(frame, enhanced, asr_samples, metrics)
 
     async def _consume_events(self) -> None:
-        async for event in self.asr.events():
-            self.sink.write_transcript(event)
+        try:
+            async for event in self.asr.events():
+                self.sink.write_transcript(event)
+                if self.translation is not None:
+                    await self._translation_queue.put(event)
+        finally:
+            if self.translation is not None:
+                await self._translation_queue.put(_TRANSLATION_END)
+
+    async def _consume_translations(self) -> None:
+        while True:
+            event = await self._translation_queue.get()
+            if event is _TRANSLATION_END:
+                return
+            async for translated in self.translation.handle(event):
+                self.sink.write_translation(translated)
 
     async def run(self, source, duration_limit_s: float | None = None) -> None:
         consumer: asyncio.Task[None] | None = None
+        translation_consumer: asyncio.Task[None] | None = None
         try:
+            if self.translation is not None:
+                await self.translation.start()
             await self.asr.start_session(
                 AsrSessionConfig(
                     session_id=str(uuid.uuid4()),
@@ -111,6 +135,8 @@ class FarFieldPipeline:
                 )
             )
             consumer = asyncio.create_task(self._consume_events())
+            if self.translation is not None:
+                translation_consumer = asyncio.create_task(self._consume_translations())
             for frame in source.frames():
                 processed = self.process_frame(
                     frame,
@@ -148,10 +174,17 @@ class FarFieldPipeline:
             await self.asr.finish_session()
             if consumer is not None:
                 await consumer
+            if translation_consumer is not None:
+                await translation_consumer
         finally:
             if consumer is not None and not consumer.done():
                 consumer.cancel()
                 await asyncio.gather(consumer, return_exceptions=True)
+            if translation_consumer is not None and not translation_consumer.done():
+                translation_consumer.cancel()
+                await asyncio.gather(translation_consumer, return_exceptions=True)
             source.close()
             await self.asr.close()
+            if self.translation is not None and hasattr(self.translation.backend, "close"):
+                await self.translation.backend.close()
             self.sink.close()
