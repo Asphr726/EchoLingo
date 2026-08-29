@@ -336,18 +336,35 @@ impl AppCore {
 
     pub fn update_metrics(&mut self, metrics: LiveMetrics) {
         self.snapshot.metrics = metrics;
-        self.bump();
     }
     pub fn update_live_transcript(&mut self, live: LiveTranscript) {
         self.snapshot.live = live;
-        self.bump();
     }
     pub fn commit_segment(&mut self, segment: SegmentSummary) {
-        self.snapshot.previous_segments.push(segment);
+        if let Some(existing) = self
+            .snapshot
+            .previous_segments
+            .iter_mut()
+            .find(|existing| existing.ordinal == segment.ordinal)
+        {
+            *existing = segment;
+        } else {
+            self.snapshot.previous_segments.push(segment);
+        }
         if self.snapshot.previous_segments.len() > 200 {
             self.snapshot.previous_segments.remove(0);
         }
-        self.bump();
+    }
+
+    pub fn update_segment_translation(&mut self, ordinal: u32, translation: String) {
+        if let Some(segment) = self
+            .snapshot
+            .previous_segments
+            .iter_mut()
+            .find(|segment| segment.ordinal == ordinal)
+        {
+            segment.translation = translation;
+        }
     }
 
     fn check_revision(&self, expected: u64) -> Result<(), SessionError> {
@@ -469,6 +486,32 @@ mod tests {
         let paused = core.audio_device_removed("USB microphone").unwrap();
         assert_eq!(paused.phase, SessionPhase::Paused);
         assert_eq!(paused.session_id, listening.session_id);
+    }
+
+    #[test]
+    fn live_events_do_not_invalidate_lifecycle_commands() {
+        let mut core = AppCore::default();
+        core.start(StartSessionRequest::default()).unwrap();
+        let listening = core.mark_listening(connected_route()).unwrap();
+        let revision = listening.state_revision;
+        core.update_metrics(LiveMetrics {
+            input_rms_dbfs: Some(-31.4),
+            ..LiveMetrics::default()
+        });
+        core.update_live_transcript(LiveTranscript {
+            original_unstable: "live words".into(),
+            ..LiveTranscript::default()
+        });
+        core.commit_segment(SegmentSummary {
+            id: Uuid::new_v4(),
+            ordinal: 1,
+            start_ms: 0.0,
+            end_ms: 500.0,
+            original: "stable words".into(),
+            translation: String::new(),
+        });
+        assert_eq!(core.snapshot().state_revision, revision);
+        assert_eq!(core.pause(revision).unwrap().phase, SessionPhase::Paused);
     }
 
     #[test]

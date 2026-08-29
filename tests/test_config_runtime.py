@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from echolingo.config import AppConfig, load_config
-from echolingo.errors import ConfigurationError
+from echolingo.errors import BackendUnavailableError, ConfigurationError
 from echolingo.models import DeploymentStatus
 from echolingo.runtime.calibration import CalibrationRecord, hardware_fingerprint
 from echolingo.runtime.capabilities import RuntimeCapabilities
@@ -22,6 +22,7 @@ def capabilities(**overrides) -> RuntimeCapabilities:
         apple_silicon=True,
         metal_available=True,
         local_models={"qwen3-asr-0.6b": True, "hymt2-1.8b": False},
+        local_services={"qwen_asr": True, "hymt": False},
         network_available=False,
         credentials={},
     )
@@ -67,6 +68,16 @@ def test_router_uses_calibrated_local_model_without_cuda() -> None:
     assert route.status == DeploymentStatus.LOCAL
 
 
+def test_router_does_not_treat_model_weights_as_a_running_backend() -> None:
+    config = AppConfig()
+    config.translation.provider = "none"
+    with pytest.raises(BackendUnavailableError, match="no ASR backend"):
+        RuntimeRouter(
+            config,
+            capabilities(local_services={"qwen_asr": False}),
+        ).select()
+
+
 def test_router_can_select_hybrid_independently() -> None:
     config = AppConfig()
     config.asr.provider = "qwen_local"
@@ -81,4 +92,3 @@ def test_router_can_select_hybrid_independently() -> None:
     assert route.asr_provider == "qwen_local"
     assert route.translation_provider == "qwen_cloud"
     assert route.status == DeploymentStatus.HYBRID
-

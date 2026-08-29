@@ -1,6 +1,6 @@
 use app_core::{
     AppCore, AudioSourceKind as AppAudioSourceKind, BackendHealth, LiveMetrics, RouteStatus,
-    SessionSnapshot, StartSessionRequest,
+    SegmentSummary, SessionPhase, SessionSnapshot, StartSessionRequest,
 };
 use audio_core::{
     list_audio_devices as enumerate_audio_devices, start_microphone, start_system_audio,
@@ -10,6 +10,9 @@ use inference_ipc::{
     AudioFrameHeader, InferenceSupervisor, SidecarCommand, SidecarEvent, SidecarLaunchConfig,
     UiEventEnvelope, UiEventKind, PROTOCOL_VERSION,
 };
+#[cfg(target_os = "macos")]
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,12 +25,40 @@ use transcript_store::{
 
 const UI_EVENT_CHANNEL: &str = "echolingo://ui-event";
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CaptionDisplayMode {
+    Both,
+    Original,
+    Translation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CaptionPreferences {
+    display: CaptionDisplayMode,
+    recent_segments: u8,
+    font_size_px: u16,
+    opacity: f64,
+}
+
+impl Default for CaptionPreferences {
+    fn default() -> Self {
+        Self {
+            display: CaptionDisplayMode::Both,
+            recent_segments: 2,
+            font_size_px: 30,
+            opacity: 0.92,
+        }
+    }
+}
+
 struct RuntimeState {
     core: Mutex<AppCore>,
     event_sequence: AtomicU64,
     audio_sequence: AtomicU64,
     audio: tokio::sync::Mutex<Option<AudioCaptureSession>>,
     shutting_down: std::sync::atomic::AtomicBool,
+    caption_preferences: Mutex<CaptionPreferences>,
     supervisor: Arc<InferenceSupervisor>,
     store: tokio::sync::OnceCell<TranscriptStore>,
 }
@@ -41,6 +72,7 @@ impl Default for RuntimeState {
             audio_sequence: AtomicU64::new(0),
             audio: tokio::sync::Mutex::new(None),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
+            caption_preferences: Mutex::new(CaptionPreferences::default()),
             supervisor: InferenceSupervisor::new(SidecarLaunchConfig::development(project_root)),
             store: tokio::sync::OnceCell::new(),
         }
@@ -296,6 +328,31 @@ fn forward_sidecar_events(app: AppHandle) {
                             .as_u64()
                             .unwrap_or(live.source_revision_id);
                         core.update_live_transcript(live);
+                        if matches!(event_kind, "stable" | "final") {
+                            let revision = payload["revision_id"].as_u64().unwrap_or(0) as u32;
+                            let end_ms = payload["end_ms"]
+                                .as_f64()
+                                .or_else(|| payload["audio_cursor_ms"].as_f64())
+                                .unwrap_or(0.0);
+                            let start_ms = payload["start_ms"]
+                                .as_f64()
+                                .unwrap_or((end_ms - 1_000.0).max(0.0));
+                            core.commit_segment(SegmentSummary {
+                                id: payload["event_id"]
+                                    .as_str()
+                                    .and_then(|value| value.parse().ok())
+                                    .unwrap_or_else(uuid::Uuid::new_v4),
+                                ordinal: revision,
+                                start_ms,
+                                end_ms,
+                                original: payload["committed_text"]
+                                    .as_str()
+                                    .filter(|value| !value.is_empty())
+                                    .unwrap_or(payload["text"].as_str().unwrap_or_default())
+                                    .to_string(),
+                                translation: String::new(),
+                            });
+                        }
                     }
                     (UiEventKind::TranscriptRevision, payload)
                 }
@@ -312,6 +369,16 @@ fn forward_sidecar_events(app: AppHandle) {
                             .as_u64()
                             .unwrap_or(live.translation_revision_id);
                         core.update_live_transcript(live);
+                        if let Some(source_revision) = payload["source_revision_id"].as_u64() {
+                            let text = payload["committed_text"]
+                                .as_str()
+                                .filter(|value| !value.is_empty())
+                                .or_else(|| payload["editable_text"].as_str())
+                                .or_else(|| payload["text"].as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            core.update_segment_translation(source_revision as u32, text);
+                        }
                     }
                     (UiEventKind::TranslationRevision, payload)
                 }
@@ -505,11 +572,150 @@ async fn stop_audio_capture(state: &RuntimeState) -> Result<(), String> {
     Ok(())
 }
 
+async fn shutdown_application(app: &AppHandle) {
+    let state = app.state::<RuntimeState>();
+    let snapshot = state.snapshot().ok();
+    let active = snapshot.as_ref().is_some_and(|snapshot| {
+        matches!(
+            snapshot.phase,
+            SessionPhase::Starting | SessionPhase::Listening | SessionPhase::Paused
+        )
+    });
+    if active {
+        if let Some(snapshot) = snapshot {
+            if let Ok(stopping) = state
+                .core
+                .lock()
+                .map_err(|_| ())
+                .and_then(|mut core| core.begin_stop(snapshot.state_revision).map_err(|_| ()))
+            {
+                let _ = state.emit_snapshot(app, &stopping);
+                let _ = stop_audio_capture(&state).await;
+                if let Some(session_id) = stopping.session_id {
+                    let mut receiver = state.supervisor.subscribe();
+                    if state
+                        .supervisor
+                        .send_command(SidecarCommand::FinishSession { session_id })
+                        .await
+                        .is_ok()
+                    {
+                        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                            while let Ok(event) = receiver.recv().await {
+                                if matches!(event, SidecarEvent::SessionFinished { session_id: finished } if finished == session_id) {
+                                    break;
+                                }
+                            }
+                        })
+                        .await;
+                    }
+                    if let Ok(completed) = state
+                        .core
+                        .lock()
+                        .map_err(|_| ())
+                        .and_then(|mut core| core.complete().map_err(|_| ()))
+                    {
+                        if let Ok(store) = state.store() {
+                            let _ = store.complete_session(session_id, &[]).await;
+                        }
+                        let _ = state.emit_snapshot(app, &completed);
+                    }
+                }
+            }
+        }
+    } else {
+        let _ = stop_audio_capture(&state).await;
+    }
+    state.supervisor.shutdown().await;
+}
+
 #[tauri::command]
 async fn list_audio_devices() -> Result<Vec<AudioDevice>, String> {
     tauri::async_runtime::spawn_blocking(enumerate_audio_devices)
         .await
         .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn get_caption_preferences(state: State<'_, RuntimeState>) -> Result<CaptionPreferences, String> {
+    state
+        .caption_preferences
+        .lock()
+        .map_err(|_| "caption preferences lock poisoned".to_string())
+        .map(|preferences| preferences.clone())
+}
+
+#[tauri::command]
+fn update_caption_preferences(
+    app: AppHandle,
+    state: State<'_, RuntimeState>,
+    preferences: CaptionPreferences,
+) -> Result<CaptionPreferences, String> {
+    if !(18..=72).contains(&preferences.font_size_px) {
+        return Err("caption font size must be between 18 and 72 px".into());
+    }
+    if !(0.35..=1.0).contains(&preferences.opacity) || !preferences.opacity.is_finite() {
+        return Err("caption opacity must be between 0.35 and 1.0".into());
+    }
+    if !(1..=3).contains(&preferences.recent_segments) {
+        return Err("caption recent segments must be between 1 and 3".into());
+    }
+    *state
+        .caption_preferences
+        .lock()
+        .map_err(|_| "caption preferences lock poisoned".to_string())? = preferences.clone();
+    state.emit_event(
+        &app,
+        state.snapshot()?.session_id,
+        UiEventKind::SettingsChanged,
+        serde_json::to_value(&preferences).map_err(|error| error.to_string())?,
+    )?;
+    if let Some(window) = app.get_webview_window("caption") {
+        apply_caption_opacity(&window, preferences.opacity)?;
+    }
+    Ok(preferences)
+}
+
+#[cfg(target_os = "macos")]
+fn apply_caption_opacity(window: &tauri::WebviewWindow, opacity: f64) -> Result<(), String> {
+    let handle = window.window_handle().map_err(|error| error.to_string())?;
+    match handle.as_raw() {
+        RawWindowHandle::AppKit(handle) => {
+            unsafe {
+                audio_core::set_macos_window_opacity(handle.ns_view.as_ptr(), opacity);
+            }
+            Ok(())
+        }
+        _ => Err("caption window does not expose an AppKit handle".into()),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn apply_caption_opacity(_window: &tauri::WebviewWindow, _opacity: f64) -> Result<(), String> {
+    Ok(())
+}
+
+#[tauri::command]
+fn show_caption_window(app: AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("caption")
+        .ok_or_else(|| "caption window is unavailable".to_string())?;
+    let opacity = app
+        .state::<RuntimeState>()
+        .caption_preferences
+        .lock()
+        .map_err(|_| "caption preferences lock poisoned".to_string())?
+        .opacity;
+    apply_caption_opacity(&window, opacity)?;
+    window.show().map_err(|error| error.to_string())?;
+    window.set_focus().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn hide_caption_window(app: AppHandle) -> Result<(), String> {
+    app.get_webview_window("caption")
+        .ok_or_else(|| "caption window is unavailable".to_string())?
+        .hide()
         .map_err(|error| error.to_string())
 }
 
@@ -806,6 +1012,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_app_snapshot,
             list_audio_devices,
+            get_caption_preferences,
+            update_caption_preferences,
+            show_caption_window,
+            hide_caption_window,
             start_session,
             pause_session,
             resume_session,
@@ -844,9 +1054,7 @@ pub fn run() {
                 api.prevent_close();
                 let window = window.clone();
                 tauri::async_runtime::spawn(async move {
-                    let state = window.state::<RuntimeState>();
-                    let _ = stop_audio_capture(&state).await;
-                    state.supervisor.shutdown().await;
+                    shutdown_application(window.app_handle()).await;
                     let _ = window.destroy();
                 });
             }

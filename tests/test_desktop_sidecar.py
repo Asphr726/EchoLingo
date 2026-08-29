@@ -8,7 +8,7 @@ import pytest
 
 from echolingo.service.protocol import ProtocolError, decode_audio_packet
 from echolingo.service.server import SidecarConnection
-from echolingo.service.session import DesktopInferenceSession
+from echolingo.service.session import DesktopInferenceSession, resolve_frontend_profile
 
 
 def audio_packet(samples: np.ndarray, *, sequence: int = 1, rate: int = 16_000) -> bytes:
@@ -45,6 +45,20 @@ def test_audio_packet_rejects_bad_version_and_size() -> None:
         decode_audio_packet(bytes(invalid_version))
     with pytest.raises(ProtocolError, match="length mismatch"):
         decode_audio_packet(audio_packet(np.ones(8, dtype=np.float32))[:-1])
+
+
+@pytest.mark.parametrize(
+    ("product_profile", "frontend_profile"),
+    [
+        ("lecture", "webrtc_ns_agc"),
+        ("conversation", "webrtc_agc"),
+        ("raw", "raw"),
+    ],
+)
+def test_desktop_audio_profiles_map_to_frontend_implementations(
+    product_profile: str, frontend_profile: str
+) -> None:
+    assert resolve_frontend_profile(product_profile) == frontend_profile
 
 
 async def test_sidecar_mock_session_emits_canonical_metrics_and_transcript() -> None:

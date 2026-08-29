@@ -383,6 +383,16 @@ pub fn start_system_audio() -> Result<AudioCaptureSession, AudioError> {
     Err(AudioError::SystemAudioUnsupported)
 }
 
+/// Apply public AppKit `NSWindow.alphaValue` without enabling Tauri's private
+/// transparent-window API. `ns_view` must come from an AppKit raw window handle.
+#[cfg(target_os = "macos")]
+pub unsafe fn set_macos_window_opacity(ns_view: *mut std::ffi::c_void, opacity: f64) {
+    extern "C" {
+        fn el_macos_set_window_opacity(ns_view: *mut std::ffi::c_void, opacity: f64);
+    }
+    el_macos_set_window_opacity(ns_view, opacity);
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;

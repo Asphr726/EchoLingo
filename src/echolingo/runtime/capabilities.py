@@ -81,6 +81,14 @@ class CapabilityDetector:
     def _metal(apple_silicon: bool) -> bool:
         if not apple_silicon:
             return False
+
+    @staticmethod
+    def _loopback_service(port: int) -> bool:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.08):
+                return True
+        except OSError:
+            return False
         try:
             import torch
 
@@ -103,6 +111,10 @@ class CapabilityDetector:
             "dashscope_workspace_id": bool(self.environ.get("DASHSCOPE_WORKSPACE_ID")),
             "openai_api_key": bool(self.environ.get("OPENAI_API_KEY")),
         }
+        services = {
+            "qwen_asr": self._loopback_service(8000),
+            "hymt": self._loopback_service(8010),
+        }
         return RuntimeCapabilities(
             os=platform.system(),
             architecture=machine,
@@ -114,10 +126,10 @@ class CapabilityDetector:
             apple_silicon=apple_silicon,
             metal_available=self._metal(apple_silicon),
             local_models=models,
+            local_services=services,
             network_available=self.network_probe(),
             credentials=credentials,
         )
 
     def report_json(self) -> str:
         return json.dumps(self.detect().to_dict(), indent=2, sort_keys=True)
-

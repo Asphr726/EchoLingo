@@ -17,6 +17,16 @@ from .protocol import AudioPacket
 from .sink import SidecarEventSink
 
 
+def resolve_frontend_profile(product_profile: str) -> str:
+    """Map stable desktop vocabulary to replaceable DSP implementations."""
+    aliases = {
+        "lecture": "webrtc_ns_agc",
+        "conversation": "webrtc_agc",
+        "raw": "raw",
+    }
+    return aliases.get(product_profile, product_profile)
+
+
 class DesktopInferenceSession:
     def __init__(
         self,
@@ -40,7 +50,9 @@ class DesktopInferenceSession:
         config.translation.target_language = payload.get(
             "target_language", config.translation.target_language
         )
-        config.frontend.profile = payload.get("audio_profile", config.frontend.profile)
+        config.frontend.profile = resolve_frontend_profile(
+            payload.get("audio_profile", config.frontend.profile)
+        )
         config.inference.mode = payload.get("inference_mode", config.inference.mode)
         config.asr.provider = payload.get("asr_provider", config.asr.provider)
         config.translation.provider = payload.get(

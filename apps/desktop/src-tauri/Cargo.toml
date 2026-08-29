@@ -21,5 +21,6 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2", features = [] }
+raw-window-handle = "0.6"
 tokio.workspace = true
 uuid.workspace = true

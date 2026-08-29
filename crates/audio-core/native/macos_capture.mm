@@ -285,3 +285,13 @@ extern "C" void el_macos_system_audio_destroy(void *handle) {
     CFBridgingRelease(handle);
   }
 }
+
+extern "C" void el_macos_set_window_opacity(void *nsView, double opacity) {
+  if (nsView == nullptr) {
+    return;
+  }
+  NSView *view = (__bridge NSView *)nsView;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    view.window.alphaValue = std::clamp(opacity, 0.35, 1.0);
+  });
+}

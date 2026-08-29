@@ -60,18 +60,27 @@ class RuntimeRouter:
             and self.capabilities.credentials.get("dashscope_workspace_id")
         )
 
+    def _local_service_available(self, service: str) -> bool:
+        return bool(self.capabilities.local_services.get(service))
+
     def _select_asr(self, reasons: list[str]) -> tuple[str, bool]:
         requested = self.config.asr.provider
         if requested != "auto":
             if requested == "qwen_cloud" and not self._cloud_available():
                 raise BackendUnavailableError("Cloud Qwen ASR credentials or network unavailable")
+            if requested == "qwen_local" and not self._local_service_available("qwen_asr"):
+                raise BackendUnavailableError("Local Qwen ASR runtime service is unavailable")
             return requested, False
 
         quality = "qwen3-asr-1.7b"
         light = "qwen3-asr-0.6b"
         if self.config.inference.mode != "cloud":
             for model in (quality, light):
-                if self.capabilities.local_models.get(model) and self._asr_local_meets_sla(model):
+                if (
+                    self.capabilities.local_models.get(model)
+                    and self._local_service_available("qwen_asr")
+                    and self._asr_local_meets_sla(model)
+                ):
                     reasons.append(f"{model} passed local ASR calibration")
                     return "qwen_local", False
         if (
@@ -81,7 +90,7 @@ class RuntimeRouter:
         ):
             reasons.append("local ASR did not meet SLA; cloud is configured")
             return "qwen_cloud", False
-        if self.capabilities.local_models.get(light):
+        if self.capabilities.local_models.get(light) and self._local_service_available("qwen_asr"):
             reasons.append("cloud unavailable or disallowed; using lightweight local ASR")
             return "qwen_local", True
         raise BackendUnavailableError("no ASR backend is available under the current policy")
@@ -93,13 +102,19 @@ class RuntimeRouter:
         if requested != "auto":
             if requested == "qwen_cloud" and not self._cloud_available():
                 raise BackendUnavailableError("Cloud Qwen-MT credentials or network unavailable")
+            if requested == "hymt_local" and not self._local_service_available("hymt"):
+                raise BackendUnavailableError("Local Hy-MT runtime service is unavailable")
             return requested, False
 
         quality = "hymt2-7b"
         light = "hymt2-1.8b"
         if self.config.inference.mode != "cloud":
             for model in (quality, light):
-                if self.capabilities.local_models.get(model) and self._translation_local_meets_sla(model):
+                if (
+                    self.capabilities.local_models.get(model)
+                    and self._local_service_available("hymt")
+                    and self._translation_local_meets_sla(model)
+                ):
                     reasons.append(f"{model} passed local translation calibration")
                     return "hymt_local", False
         if (
@@ -109,7 +124,7 @@ class RuntimeRouter:
         ):
             reasons.append("local translation did not meet SLA; cloud is configured")
             return "qwen_cloud", False
-        if self.capabilities.local_models.get(light):
+        if self.capabilities.local_models.get(light) and self._local_service_available("hymt"):
             reasons.append("cloud unavailable or disallowed; using lightweight local translation")
             return "hymt_local", True
         reasons.append("no translation backend available; translation disabled")
@@ -133,4 +148,3 @@ class RuntimeRouter:
             status = DeploymentStatus.DEGRADED
         assert asr in local or asr_cloud
         return RouteDecision(asr, translation, status, degraded, tuple(reasons))
-

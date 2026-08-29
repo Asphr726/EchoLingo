@@ -19,6 +19,22 @@
         "minWidth": 760,
         "minHeight": 560,
         "resizable": true
+      },
+      {
+        "label": "caption",
+        "title": "EchoLingo Caption",
+        "url": "index.html?window=caption",
+        "width": 860,
+        "height": 228,
+        "minWidth": 460,
+        "minHeight": 130,
+        "visible": false,
+        "alwaysOnTop": true,
+        "decorations": false,
+        "resizable": true,
+        "skipTaskbar": true,
+        "shadow": true,
+        "transparent": false
       }
     ],
     "security": {"csp": null}

@@ -68,6 +68,7 @@ pub enum UiEventKind {
     RouteDecision,
     BackendHealth,
     AudioDeviceChange,
+    SettingsChanged,
     Error,
 }
 
