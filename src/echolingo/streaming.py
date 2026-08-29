@@ -110,7 +110,6 @@ class WlkEventMapper:
 
         partial = str(message.get("buffer_transcription") or "").strip()
         if partial != self._partial:
-            self._revision += 1
             self._partial = partial
             if partial:
                 event = self._event(TranscriptKind.PARTIAL, partial, now, audio_cursor_ms)
@@ -132,6 +131,7 @@ class WlkEventMapper:
     def _event(
         self, kind: TranscriptKind, text: str, now_ns: int, audio_cursor_ms: float
     ) -> TranscriptEvent:
+        self._revision += 1
         return TranscriptEvent(
             session_id=self.session_id,
             event_id=str(uuid.uuid4()),

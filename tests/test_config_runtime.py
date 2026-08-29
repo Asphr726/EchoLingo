@@ -46,6 +46,8 @@ def test_lecture_config_loads_and_never_hard_gates() -> None:
     config = load_config(Path("configs/lecture.toml"))
     assert config.inference.mode == "auto"
     assert config.asr.qwen_cloud.region == "singapore"
+    assert config.alignment.enabled
+    assert config.alignment.provider == "qwen_local"
     assert not config.vad.hard_gate
 
 

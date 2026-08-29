@@ -24,6 +24,7 @@ class SidecarConnection:
         self.session: DesktopInferenceSession | None = None
         self.events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self.sender: asyncio.Task[None] | None = None
+        self.background_tasks: set[asyncio.Task[Any]] = set()
 
     async def run(self) -> None:
         self.sender = asyncio.create_task(self._send_events())
@@ -40,6 +41,10 @@ class SidecarConnection:
         finally:
             if self.session is not None:
                 await self.session.close()
+            for task in self.background_tasks:
+                task.cancel()
+            if self.background_tasks:
+                await asyncio.gather(*self.background_tasks, return_exceptions=True)
             if self.sender is not None:
                 self.sender.cancel()
                 await asyncio.gather(self.sender, return_exceptions=True)
@@ -81,6 +86,9 @@ class SidecarConnection:
                 _event("session_finished", {"session_id": payload["session_id"]})
             )
             self.session = None
+            task = asyncio.create_task(self._run_alignment(session))
+            self.background_tasks.add(task)
+            task.add_done_callback(self.background_tasks.discard)
         elif command_type == "shutdown":
             await self.websocket.close(code=1000, reason="sidecar shutdown")
         else:
@@ -95,6 +103,27 @@ class SidecarConnection:
         if self.session is None:
             raise ProtocolError("no active sidecar session")
         return self.session
+
+    async def _run_alignment(self, session: DesktopInferenceSession) -> None:
+        try:
+            await session.align()
+        except asyncio.CancelledError:
+            if session.alignment_capture is not None:
+                session.alignment_capture.discard()
+            raise
+        except Exception as error:
+            if session.alignment_capture is not None:
+                session.alignment_capture.discard()
+            await self.events.put(
+                {
+                    "type": "error",
+                    "payload": {
+                        "code": "alignment_failed",
+                        "message": str(error),
+                        "recoverable": True,
+                    },
+                }
+            )
 
 
 async def run_server(host: str, port: int, token: str) -> None:

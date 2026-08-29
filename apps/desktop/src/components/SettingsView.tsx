@@ -188,7 +188,7 @@ export function SettingsView() {
             <SettingsGroup title="Diagnostics" description="Metrics remain visible for lecture tuning and release-gate evidence.">
               <dl className="advanced-status">
                 <div><dt>Protocol</dt><dd>Canonical UI events v1</dd></div>
-                <div><dt>Forced alignment</dt><dd>Pending model validation</dd></div>
+                <div><dt>Forced alignment</dt><dd>Background after Stop · local model</dd></div>
                 <div><dt>Physical far-field test</dt><dd>Pending hardware validation</dd></div>
                 <div><dt>Cloud benchmark</dt><dd>Pending credentials</dd></div>
               </dl>

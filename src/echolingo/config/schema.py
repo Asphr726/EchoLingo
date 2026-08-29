@@ -130,6 +130,13 @@ class CostConfig:
 
 
 @dataclass(slots=True)
+class AlignmentConfig:
+    enabled: bool = False
+    provider: str = "qwen_local"
+    model_path: str = "models/qwen3-forced-aligner-0.6b"
+
+
+@dataclass(slots=True)
 class AppConfig:
     audio: AudioConfig = field(default_factory=AudioConfig)
     frontend: FrontendConfig = field(default_factory=FrontendConfig)
@@ -141,6 +148,7 @@ class AppConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     network: NetworkConfig = field(default_factory=NetworkConfig)
     cost: CostConfig = field(default_factory=CostConfig)
+    alignment: AlignmentConfig = field(default_factory=AlignmentConfig)
 
     def validate(self) -> None:
         if self.inference.mode not in {"auto", "local", "cloud"}:
@@ -151,6 +159,10 @@ class AppConfig:
             raise ConfigurationError(f"unknown ASR provider: {self.asr.provider}")
         if self.translation.provider not in {"auto", "none", "hymt_local", "qwen_cloud", "mock"}:
             raise ConfigurationError(f"unknown translation provider: {self.translation.provider}")
+        if self.alignment.provider not in {"none", "qwen_local", "mock"}:
+            raise ConfigurationError(
+                f"unknown alignment provider: {self.alignment.provider}"
+            )
         if self.asr.language not in {"auto", "en", "zh", "ja", "ko"}:
             raise ConfigurationError("ASR language must be auto, en, zh, ja, or ko")
         local_asr = {"qwen_local", "simulstreaming"}

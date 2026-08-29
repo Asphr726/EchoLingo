@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import load_config
+from ..alignment import MockAlignmentService, QwenForcedAlignmentService
 from ..enhancement import make_processor
 from ..models import AudioFrame
 from ..pipeline import FarFieldPipeline, StreamingPipelineSession
@@ -15,6 +16,7 @@ from ..translation import StreamingTranslationCoordinator
 from ..vad import make_vad
 from .protocol import AudioPacket
 from .sink import SidecarEventSink
+from .alignment import SessionAlignmentCapture
 
 
 def resolve_frontend_profile(product_profile: str) -> str:
@@ -33,11 +35,13 @@ class DesktopInferenceSession:
         pipeline: StreamingPipelineSession,
         events: asyncio.Queue[dict[str, Any]],
         route: dict[str, Any],
+        alignment_capture: SessionAlignmentCapture | None,
     ) -> None:
         self.pipeline = pipeline
         self.events = events
         self.route = route
         self.paused = False
+        self.alignment_capture = alignment_capture
 
     @classmethod
     async def create(
@@ -58,6 +62,10 @@ class DesktopInferenceSession:
         config.translation.provider = payload.get(
             "translation_provider", config.translation.provider
         )
+        if "alignment_enabled" in payload:
+            config.alignment.enabled = bool(payload["alignment_enabled"])
+        if "alignment_provider" in payload:
+            config.alignment.provider = str(payload["alignment_provider"])
         privacy = payload.get("privacy", {})
         config.privacy.audio_upload_allowed = bool(
             privacy.get("audio_upload_allowed", False)
@@ -94,7 +102,17 @@ class DesktopInferenceSession:
                 target_lang=config.translation.target_language,
                 context_segments=config.translation.context_segments,
             )
-        sink = SidecarEventSink(events)
+        alignment_capture = None
+        if config.alignment.enabled and config.alignment.provider != "none":
+            if config.alignment.provider == "mock":
+                alignment_service = MockAlignmentService()
+            else:
+                alignment_service = QwenForcedAlignmentService(
+                    Path(config.alignment.model_path)
+                )
+            if getattr(alignment_service, "available", True):
+                alignment_capture = SessionAlignmentCapture(alignment_service)
+        sink = SidecarEventSink(events, alignment_capture=alignment_capture)
         core_pipeline = FarFieldPipeline(
             processor, vad, speech_policy, asr, sink, input_rate_hz, translation
         )
@@ -105,7 +123,7 @@ class DesktopInferenceSession:
         route = asdict(decision)
         route["status"] = decision.status.value
         route["reasons"] = list(decision.reasons)
-        instance = cls(pipeline, events, route)
+        instance = cls(pipeline, events, route, alignment_capture)
         await pipeline.start()
         return instance
 
@@ -128,5 +146,12 @@ class DesktopInferenceSession:
     async def finish(self) -> None:
         await self.pipeline.finish()
 
+    async def align(self) -> int:
+        if self.alignment_capture is None:
+            return 0
+        return await self.alignment_capture.align(self.events.put_nowait)
+
     async def close(self) -> None:
         await self.pipeline.close()
+        if self.alignment_capture is not None:
+            self.alignment_capture.discard()

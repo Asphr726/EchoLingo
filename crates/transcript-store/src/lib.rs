@@ -213,6 +213,28 @@ impl TranscriptStore {
         self.refresh_search(session_id).await
     }
 
+    pub async fn update_alignment(
+        &self,
+        session_id: Uuid,
+        source_revision: i64,
+        start_ms: f64,
+        end_ms: f64,
+        word_timings: &serde_json::Value,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE segments SET start_ms=?,end_ms=?,timestamp_quality='forced',word_timings_json=?,updated_at=? WHERE session_id=? AND source_revision=?",
+        )
+        .bind(start_ms.max(0.0))
+        .bind(end_ms.max(start_ms))
+        .bind(serde_json::to_string(word_timings)?)
+        .bind(timestamp(Utc::now()))
+        .bind(session_id.to_string())
+        .bind(source_revision)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn append_revision(
         &self,
         session_id: Uuid,
@@ -276,6 +298,14 @@ impl TranscriptStore {
         .fetch_all(&self.pool)
         .await?;
         Ok(SessionDetail { session, segments })
+    }
+
+    pub async fn has_segments(&self, session_id: Uuid) -> Result<bool, StoreError> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM segments WHERE session_id=?")
+            .bind(session_id.to_string())
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count > 0)
     }
 
     pub async fn search(&self, query: &str, limit: u32) -> Result<Vec<SessionRecord>, StoreError> {
@@ -494,6 +524,22 @@ mod tests {
         assert!(srt.contains("00:00:01,000 --> 00:00:03,250"));
         let vtt = store.export(session_id, ExportFormat::Vtt).await.unwrap();
         assert!(vtt.starts_with("WEBVTT") && vtt.contains("00:00:01.000"));
+        assert!(store
+            .update_alignment(
+                session_id,
+                1,
+                1_120.0,
+                3_100.0,
+                &serde_json::json!([
+                    {"text": "robotics", "start_ms": 1120.0, "end_ms": 1600.0}
+                ]),
+            )
+            .await
+            .unwrap());
+        let aligned = store.detail(session_id).await.unwrap().segments.remove(0);
+        assert_eq!(aligned.timestamp_quality, "forced");
+        assert_eq!(aligned.start_ms, 1_120.0);
+        assert!(aligned.word_timings_json.contains("robotics"));
         store.complete_session(session_id, &[]).await.unwrap();
         assert_eq!(store.session(session_id).await.unwrap().status, "completed");
         store.delete(session_id).await.unwrap();

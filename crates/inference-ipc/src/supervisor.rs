@@ -247,6 +247,8 @@ mod tests {
                 "inference_mode": "auto",
                 "asr_provider": "mock",
                 "translation_provider": "mock",
+                "alignment_enabled": true,
+                "alignment_provider": "mock",
                 "privacy": {"audio_upload_allowed": false, "transcript_upload_allowed": false}
             })))
             .await
@@ -286,6 +288,17 @@ mod tests {
             .send_command(SidecarCommand::FinishSession { session_id })
             .await
             .unwrap();
+        let alignment = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let SidecarEvent::AlignmentUpdate(value) = events.recv().await.unwrap() {
+                    break value;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(alignment["session_id"], session_id.to_string());
+        assert_eq!(alignment["timestamp_quality"], "forced");
         supervisor.shutdown().await;
     }
 }

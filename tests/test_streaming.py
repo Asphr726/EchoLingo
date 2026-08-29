@@ -28,9 +28,10 @@ def test_wlk_full_state_maps_partial_revisions_and_new_stable_lines() -> None:
         1250,
     )
     assert [event.kind for event in update] == [TranscriptKind.STABLE, TranscriptKind.PARTIAL]
+    assert [event.revision_id for event in update] == [2, 3]
     assert update[0].committed_text == "hello world"
     assert update[0].commit_latency_ms == 250
-    assert update[1].revision_id == 2
+    assert update[1].revision_id == 3
 
     repeated = mapper.map_message(
         {
@@ -40,6 +41,21 @@ def test_wlk_full_state_maps_partial_revisions_and_new_stable_lines() -> None:
         1300,
     )
     assert repeated == []
+
+
+def test_wlk_assigns_unique_revisions_to_multiple_stable_lines() -> None:
+    mapper = WlkEventMapper("session", "en", "qwen", "streaming")
+    events = mapper.map_message(
+        {
+            "lines": [
+                {"text": "first", "start": 0, "end": 1},
+                {"text": "second", "start": 1, "end": 2},
+            ],
+            "buffer_transcription": "",
+        },
+        2_000,
+    )
+    assert [event.revision_id for event in events] == [1, 2]
 
 
 def test_parse_wlk_timestamp() -> None:

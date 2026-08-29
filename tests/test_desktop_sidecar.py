@@ -74,6 +74,7 @@ async def test_sidecar_mock_session_emits_canonical_metrics_and_transcript() -> 
             "inference_mode": "auto",
             "asr_provider": "mock",
             "translation_provider": "mock",
+            "alignment_enabled": False,
             "privacy": {
                 "audio_upload_allowed": False,
                 "transcript_upload_allowed": False,
@@ -93,6 +94,41 @@ async def test_sidecar_mock_session_emits_canonical_metrics_and_transcript() -> 
     transcript = next(event["payload"] for event in emitted if event["type"] == "transcript")
     assert transcript["schema_version"] == 2
     assert transcript["provider"] == "mock"
+
+
+async def test_sidecar_alignment_runs_after_streaming_finish() -> None:
+    events: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+    session = await DesktopInferenceSession.create(
+        {
+            "session_id": "sidecar-alignment",
+            "source_language": "ja",
+            "target_language": "en",
+            "sample_rate_hz": 16_000,
+            "channels": 1,
+            "audio_profile": "raw",
+            "inference_mode": "auto",
+            "asr_provider": "mock",
+            "translation_provider": "mock",
+            "alignment_enabled": True,
+            "alignment_provider": "mock",
+            "privacy": {
+                "audio_upload_allowed": False,
+                "transcript_upload_allowed": False,
+            },
+        },
+        events,
+    )
+    await session.push(
+        decode_audio_packet(audio_packet(np.ones(16_000, dtype=np.float32), sequence=1))
+    )
+    await session.finish()
+    assert await session.align() == 1
+    emitted = []
+    while not events.empty():
+        emitted.append(events.get_nowait())
+    update = next(event for event in emitted if event["type"] == "alignment_update")
+    assert update["payload"]["session_id"] == "sidecar-alignment"
+    assert update["payload"]["timestamp_quality"] == "forced"
 
 
 async def test_sidecar_websocket_requires_versioned_authenticated_hello() -> None:

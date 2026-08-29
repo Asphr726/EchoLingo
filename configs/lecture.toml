@@ -84,3 +84,8 @@ backoff_max_s = 4.0
 
 [cost]
 meter_cloud_usage = true
+
+[alignment]
+enabled = true
+provider = "qwen_local"
+model_path = "models/qwen3-forced-aligner-0.6b"

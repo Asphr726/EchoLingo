@@ -222,7 +222,13 @@ async fn persist_sidecar_event(
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-            if matches!(kind, "stable" | "final") && !text.is_empty() {
+            let should_persist_segment = kind == "stable"
+                || (kind == "final"
+                    && !store
+                        .has_segments(session_id)
+                        .await
+                        .map_err(|error| error.to_string())?);
+            if should_persist_segment && !text.is_empty() {
                 let end = payload["end_ms"]
                     .as_f64()
                     .unwrap_or_else(|| payload["audio_cursor_ms"].as_f64().unwrap_or(0.0));
@@ -236,11 +242,15 @@ async fn persist_sidecar_event(
                         ordinal: revision,
                         start_ms: start,
                         end_ms: end.max(start + 500.0),
-                        source_text: payload["committed_text"]
-                            .as_str()
-                            .filter(|value| !value.is_empty())
-                            .unwrap_or(text)
-                            .to_string(),
+                        source_text: if kind == "stable" {
+                            text.to_string()
+                        } else {
+                            payload["committed_text"]
+                                .as_str()
+                                .filter(|value| !value.is_empty())
+                                .unwrap_or(text)
+                                .to_string()
+                        },
                         source_final: kind == "final",
                         asr_confidence: payload["confidence"].as_f64(),
                         source_revision: revision,
@@ -290,6 +300,36 @@ async fn persist_sidecar_event(
                 .await
                 .map_err(|error| error.to_string())?;
         }
+        SidecarEvent::AlignmentUpdate(payload) => {
+            let source_revision = payload["revision_id"].as_i64().unwrap_or(0);
+            let start_ms = payload["start_ms"].as_f64().unwrap_or(0.0);
+            let end_ms = payload["end_ms"].as_f64().unwrap_or(start_ms);
+            store
+                .append_revision(
+                    session_id,
+                    None,
+                    "source",
+                    source_revision,
+                    "alignment_update",
+                    payload["text"].as_str().unwrap_or_default(),
+                    payload["model"].as_str().unwrap_or("qwen_forced_aligner"),
+                    &json!({
+                        "alignment_processing_ms": payload["alignment_processing_ms"]
+                    }),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            store
+                .update_alignment(
+                    session_id,
+                    source_revision,
+                    start_ms,
+                    end_ms,
+                    &payload["words"],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         _ => {}
     }
     Ok(())
@@ -328,7 +368,10 @@ fn forward_sidecar_events(app: AppHandle) {
                             .as_u64()
                             .unwrap_or(live.source_revision_id);
                         core.update_live_transcript(live);
-                        if matches!(event_kind, "stable" | "final") {
+                        let should_commit_segment = event_kind == "stable"
+                            || (event_kind == "final"
+                                && core.snapshot().previous_segments.is_empty());
+                        if should_commit_segment {
                             let revision = payload["revision_id"].as_u64().unwrap_or(0) as u32;
                             let end_ms = payload["end_ms"]
                                 .as_f64()
@@ -345,11 +388,15 @@ fn forward_sidecar_events(app: AppHandle) {
                                 ordinal: revision,
                                 start_ms,
                                 end_ms,
-                                original: payload["committed_text"]
-                                    .as_str()
-                                    .filter(|value| !value.is_empty())
-                                    .unwrap_or(payload["text"].as_str().unwrap_or_default())
-                                    .to_string(),
+                                original: if event_kind == "stable" {
+                                    payload["text"].as_str().unwrap_or_default().to_string()
+                                } else {
+                                    payload["committed_text"]
+                                        .as_str()
+                                        .filter(|value| !value.is_empty())
+                                        .unwrap_or(payload["text"].as_str().unwrap_or_default())
+                                        .to_string()
+                                },
                                 translation: String::new(),
                             });
                         }
@@ -408,12 +455,16 @@ fn forward_sidecar_events(app: AppHandle) {
                     continue
                 }
             };
-            let session_id = state
+            let active_session_id = state
                 .snapshot()
                 .ok()
                 .and_then(|snapshot| snapshot.session_id);
-            let _ = state.emit_event(&app, session_id, kind, payload);
-            if let Some(session_id) = session_id {
+            let event_session_id = payload["session_id"]
+                .as_str()
+                .and_then(|value| value.parse().ok())
+                .or(active_session_id);
+            let _ = state.emit_event(&app, event_session_id, kind, payload);
+            if let Some(session_id) = event_session_id {
                 if let Err(error) = persist_sidecar_event(&state, session_id, &persist_event).await
                 {
                     let _ = state.emit_event(
