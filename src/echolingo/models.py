@@ -269,3 +269,33 @@ class ProcessedFrame:
     enhanced_samples: FloatAudio
     asr_samples: FloatAudio
     metrics: AudioMetrics
+
+
+@dataclass(slots=True)
+class AlignmentRequest:
+    session_id: str
+    source_revision_id: int
+    audio: FloatAudio
+    sample_rate_hz: int
+    transcript: str
+    language: str
+
+    def __post_init__(self) -> None:
+        samples = np.asarray(self.audio, dtype=np.float32)
+        if samples.ndim == 2:
+            samples = samples.mean(axis=1)
+        if samples.ndim != 1 or self.sample_rate_hz <= 0:
+            raise ValueError("alignment audio must be mono PCM with a positive sample rate")
+        if not self.transcript.strip():
+            raise ValueError("alignment transcript must not be empty")
+        self.audio = np.ascontiguousarray(samples)
+
+
+@dataclass(slots=True)
+class AlignmentResult:
+    session_id: str
+    source_revision_id: int
+    language: str
+    words: list[WordTiming]
+    model: str
+    processing_ms: float

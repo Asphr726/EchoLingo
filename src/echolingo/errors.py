@@ -19,6 +19,10 @@ class BackendUnavailableError(BackendError):
     recoverable = True
 
 
+class AlignmentUnavailableError(BackendUnavailableError):
+    code = "alignment_unavailable"
+
+
 class AuthenticationError(BackendError):
     code = "authentication_failed"
 
@@ -39,4 +43,3 @@ class ProviderTimeoutError(NetworkError):
 
 class PolicyDeniedError(BackendError):
     code = "privacy_policy_denied"
-

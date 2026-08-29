@@ -6,6 +6,8 @@ from typing import Protocol
 from .models import (
     AsrAudioChunk,
     AsrSessionConfig,
+    AlignmentRequest,
+    AlignmentResult,
     AudioFrame,
     BackendDescriptor,
     CanonicalTranscriptEvent,
@@ -68,6 +70,10 @@ class TranslationBackend(Protocol):
     ) -> CanonicalTranslationEvent: ...
 
     async def set_glossary(self, terms: tuple[GlossaryTerm, ...]) -> None: ...
+
+
+class AlignmentService(Protocol):
+    async def align(self, request: AlignmentRequest) -> AlignmentResult: ...
 
 
 class StreamingPolicy(Protocol):
