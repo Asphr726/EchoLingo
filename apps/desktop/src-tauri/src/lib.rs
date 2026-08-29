@@ -1,9 +1,14 @@
 use app_core::{
-    AppCore, BackendHealth, LiveMetrics, RouteStatus, SessionSnapshot, StartSessionRequest,
+    AppCore, AudioSourceKind as AppAudioSourceKind, BackendHealth, LiveMetrics, RouteStatus,
+    SessionSnapshot, StartSessionRequest,
+};
+use audio_core::{
+    list_audio_devices as enumerate_audio_devices, start_microphone, start_system_audio,
+    AudioCaptureSession, AudioDevice, AudioSourceEvent,
 };
 use inference_ipc::{
-    InferenceSupervisor, SidecarCommand, SidecarEvent, SidecarLaunchConfig, UiEventEnvelope,
-    UiEventKind, PROTOCOL_VERSION,
+    AudioFrameHeader, InferenceSupervisor, SidecarCommand, SidecarEvent, SidecarLaunchConfig,
+    UiEventEnvelope, UiEventKind, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -20,6 +25,9 @@ const UI_EVENT_CHANNEL: &str = "echolingo://ui-event";
 struct RuntimeState {
     core: Mutex<AppCore>,
     event_sequence: AtomicU64,
+    audio_sequence: AtomicU64,
+    audio: tokio::sync::Mutex<Option<AudioCaptureSession>>,
+    shutting_down: std::sync::atomic::AtomicBool,
     supervisor: Arc<InferenceSupervisor>,
     store: tokio::sync::OnceCell<TranscriptStore>,
 }
@@ -30,6 +38,9 @@ impl Default for RuntimeState {
         Self {
             core: Mutex::new(AppCore::default()),
             event_sequence: AtomicU64::new(0),
+            audio_sequence: AtomicU64::new(0),
+            audio: tokio::sync::Mutex::new(None),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
             supervisor: InferenceSupervisor::new(SidecarLaunchConfig::development(project_root)),
             store: tokio::sync::OnceCell::new(),
         }
@@ -350,6 +361,158 @@ fn forward_sidecar_events(app: AppHandle) {
     });
 }
 
+fn emit_audio_event(
+    app: &AppHandle,
+    state: &RuntimeState,
+    event: &AudioSourceEvent,
+) -> Result<(), String> {
+    state.emit_event(
+        app,
+        state.snapshot()?.session_id,
+        UiEventKind::AudioDeviceChange,
+        serde_json::to_value(event).map_err(|error| error.to_string())?,
+    )
+}
+
+async fn start_audio_capture(
+    app: &AppHandle,
+    state: &RuntimeState,
+    request: &StartSessionRequest,
+) -> Result<(), String> {
+    let mut capture = match request.audio_source {
+        AppAudioSourceKind::Microphone => start_microphone(request.audio_device_id.as_deref()),
+        AppAudioSourceKind::SystemAudio => start_system_audio(),
+        AppAudioSourceKind::SystemAudioAndMicrophone => {
+            return Err(
+                "combined system audio and microphone capture is not implemented yet".into(),
+            )
+        }
+    }
+    .map_err(|error| error.to_string())?;
+    let mut events = capture
+        .take_events()
+        .ok_or_else(|| "audio event receiver is unavailable".to_string())?;
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        while let Some(event) = events.recv().await {
+            emit_audio_event(app, state, &event)?;
+            match event {
+                AudioSourceEvent::Started => return Ok(()),
+                AudioSourceEvent::PickerCancelled => {
+                    return Err("system audio selection was cancelled".into())
+                }
+                AudioSourceEvent::DeviceRemoved { message } => return Err(message),
+                AudioSourceEvent::Error { message, .. } => return Err(message),
+                _ => {}
+            }
+        }
+        Err("audio source closed before starting".into())
+    })
+    .await
+    .map_err(|_| "audio source start timed out".to_string())?;
+    ready?;
+
+    let frames = capture
+        .take_frames()
+        .ok_or_else(|| "audio frame receiver is unavailable".to_string())?;
+    let mut audio = state.audio.lock().await;
+    if audio.is_some() {
+        return Err("an audio source is already running".into());
+    }
+    *audio = Some(capture);
+    drop(audio);
+    pump_audio_frames(app.clone(), frames);
+    forward_audio_events(app.clone(), events);
+    Ok(())
+}
+
+fn pump_audio_frames(
+    app: AppHandle,
+    mut frames: tokio::sync::mpsc::Receiver<audio_core::AudioFrame>,
+) {
+    tauri::async_runtime::spawn(async move {
+        while let Some(frame) = frames.recv().await {
+            let state = app.state::<RuntimeState>();
+            let max_frames = usize::from(u16::MAX);
+            for (part, samples) in frame.samples.chunks(max_frames).enumerate() {
+                let sequence = state.audio_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+                let header = AudioFrameHeader {
+                    flags: u16::from(frame.overflow && part == 0),
+                    sequence,
+                    capture_monotonic_ns: frame.capture_monotonic_ns,
+                    sample_rate_hz: frame.sample_rate_hz,
+                    channels: frame.channels,
+                    frame_count: samples.len() as u16,
+                };
+                let mut packet = Vec::with_capacity(32 + samples.len() * size_of::<f32>());
+                packet.extend_from_slice(&header.encode());
+                for sample in samples {
+                    packet.extend_from_slice(&sample.to_le_bytes());
+                }
+                if let Err(error) = state.supervisor.send_audio(packet).await {
+                    let _ = state.emit_event(
+                        &app,
+                        state
+                            .snapshot()
+                            .ok()
+                            .and_then(|snapshot| snapshot.session_id),
+                        UiEventKind::Error,
+                        json!({
+                            "code": "audio_transport_error",
+                            "message": error.to_string(),
+                            "recoverable": true
+                        }),
+                    );
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn forward_audio_events(app: AppHandle, mut events: tokio::sync::mpsc::Receiver<AudioSourceEvent>) {
+    tauri::async_runtime::spawn(async move {
+        while let Some(event) = events.recv().await {
+            let state = app.state::<RuntimeState>();
+            let _ = emit_audio_event(&app, &state, &event);
+            if let AudioSourceEvent::DeviceRemoved { message } = event {
+                let recovery = state
+                    .core
+                    .lock()
+                    .ok()
+                    .and_then(|mut core| core.pause_for_recovery(message).ok());
+                if let Some(snapshot) = recovery {
+                    if let Some(session_id) = snapshot.session_id {
+                        let _ = state
+                            .supervisor
+                            .send_command(SidecarCommand::Pause {
+                                session_id,
+                                epoch: snapshot.state_revision as u32,
+                            })
+                            .await;
+                    }
+                    let _ = state.emit_snapshot(&app, &snapshot);
+                }
+            }
+        }
+    });
+}
+
+async fn stop_audio_capture(state: &RuntimeState) -> Result<(), String> {
+    let mut capture = state.audio.lock().await.take();
+    if let Some(capture) = capture.as_mut() {
+        capture.stop().map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn list_audio_devices() -> Result<Vec<AudioDevice>, String> {
+    tauri::async_runtime::spawn_blocking(enumerate_audio_devices)
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 async fn start_session(
     app: AppHandle,
@@ -393,7 +556,8 @@ async fn start_session(
                 Ok(Ok(SidecarEvent::Ready { session_id, route }))
                     if Some(session_id) == starting.session_id =>
                 {
-                    break Ok(route)
+                    start_audio_capture(&app, &state, starting.config.as_ref().unwrap()).await?;
+                    break Ok(route);
                 }
                 Ok(Ok(SidecarEvent::Error { message, .. })) => break Err(message),
                 Ok(Ok(_)) => continue,
@@ -444,6 +608,7 @@ async fn start_session(
             Ok(snapshot)
         }
         Err(error) => {
+            let _ = stop_audio_capture(&state).await;
             let snapshot = state
                 .core
                 .lock()
@@ -462,6 +627,9 @@ async fn pause_session(
     state: State<'_, RuntimeState>,
     expected_state_revision: u64,
 ) -> Result<SessionSnapshot, String> {
+    if let Some(capture) = state.audio.lock().await.as_ref() {
+        capture.pause().map_err(|error| error.to_string())?;
+    }
     let session_id = state
         .snapshot()?
         .session_id
@@ -502,6 +670,9 @@ async fn resume_session(
         })
         .await
         .map_err(|error| error.to_string())?;
+    if let Some(capture) = state.audio.lock().await.as_ref() {
+        capture.resume().map_err(|error| error.to_string())?;
+    }
     let snapshot = state
         .core
         .lock()
@@ -525,6 +696,7 @@ async fn stop_session(
         .begin_stop(expected_state_revision)
         .map_err(|error| error.to_string())?;
     state.emit_snapshot(&app, &stopping)?;
+    stop_audio_capture(&state).await?;
     if let Some(session_id) = stopping.session_id {
         let mut receiver = state.supervisor.subscribe();
         state
@@ -633,6 +805,7 @@ pub fn run() {
         .manage(RuntimeState::default())
         .invoke_handler(tauri::generate_handler![
             get_app_snapshot,
+            list_audio_devices,
             start_session,
             pause_session,
             resume_session,
@@ -658,6 +831,25 @@ pub fn run() {
                 .map_err(std::io::Error::other)?;
             forward_sidecar_events(app.handle().clone());
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let state = window.state::<RuntimeState>();
+                if state.shutting_down.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                api.prevent_close();
+                let window = window.clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = window.state::<RuntimeState>();
+                    let _ = stop_audio_capture(&state).await;
+                    state.supervisor.shutdown().await;
+                    let _ = window.destroy();
+                });
+            }
         })
         .run(tauri::generate_context!())
         .expect("failed to run EchoLingo desktop application");

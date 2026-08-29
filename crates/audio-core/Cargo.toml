@@ -7,5 +7,10 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+cpal = "0.17.0"
 serde.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+
+[target.'cfg(target_os = "macos")'.build-dependencies]
+cc = "1.2"
