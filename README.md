@@ -1,9 +1,9 @@
 # EchoLingo
 
-Local-first, cloud-capable multilingual interpreter prototype. Spike 1A's
-far-field audio pipeline is complete; backend benchmarking and physical
-far-field validation continue without blocking the Local/Cloud/Hybrid
-inference foundation. TTS is intentionally out of scope.
+Local-first, cloud-capable multilingual interpreter. Its streaming core has
+entered Phase 3 desktop productization with Tauri 2 and React. Backend
+benchmarking and physical far-field validation continue as parallel release
+gates. TTS is intentionally out of scope.
 
 ## Environment
 
@@ -55,3 +55,17 @@ that the distance labels are simulation controls, not physical measurements.
 
 See [the Spike 1 report](docs/spikes/spike1.md) and
 [architecture decision](docs/adr/0001-spike1-runtime-and-asr.md).
+
+## Desktop development
+
+The desktop app targets macOS 14+ first and requires Node 22 LTS and Rust
+stable in addition to the existing Conda environment.
+
+```bash
+npm install
+npm run desktop:dev
+npm run test:desktop
+cargo test --workspace
+```
+
+See [Phase 3 productization](docs/phase3-productization.md).

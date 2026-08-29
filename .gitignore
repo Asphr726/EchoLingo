@@ -12,3 +12,15 @@ models/
 runs/
 data/cache/
 data/generated/
+node_modules/
+dist/
+target/
+*.log
+apps/desktop/src-tauri/gen/
+apps/desktop/.vite/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.env
+.env.*
+!.env.example
