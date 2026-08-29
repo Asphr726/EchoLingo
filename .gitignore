@@ -18,6 +18,9 @@ target/
 *.log
 apps/desktop/src-tauri/gen/
 apps/desktop/.vite/
+*.tsbuildinfo
+apps/desktop/vite.config.js
+apps/desktop/vite.config.d.ts
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal

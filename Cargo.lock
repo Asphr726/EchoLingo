@@ -51,6 +51,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 name = "app-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "serde",
  "thiserror 2.0.20",
  "uuid",
@@ -345,8 +346,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-link 0.2.1",
 ]
 
@@ -747,6 +750,7 @@ version = "0.1.0"
 dependencies = [
  "app-core",
  "audio-core",
+ "chrono",
  "inference-ipc",
  "serde",
  "serde_json",
@@ -1549,6 +1553,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "thiserror 2.0.20",
  "uuid",
 ]
 

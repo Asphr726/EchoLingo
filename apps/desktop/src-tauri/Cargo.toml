@@ -17,6 +17,7 @@ app-core = { path = "../../../crates/app-core" }
 audio-core = { path = "../../../crates/audio-core" }
 inference-ipc = { path = "../../../crates/inference-ipc" }
 transcript-store = { path = "../../../crates/transcript-store" }
+chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2", features = [] }
