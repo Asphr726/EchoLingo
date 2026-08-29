@@ -11,6 +11,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
+use transcript_store::{
+    ExportFormat, SegmentDraft, SessionDetail, SessionDraft, SessionRecord, TranscriptStore,
+};
 
 const UI_EVENT_CHANNEL: &str = "echolingo://ui-event";
 
@@ -18,6 +21,7 @@ struct RuntimeState {
     core: Mutex<AppCore>,
     event_sequence: AtomicU64,
     supervisor: Arc<InferenceSupervisor>,
+    store: tokio::sync::OnceCell<TranscriptStore>,
 }
 
 impl Default for RuntimeState {
@@ -27,6 +31,7 @@ impl Default for RuntimeState {
             core: Mutex::new(AppCore::default()),
             event_sequence: AtomicU64::new(0),
             supervisor: InferenceSupervisor::new(SidecarLaunchConfig::development(project_root)),
+            store: tokio::sync::OnceCell::new(),
         }
     }
 }
@@ -65,6 +70,12 @@ impl RuntimeState {
         };
         app.emit(UI_EVENT_CHANNEL, event)
             .map_err(|error| error.to_string())
+    }
+
+    fn store(&self) -> Result<&TranscriptStore, String> {
+        self.store
+            .get()
+            .ok_or_else(|| "transcript store is not initialized".to_string())
     }
 }
 
@@ -133,11 +144,120 @@ fn route_status(value: &Value) -> RouteStatus {
     }
 }
 
+fn value_name<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+async fn persist_sidecar_event(
+    state: &RuntimeState,
+    session_id: uuid::Uuid,
+    event: &SidecarEvent,
+) -> Result<(), String> {
+    let store = state.store()?;
+    match event {
+        SidecarEvent::Transcript(payload) => {
+            let revision = payload["revision_id"].as_i64().unwrap_or(0);
+            let kind = payload["kind"].as_str().unwrap_or("partial");
+            let text = payload["text"].as_str().unwrap_or_default();
+            let segment_id = payload["event_id"].as_str().and_then(|id| id.parse().ok());
+            store
+                .append_revision(
+                    session_id,
+                    None,
+                    "source",
+                    revision,
+                    kind,
+                    text,
+                    payload["backend"].as_str().unwrap_or("unknown"),
+                    &json!({
+                        "first_token_latency_ms": payload["first_token_latency_ms"],
+                        "commit_latency_ms": payload["commit_latency_ms"]
+                    }),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            if matches!(kind, "stable" | "final") && !text.is_empty() {
+                let end = payload["end_ms"]
+                    .as_f64()
+                    .unwrap_or_else(|| payload["audio_cursor_ms"].as_f64().unwrap_or(0.0));
+                let start = payload["start_ms"]
+                    .as_f64()
+                    .unwrap_or((end - 1_000.0).max(0.0));
+                store
+                    .upsert_segment(&SegmentDraft {
+                        id: segment_id.unwrap_or_else(uuid::Uuid::new_v4),
+                        session_id,
+                        ordinal: revision,
+                        start_ms: start,
+                        end_ms: end.max(start + 500.0),
+                        source_text: payload["committed_text"]
+                            .as_str()
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or(text)
+                            .to_string(),
+                        source_final: kind == "final",
+                        asr_confidence: payload["confidence"].as_f64(),
+                        source_revision: revision,
+                        timestamp_quality: payload["timestamp_quality"]
+                            .as_str()
+                            .unwrap_or("none")
+                            .to_string(),
+                        word_timings: payload["words"].clone(),
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        SidecarEvent::Translation(payload) => {
+            let source_revision = payload["source_revision_id"].as_i64().unwrap_or(0);
+            let revision = payload["revision_id"].as_i64().unwrap_or(0);
+            let kind = payload["kind"].as_str().unwrap_or("partial");
+            let text = payload["text"].as_str().unwrap_or_default();
+            store
+                .append_revision(
+                    session_id,
+                    None,
+                    "target",
+                    revision,
+                    kind,
+                    text,
+                    payload["provider"].as_str().unwrap_or("unknown"),
+                    &json!({
+                        "first_delta_latency_ms": payload["first_delta_latency_ms"],
+                        "total_latency_ms": payload["total_latency_ms"]
+                    }),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            store
+                .update_translation(session_id, source_revision, revision, text, kind == "final")
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        SidecarEvent::Metrics(payload) => {
+            store
+                .record_metrics(
+                    session_id,
+                    payload["captured_audio_ms"].as_f64().unwrap_or(0.0),
+                    payload,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn forward_sidecar_events(app: AppHandle) {
     let mut receiver = app.state::<RuntimeState>().supervisor.subscribe();
     tauri::async_runtime::spawn(async move {
         while let Ok(event) = receiver.recv().await {
             let state = app.state::<RuntimeState>();
+            let persist_event = event.clone();
             let (kind, payload) = match event {
                 SidecarEvent::Transcript(payload) => {
                     if let Ok(mut core) = state.core.lock() {
@@ -215,6 +335,17 @@ fn forward_sidecar_events(app: AppHandle) {
                 .ok()
                 .and_then(|snapshot| snapshot.session_id);
             let _ = state.emit_event(&app, session_id, kind, payload);
+            if let Some(session_id) = session_id {
+                if let Err(error) = persist_sidecar_event(&state, session_id, &persist_event).await
+                {
+                    let _ = state.emit_event(
+                        &app,
+                        Some(session_id),
+                        UiEventKind::Error,
+                        json!({"code": "storage_error", "message": error, "recoverable": true}),
+                    );
+                }
+            }
         }
     });
 }
@@ -274,11 +405,40 @@ async fn start_session(
     .await;
     match result {
         Ok(route) => {
+            let selected_route = route_status(&route);
             let snapshot = state
                 .core
                 .lock()
                 .map_err(|_| "app core lock poisoned".to_string())?
-                .mark_listening(route_status(&route))
+                .mark_listening(selected_route.clone())
+                .map_err(|error| error.to_string())?;
+            let config = snapshot
+                .config
+                .as_ref()
+                .ok_or_else(|| "missing session config".to_string())?;
+            state
+                .store()?
+                .create_session(&SessionDraft {
+                    id: snapshot
+                        .session_id
+                        .ok_or_else(|| "missing session id".to_string())?,
+                    title: format!(
+                        "{} → {} lecture",
+                        config.source_language, config.target_language
+                    ),
+                    source_language: config.source_language.clone(),
+                    target_language: config.target_language.clone(),
+                    audio_source: value_name(&config.audio_source),
+                    audio_profile: config.audio_profile.clone(),
+                    inference_mode: value_name(&config.inference_mode),
+                    asr_backend: selected_route.asr_provider,
+                    translation_backend: selected_route.translation_provider,
+                    route_reason: selected_route.reason,
+                    privacy: serde_json::to_value(&config.privacy)
+                        .map_err(|error| error.to_string())?,
+                    model_config: route,
+                })
+                .await
                 .map_err(|error| error.to_string())?;
             state.emit_snapshot(&app, &snapshot)?;
             Ok(snapshot)
@@ -384,8 +544,87 @@ async fn stop_session(
         .map_err(|_| "app core lock poisoned".to_string())?
         .complete()
         .map_err(|error| error.to_string())?;
+    if let Some(session_id) = completed.session_id {
+        state
+            .store()?
+            .complete_session(session_id, &[])
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     state.emit_snapshot(&app, &completed)?;
     Ok(completed)
+}
+
+#[tauri::command]
+async fn history_search(
+    state: State<'_, RuntimeState>,
+    query: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<SessionRecord>, String> {
+    state
+        .store()?
+        .search(query.as_deref().unwrap_or(""), limit.unwrap_or(100))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn history_open(
+    state: State<'_, RuntimeState>,
+    session_id: String,
+) -> Result<SessionDetail, String> {
+    let id = session_id
+        .parse()
+        .map_err(|_| "invalid session id".to_string())?;
+    state
+        .store()?
+        .detail(id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn history_rename(
+    state: State<'_, RuntimeState>,
+    session_id: String,
+    title: String,
+) -> Result<(), String> {
+    let id = session_id
+        .parse()
+        .map_err(|_| "invalid session id".to_string())?;
+    state
+        .store()?
+        .rename(id, &title)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn history_delete(state: State<'_, RuntimeState>, session_id: String) -> Result<(), String> {
+    let id = session_id
+        .parse()
+        .map_err(|_| "invalid session id".to_string())?;
+    state
+        .store()?
+        .delete(id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn history_export(
+    state: State<'_, RuntimeState>,
+    session_id: String,
+    format: ExportFormat,
+) -> Result<String, String> {
+    let id = session_id
+        .parse()
+        .map_err(|_| "invalid session id".to_string())?;
+    state
+        .store()?
+        .export(id, format)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -398,9 +637,21 @@ pub fn run() {
             pause_session,
             resume_session,
             stop_session,
+            history_search,
+            history_open,
+            history_rename,
+            history_delete,
+            history_export,
         ])
         .setup(|app| {
             let state = app.state::<RuntimeState>();
+            let database_path = app.path().app_data_dir()?.join("history.sqlite");
+            let store = tauri::async_runtime::block_on(TranscriptStore::open(database_path))
+                .map_err(std::io::Error::other)?;
+            state
+                .store
+                .set(store)
+                .map_err(|_| std::io::Error::other("store already initialized"))?;
             let snapshot = state.snapshot().map_err(std::io::Error::other)?;
             state
                 .emit_snapshot(app.handle(), &snapshot)
