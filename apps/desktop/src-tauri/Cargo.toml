@@ -24,3 +24,6 @@ tauri = { version = "2", features = [] }
 raw-window-handle = "0.6"
 tokio.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

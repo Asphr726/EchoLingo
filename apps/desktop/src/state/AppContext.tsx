@@ -17,24 +17,18 @@ import type {
   StartSessionRequest,
   UiEventEnvelope,
 } from "../types";
-import { defaultCaptionPreferences, emptySnapshot } from "../types";
+import {
+  defaultCaptionPreferences,
+  defaultSessionDefaults,
+  emptySnapshot,
+} from "../types";
 
 const smokeBackend = import.meta.env.VITE_ECHOLINGO_SMOKE_BACKEND === "mock";
 
 const defaultDraft: StartSessionRequest = {
-  expected_state_revision: 0,
-  source_language: "en",
-  target_language: "zh",
-  audio_source: "microphone",
-  audio_device_id: null,
-  audio_profile: "lecture",
-  inference_mode: "auto",
-  asr_provider: smokeBackend ? "mock" : "auto",
-  translation_provider: smokeBackend ? "mock" : "auto",
-  privacy: {
-    audio_upload_allowed: false,
-    transcript_upload_allowed: false,
-  },
+  ...defaultSessionDefaults,
+  asr_provider: smokeBackend ? "mock" : defaultSessionDefaults.asr_provider,
+  translation_provider: smokeBackend ? "mock" : defaultSessionDefaults.translation_provider,
 };
 
 interface AppContextValue {
@@ -113,18 +107,27 @@ export function AppProvider({ children }: PropsWithChildren) {
   useEffect(() => {
     let active = true;
     let unlisten: () => void = () => undefined;
-    Promise.all([api.snapshot(), api.audioDevices(), api.captionPreferences()])
-      .then(([nextSnapshot, nextDevices, nextCaption]) => {
+    Promise.all([
+      api.snapshot(),
+      api.audioDevices(),
+      api.captionPreferences(),
+      api.sessionDefaults(),
+    ])
+      .then(([nextSnapshot, nextDevices, nextCaption, nextDefaults]) => {
         if (!active) return;
         setSnapshot(nextSnapshot);
-        setDraft((current) => ({
-          ...current,
+        setDraft({
+          ...nextDefaults,
           expected_state_revision: nextSnapshot.state_revision,
+          asr_provider: smokeBackend ? "mock" : nextDefaults.asr_provider,
+          translation_provider: smokeBackend ? "mock" : nextDefaults.translation_provider,
           audio_device_id:
-            current.audio_device_id ??
+            nextDevices.find(
+              (device) => device.id === nextDefaults.audio_device_id && device.available,
+            )?.id ??
             nextDevices.find((device) => device.kind === "microphone" && device.is_default)?.id ??
             null,
-        }));
+        });
         setDevices(nextDevices);
         setCaption(nextCaption);
       })
@@ -146,6 +149,19 @@ export function AppProvider({ children }: PropsWithChildren) {
       unlisten();
     };
   }, []);
+
+  useEffect(() => {
+    if (loading || smokeBackend) return;
+    const timer = window.setTimeout(() => {
+      void api
+        .updateSessionDefaults({
+          ...draft,
+          expected_state_revision: snapshot.state_revision,
+        })
+        .catch((failure) => setError(message(failure)));
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [draft, loading, snapshot.state_revision]);
 
   const run = useCallback(async (action: () => Promise<SessionSnapshot>) => {
     setActionPending(true);

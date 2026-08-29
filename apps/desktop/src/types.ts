@@ -189,3 +189,19 @@ export const defaultCaptionPreferences: CaptionPreferences = {
   font_size_px: 30,
   opacity: 0.92,
 };
+
+export const defaultSessionDefaults: StartSessionRequest = {
+  expected_state_revision: 0,
+  source_language: "en",
+  target_language: "zh",
+  audio_source: "microphone",
+  audio_device_id: null,
+  audio_profile: "lecture",
+  inference_mode: "auto",
+  asr_provider: "auto",
+  translation_provider: "auto",
+  privacy: {
+    audio_upload_allowed: false,
+    transcript_upload_allowed: false,
+  },
+};

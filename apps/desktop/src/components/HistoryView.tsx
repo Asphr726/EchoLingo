@@ -206,7 +206,14 @@ export function HistoryView() {
             <div className="session-meta">
               <span>ASR <strong>{selected.session.asr_backend}</strong></span>
               <span>Translation <strong>{selected.session.translation_backend}</strong></span>
-              <span>Timing <strong>segment timestamps</strong></span>
+              <span>
+                Timing{" "}
+                <strong>
+                  {selected.segments.some((segment) => segment.timestamp_quality === "forced")
+                    ? "word-aligned"
+                    : "segment timestamps"}
+                </strong>
+              </span>
             </div>
             <div className="detail-segments">
               {selected.segments.length === 0 ? (

@@ -9,18 +9,18 @@ import type {
   StartSessionRequest,
   UiEventEnvelope,
 } from "../types";
-import { defaultCaptionPreferences, emptySnapshot } from "../types";
+import { defaultCaptionPreferences, defaultSessionDefaults, emptySnapshot } from "../types";
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
 
 export async function command<T>(name: string, args?: Record<string, unknown>): Promise<T> {
   if (!isTauri()) {
-    return browserFallback<T>(name);
+    return browserFallback<T>(name, args);
   }
   return invoke<T>(name, args);
 }
 
-function browserFallback<T>(name: string): T {
+function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
   const values: Record<string, unknown> = {
     get_app_snapshot: emptySnapshot,
     list_audio_devices: [
@@ -42,8 +42,15 @@ function browserFallback<T>(name: string): T {
       },
     ] satisfies AudioDevice[],
     get_caption_preferences: defaultCaptionPreferences,
+    get_session_defaults: defaultSessionDefaults,
     history_search: [],
   };
+  if (name === "update_session_defaults") {
+    return args?.defaults as T;
+  }
+  if (name === "update_caption_preferences") {
+    return args?.preferences as T;
+  }
   if (name in values) return values[name] as T;
   throw new Error(`${name} requires the Tauri desktop runtime`);
 }
@@ -67,6 +74,9 @@ export const api = {
   stop: (revision: number) =>
     command<SessionSnapshot>("stop_session", { expectedStateRevision: revision }),
   captionPreferences: () => command<CaptionPreferences>("get_caption_preferences"),
+  sessionDefaults: () => command<StartSessionRequest>("get_session_defaults"),
+  updateSessionDefaults: (defaults: StartSessionRequest) =>
+    command<StartSessionRequest>("update_session_defaults", { defaults }),
   updateCaptionPreferences: (preferences: CaptionPreferences) =>
     command<CaptionPreferences>("update_caption_preferences", { preferences }),
   showCaption: () => command<void>("show_caption_window"),

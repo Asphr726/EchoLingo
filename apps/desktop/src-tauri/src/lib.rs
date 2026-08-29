@@ -25,7 +25,7 @@ use transcript_store::{
 
 const UI_EVENT_CHANNEL: &str = "echolingo://ui-event";
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum CaptionDisplayMode {
     Both,
@@ -33,7 +33,7 @@ enum CaptionDisplayMode {
     Translation,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct CaptionPreferences {
     display: CaptionDisplayMode,
     recent_segments: u8,
@@ -59,8 +59,10 @@ struct RuntimeState {
     audio: tokio::sync::Mutex<Option<AudioCaptureSession>>,
     shutting_down: std::sync::atomic::AtomicBool,
     caption_preferences: Mutex<CaptionPreferences>,
+    session_defaults: Mutex<StartSessionRequest>,
     supervisor: Arc<InferenceSupervisor>,
     store: tokio::sync::OnceCell<TranscriptStore>,
+    preferences_path: std::sync::OnceLock<PathBuf>,
 }
 
 impl Default for RuntimeState {
@@ -73,8 +75,10 @@ impl Default for RuntimeState {
             audio: tokio::sync::Mutex::new(None),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             caption_preferences: Mutex::new(CaptionPreferences::default()),
+            session_defaults: Mutex::new(StartSessionRequest::default()),
             supervisor: InferenceSupervisor::new(SidecarLaunchConfig::development(project_root)),
             store: tokio::sync::OnceCell::new(),
+            preferences_path: std::sync::OnceLock::new(),
         }
     }
 }
@@ -120,6 +124,123 @@ impl RuntimeState {
             .get()
             .ok_or_else(|| "transcript store is not initialized".to_string())
     }
+
+    fn preferences(&self) -> Result<DesktopPreferences, String> {
+        Ok(DesktopPreferences {
+            schema_version: 1,
+            session: self
+                .session_defaults
+                .lock()
+                .map_err(|_| "session defaults lock poisoned".to_string())?
+                .clone(),
+            caption: self
+                .caption_preferences
+                .lock()
+                .map_err(|_| "caption preferences lock poisoned".to_string())?
+                .clone(),
+        })
+    }
+
+    fn persist_preferences(&self) -> Result<(), String> {
+        let path = self
+            .preferences_path
+            .get()
+            .ok_or_else(|| "preferences path is not initialized".to_string())?;
+        save_preferences(path, &self.preferences()?)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct DesktopPreferences {
+    schema_version: u16,
+    session: StartSessionRequest,
+    caption: CaptionPreferences,
+}
+
+impl Default for DesktopPreferences {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            session: StartSessionRequest::default(),
+            caption: CaptionPreferences::default(),
+        }
+    }
+}
+
+fn validate_session_defaults(defaults: &StartSessionRequest) -> Result<(), String> {
+    if !matches!(defaults.source_language.as_str(), "en" | "zh" | "ja" | "ko")
+        || !matches!(defaults.target_language.as_str(), "en" | "zh" | "ja" | "ko")
+    {
+        return Err("session languages must be en, zh, ja, or ko".into());
+    }
+    if defaults.source_language == defaults.target_language {
+        return Err("source and target languages must differ".into());
+    }
+    if !matches!(
+        defaults.audio_profile.as_str(),
+        "lecture" | "conversation" | "raw"
+    ) {
+        return Err("unknown audio profile".into());
+    }
+    if !matches!(
+        defaults.asr_provider.as_str(),
+        "auto" | "qwen_local" | "qwen_cloud" | "simulstreaming" | "mock"
+    ) {
+        return Err("unknown ASR provider".into());
+    }
+    if !matches!(
+        defaults.translation_provider.as_str(),
+        "auto" | "hymt_local" | "qwen_cloud" | "mock" | "none"
+    ) {
+        return Err("unknown translation provider".into());
+    }
+    Ok(())
+}
+
+fn validate_caption_preferences(preferences: &CaptionPreferences) -> Result<(), String> {
+    if !(18..=72).contains(&preferences.font_size_px) {
+        return Err("caption font size must be between 18 and 72 px".into());
+    }
+    if !(0.35..=1.0).contains(&preferences.opacity) || !preferences.opacity.is_finite() {
+        return Err("caption opacity must be between 0.35 and 1.0".into());
+    }
+    if !(1..=3).contains(&preferences.recent_segments) {
+        return Err("caption recent segments must be between 1 and 3".into());
+    }
+    Ok(())
+}
+
+fn load_preferences(path: &std::path::Path) -> DesktopPreferences {
+    let preferences = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<DesktopPreferences>(&bytes).ok())
+        .unwrap_or_default();
+    if preferences.schema_version != 1
+        || validate_session_defaults(&preferences.session).is_err()
+        || validate_caption_preferences(&preferences.caption).is_err()
+    {
+        DesktopPreferences::default()
+    } else {
+        preferences
+    }
+}
+
+fn save_preferences(
+    path: &std::path::Path,
+    preferences: &DesktopPreferences,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let temporary_path = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(preferences).map_err(|error| error.to_string())?;
+    std::fs::write(&temporary_path, bytes).map_err(|error| error.to_string())?;
+    #[cfg(target_os = "windows")]
+    if path.exists() {
+        std::fs::remove_file(path).map_err(|error| error.to_string())?;
+    }
+    std::fs::rename(&temporary_path, path).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -697,24 +818,43 @@ fn get_caption_preferences(state: State<'_, RuntimeState>) -> Result<CaptionPref
 }
 
 #[tauri::command]
+fn get_session_defaults(state: State<'_, RuntimeState>) -> Result<StartSessionRequest, String> {
+    let mut defaults = state
+        .session_defaults
+        .lock()
+        .map_err(|_| "session defaults lock poisoned".to_string())?
+        .clone();
+    defaults.expected_state_revision = state.snapshot()?.state_revision;
+    Ok(defaults)
+}
+
+#[tauri::command]
+fn update_session_defaults(
+    state: State<'_, RuntimeState>,
+    mut defaults: StartSessionRequest,
+) -> Result<StartSessionRequest, String> {
+    validate_session_defaults(&defaults)?;
+    defaults.expected_state_revision = state.snapshot()?.state_revision;
+    *state
+        .session_defaults
+        .lock()
+        .map_err(|_| "session defaults lock poisoned".to_string())? = defaults.clone();
+    state.persist_preferences()?;
+    Ok(defaults)
+}
+
+#[tauri::command]
 fn update_caption_preferences(
     app: AppHandle,
     state: State<'_, RuntimeState>,
     preferences: CaptionPreferences,
 ) -> Result<CaptionPreferences, String> {
-    if !(18..=72).contains(&preferences.font_size_px) {
-        return Err("caption font size must be between 18 and 72 px".into());
-    }
-    if !(0.35..=1.0).contains(&preferences.opacity) || !preferences.opacity.is_finite() {
-        return Err("caption opacity must be between 0.35 and 1.0".into());
-    }
-    if !(1..=3).contains(&preferences.recent_segments) {
-        return Err("caption recent segments must be between 1 and 3".into());
-    }
+    validate_caption_preferences(&preferences)?;
     *state
         .caption_preferences
         .lock()
         .map_err(|_| "caption preferences lock poisoned".to_string())? = preferences.clone();
+    state.persist_preferences()?;
     state.emit_event(
         &app,
         state.snapshot()?.session_id,
@@ -1064,6 +1204,8 @@ pub fn run() {
             get_app_snapshot,
             list_audio_devices,
             get_caption_preferences,
+            get_session_defaults,
+            update_session_defaults,
             update_caption_preferences,
             show_caption_window,
             hide_caption_window,
@@ -1079,13 +1221,30 @@ pub fn run() {
         ])
         .setup(|app| {
             let state = app.state::<RuntimeState>();
-            let database_path = app.path().app_data_dir()?.join("history.sqlite");
+            let app_data_directory = app.path().app_data_dir()?;
+            let database_path = app_data_directory.join("history.sqlite");
             let store = tauri::async_runtime::block_on(TranscriptStore::open(database_path))
                 .map_err(std::io::Error::other)?;
             state
                 .store
                 .set(store)
                 .map_err(|_| std::io::Error::other("store already initialized"))?;
+            let preferences_path = app_data_directory.join("preferences.json");
+            let preferences = load_preferences(&preferences_path);
+            *state
+                .session_defaults
+                .lock()
+                .map_err(|_| std::io::Error::other("session defaults lock poisoned"))? =
+                preferences.session;
+            *state
+                .caption_preferences
+                .lock()
+                .map_err(|_| std::io::Error::other("caption preferences lock poisoned"))? =
+                preferences.caption;
+            state
+                .preferences_path
+                .set(preferences_path)
+                .map_err(|_| std::io::Error::other("preferences path already initialized"))?;
             let snapshot = state.snapshot().map_err(std::io::Error::other)?;
             state
                 .emit_snapshot(app.handle(), &snapshot)
@@ -1112,4 +1271,39 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("failed to run EchoLingo desktop application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desktop_preferences_round_trip_and_reject_corruption() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preferences.json");
+        let mut preferences = DesktopPreferences::default();
+        preferences.session.source_language = "ja".into();
+        preferences.session.target_language = "en".into();
+        preferences.session.audio_profile = "lecture".into();
+        preferences.caption.opacity = 0.75;
+        save_preferences(&path, &preferences).unwrap();
+        let serialized = std::fs::read_to_string(&path).unwrap();
+        assert!(!serialized.contains("API_KEY") && !serialized.contains("DASHSCOPE"));
+
+        let loaded = load_preferences(&path);
+        assert_eq!(loaded.session.source_language, "ja");
+        assert_eq!(loaded.caption.opacity, 0.75);
+
+        std::fs::write(&path, b"not-json").unwrap();
+        let fallback = load_preferences(&path);
+        assert_eq!(fallback.session.source_language, "en");
+        assert_eq!(fallback.caption, CaptionPreferences::default());
+    }
+
+    #[test]
+    fn desktop_preferences_reject_invalid_language_pair() {
+        let mut defaults = StartSessionRequest::default();
+        defaults.target_language = defaults.source_language.clone();
+        assert!(validate_session_defaults(&defaults).is_err());
+    }
 }
