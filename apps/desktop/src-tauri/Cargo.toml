@@ -22,3 +22,4 @@ serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2", features = [] }
 tokio.workspace = true
+uuid.workspace = true

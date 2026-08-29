@@ -191,3 +191,110 @@ class FarFieldPipeline:
             if self.translation is not None and hasattr(self.translation.backend, "close"):
                 await self.translation.backend.close()
             self.sink.close()
+
+
+class StreamingPipelineSession:
+    """Incremental adapter used by the desktop inference sidecar.
+
+    The existing replay/listen runner remains available, while native desktop
+    capture can push timestamped frames without blocking an iterator.
+    """
+
+    def __init__(
+        self,
+        pipeline: FarFieldPipeline,
+        *,
+        session_id: str,
+        language: str,
+        streaming_mode: str = "streaming",
+    ) -> None:
+        self.pipeline = pipeline
+        self.session_id = session_id
+        self.language = language
+        self.streaming_mode = streaming_mode
+        self._consumer: asyncio.Task[None] | None = None
+        self._translation_consumer: asyncio.Task[None] | None = None
+        self._started = False
+        self._finished = False
+
+    async def start(self) -> None:
+        if self._started:
+            raise RuntimeError("streaming pipeline session already started")
+        if self.pipeline.translation is not None:
+            await self.pipeline.translation.start()
+        await self.pipeline.asr.start_session(
+            AsrSessionConfig(
+                session_id=self.session_id,
+                language=self.language,
+                streaming_mode=self.streaming_mode,
+            )
+        )
+        self._consumer = asyncio.create_task(self.pipeline._consume_events())
+        if self.pipeline.translation is not None:
+            self._translation_consumer = asyncio.create_task(
+                self.pipeline._consume_translations()
+            )
+        self._started = True
+
+    async def push_frame(
+        self, frame: AudioFrame, *, queue_depth: int = 0, dropped_frames: int = 0
+    ) -> ProcessedFrame:
+        if not self._started or self._finished:
+            raise RuntimeError("streaming pipeline session is not accepting audio")
+        processed = self.pipeline.process_frame(frame, queue_depth, dropped_frames)
+        self.pipeline.sink.write_frame(processed)
+        await self.pipeline.asr.push_audio(
+            AsrAudioChunk(
+                sequence=frame.sequence,
+                start_ms=self.pipeline.asr_audio_ms
+                - processed.asr_samples.size * 1000.0 / 16_000,
+                end_ms=self.pipeline.asr_audio_ms,
+                sample_rate_hz=16_000,
+                samples=processed.asr_samples,
+                vad_probability=processed.metrics.vad_probability,
+                speech_detected=processed.metrics.speech_detected,
+            )
+        )
+        return processed
+
+    async def finish(self) -> None:
+        if not self._started or self._finished:
+            return
+        tail = self.pipeline.resampler.process(
+            np.empty((0,), dtype=np.float32), end_of_input=True
+        )
+        if tail.size:
+            self.pipeline.asr_audio_ms += tail.size * 1000.0 / 16_000
+            await self.pipeline.asr.push_audio(
+                AsrAudioChunk(
+                    sequence=-1,
+                    start_ms=self.pipeline.asr_audio_ms - tail.size * 1000.0 / 16_000,
+                    end_ms=self.pipeline.asr_audio_ms,
+                    sample_rate_hz=16_000,
+                    samples=tail,
+                )
+            )
+        await self.pipeline.asr.finish_session()
+        if self._consumer is not None:
+            await self._consumer
+        if self._translation_consumer is not None:
+            await self._translation_consumer
+        self._finished = True
+        await self.close()
+
+    async def close(self) -> None:
+        for task in (self._consumer, self._translation_consumer):
+            if task is not None and not task.done():
+                task.cancel()
+        pending = [
+            task
+            for task in (self._consumer, self._translation_consumer)
+            if task is not None
+        ]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        await self.pipeline.asr.close()
+        translation = self.pipeline.translation
+        if translation is not None and hasattr(translation.backend, "close"):
+            await translation.backend.close()
+        self.pipeline.sink.close()

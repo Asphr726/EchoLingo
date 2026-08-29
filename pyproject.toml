@@ -39,6 +39,7 @@ whisper = [
 
 [project.scripts]
 echolingo = "echolingo.cli:main"
+echolingo-sidecar = "echolingo.service.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

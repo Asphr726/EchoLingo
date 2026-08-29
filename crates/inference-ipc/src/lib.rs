@@ -5,6 +5,9 @@ use serde_json::Value;
 use std::convert::TryInto;
 use uuid::Uuid;
 
+mod supervisor;
+pub use supervisor::{InferenceSupervisor, SidecarLaunchConfig, SupervisorError};
+
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const AUDIO_MAGIC: [u8; 4] = *b"ELAF";
 pub const AUDIO_HEADER_BYTES: usize = 32;

@@ -8,7 +8,7 @@ import numpy as np
 from echolingo.models import AudioFrame, BackendDescriptor, BackendLocality
 from echolingo.backends.asr.mock import MockStreamingAsrBackend
 from echolingo.backends.translation.mock import MockTranslationBackend
-from echolingo.pipeline import FarFieldPipeline, rms_dbfs
+from echolingo.pipeline import FarFieldPipeline, StreamingPipelineSession, rms_dbfs
 from echolingo.streaming import LectureSpeechPolicy
 from echolingo.translation import StreamingTranslationCoordinator
 
@@ -135,3 +135,25 @@ async def test_pipeline_runs_translation_without_coupling_audio_to_backend_type(
     await pipeline.run(source)
     assert sink.translations
     assert sink.translations[-1].committed_text == "译:mock 1"
+
+
+async def test_incremental_pipeline_session_accepts_native_frames() -> None:
+    sink = MemorySink()
+    asr = RecordingAsr()
+    pipeline = FarFieldPipeline(
+        IdentityProcessor(), AlwaysSilentVad(), LectureSpeechPolicy(), asr, sink, 16_000
+    )
+    session = StreamingPipelineSession(
+        pipeline, session_id="desktop-session", language="en"
+    )
+    await session.start()
+    frame = AudioFrame(
+        7, 100, None, 16_000, 1, np.full((160, 1), 0.25, dtype=np.float32), "native"
+    )
+    processed = await session.push_frame(frame)
+    await session.finish()
+
+    assert processed.metrics.sequence == 7
+    assert len(asr.frames) == 1
+    np.testing.assert_array_equal(asr.frames[0], frame.samples[:, 0])
+    assert asr.closed and sink.closed

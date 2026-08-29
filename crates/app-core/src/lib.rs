@@ -113,6 +113,7 @@ impl RouteStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct LiveMetrics {
     pub input_rms_dbfs: Option<f32>,
     pub enhanced_rms_dbfs: Option<f32>,
@@ -131,6 +132,7 @@ pub struct LiveMetrics {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct LiveTranscript {
     pub original_committed: String,
     pub original_unstable: String,
