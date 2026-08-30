@@ -99,6 +99,16 @@ class CalibrationStore:
                 return record
         return None
 
+    def current(self, runtime_fingerprint: str) -> dict[str, CalibrationRecord]:
+        """Return only records valid for this machine and packaged runtime."""
+        fingerprint = hardware_fingerprint()
+        return {
+            record.model: record
+            for record in self.load_all()
+            if record.hardware_fingerprint == fingerprint
+            and record.runtime_fingerprint == runtime_fingerprint
+        }
+
 
 def _peak_memory_bytes() -> int | None:
     try:

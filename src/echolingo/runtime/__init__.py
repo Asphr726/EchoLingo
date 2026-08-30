@@ -1,6 +1,6 @@
 from .calibration import CalibrationRecord, CalibrationStore, InferenceCalibrator
 from .capabilities import CapabilityDetector, RuntimeCapabilities
-from .router import RouteDecision, RuntimeRouter
+from .router import RouteDecision, RoutePlan, RuntimeRouter
 from .session import BackendFactory
 
 __all__ = [
@@ -10,6 +10,7 @@ __all__ = [
     "InferenceCalibrator",
     "CapabilityDetector",
     "RouteDecision",
+    "RoutePlan",
     "RuntimeCapabilities",
     "RuntimeRouter",
 ]

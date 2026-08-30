@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import platform
 import shutil
@@ -23,6 +24,7 @@ class RuntimeCapabilities:
     apple_silicon: bool
     metal_available: bool
     local_models: dict[str, bool] = field(default_factory=dict)
+    local_runtimes: dict[str, bool] = field(default_factory=dict)
     local_services: dict[str, bool] = field(default_factory=dict)
     network_available: bool = False
     credentials: dict[str, bool] = field(default_factory=dict)
@@ -81,6 +83,12 @@ class CapabilityDetector:
     def _metal(apple_silicon: bool) -> bool:
         if not apple_silicon:
             return False
+        try:
+            import torch
+
+            return bool(torch.backends.mps.is_available())
+        except (ImportError, AttributeError):
+            return False
 
     @staticmethod
     def _loopback_service(port: int) -> bool:
@@ -89,22 +97,47 @@ class CapabilityDetector:
                 return True
         except OSError:
             return False
-        try:
-            import torch
 
-            return bool(torch.backends.mps.is_available())
-        except (ImportError, AttributeError):
-            return False
+    def _model_roots(self) -> tuple[Path, ...]:
+        roots: list[Path] = []
+        configured = self.environ.get("ECHOLINGO_MODEL_ROOT")
+        if configured:
+            roots.append(Path(configured).expanduser())
+        try:
+            from platformdirs import user_data_path
+
+            roots.append(user_data_path("EchoLingo") / "models")
+        except ImportError:
+            pass
+        roots.append(self.project_root / "models")
+        return tuple(dict.fromkeys(roots))
+
+    def _has_model(self, *relative_paths: str) -> bool:
+        return any(
+            (root / relative_path).is_dir()
+            for root in self._model_roots()
+            for relative_path in relative_paths
+        )
+
+    def _local_runtimes(self) -> dict[str, bool]:
+        qwen_command = self.environ.get("ECHOLINGO_QWEN_ASR_COMMAND")
+        llama_command = self.environ.get("ECHOLINGO_LLAMA_SERVER")
+        return {
+            "qwen_asr": bool(qwen_command)
+            or importlib.util.find_spec("whisper_livekit") is not None,
+            "hymt": bool(llama_command)
+            or shutil.which("llama-server") is not None,
+        }
 
     def detect(self) -> RuntimeCapabilities:
         machine = platform.machine().lower()
         apple_silicon = platform.system() == "Darwin" and machine in {"arm64", "aarch64"}
         cuda, vram = self._cuda()
         models = {
-            "qwen3-asr-0.6b": (self.project_root / "models/qwen3-asr-0.6b").is_dir(),
-            "qwen3-asr-1.7b": (self.project_root / "models/qwen3-asr-1.7b").is_dir(),
-            "hymt2-1.8b": (self.project_root / "models/hymt2-1.8b").is_dir(),
-            "hymt2-7b": (self.project_root / "models/hymt2-7b").is_dir(),
+            "qwen3-asr-0.6b": self._has_model("qwen3-asr-0.6b"),
+            "qwen3-asr-1.7b": self._has_model("qwen3-asr-1.7b"),
+            "hymt2-1.8b": self._has_model("hymt2-1.8b", "hymt2-1.8b-gguf"),
+            "hymt2-7b": self._has_model("hymt2-7b", "hymt2-7b-gguf"),
         }
         credentials = {
             "dashscope_api_key": bool(self.environ.get("DASHSCOPE_API_KEY")),
@@ -126,6 +159,7 @@ class CapabilityDetector:
             apple_silicon=apple_silicon,
             metal_available=self._metal(apple_silicon),
             local_models=models,
+            local_runtimes=self._local_runtimes(),
             local_services=services,
             network_available=self.network_probe(),
             credentials=credentials,

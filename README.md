@@ -1,9 +1,10 @@
 # EchoLingo
 
-Local-first, cloud-capable multilingual interpreter. Its streaming core has
-entered Phase 3 desktop productization with Tauri 2 and React. Backend
-benchmarking and physical far-field validation continue as parallel release
-gates. TTS is intentionally out of scope.
+Local-first, cloud-capable multilingual interpreter. Its streaming core is in
+Phase 4 V1 Beta hardening with Tauri 2 and React. The accepted inference stack
+is frozen while desktop UX, native audio reliability, recovery, model setup and
+packaging are completed. Physical far-field validation remains a release gate.
+TTS is intentionally out of scope.
 
 ## Environment
 
@@ -68,4 +69,5 @@ npm run test:desktop
 cargo test --workspace
 ```
 
-See [Phase 3 productization](docs/phase3-productization.md).
+See [Phase 4 release hardening](docs/phase4-release.md) and
+[ADR 0004](docs/adr/0004-v1-beta-runtime-and-release.md).

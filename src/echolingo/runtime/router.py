@@ -18,6 +18,14 @@ class RouteDecision:
     reasons: tuple[str, ...]
 
 
+@dataclass(slots=True, frozen=True)
+class RoutePlan:
+    """A route that may require the desktop runtime manager to start services."""
+
+    decision: RouteDecision
+    services_to_start: tuple[str, ...]
+
+
 class RuntimeRouter:
     def __init__(
         self,
@@ -63,12 +71,27 @@ class RuntimeRouter:
     def _local_service_available(self, service: str) -> bool:
         return bool(self.capabilities.local_services.get(service))
 
-    def _select_asr(self, reasons: list[str]) -> tuple[str, bool]:
+    def _local_runtime_available(self, service: str) -> bool:
+        # Older capability snapshots only reported running services. Treat a
+        # healthy service as proof that its runtime exists.
+        return bool(
+            self.capabilities.local_runtimes.get(service)
+            or self._local_service_available(service)
+        )
+
+    def _select_asr(
+        self, reasons: list[str], *, require_healthy: bool
+    ) -> tuple[str, bool]:
         requested = self.config.asr.provider
         if requested != "auto":
             if requested == "qwen_cloud" and not self._cloud_available():
                 raise BackendUnavailableError("Cloud Qwen ASR credentials or network unavailable")
-            if requested == "qwen_local" and not self._local_service_available("qwen_asr"):
+            local_ready = (
+                self._local_service_available("qwen_asr")
+                if require_healthy
+                else self._local_runtime_available("qwen_asr")
+            )
+            if requested == "qwen_local" and not local_ready:
                 raise BackendUnavailableError("Local Qwen ASR runtime service is unavailable")
             return requested, False
 
@@ -78,7 +101,11 @@ class RuntimeRouter:
             for model in (quality, light):
                 if (
                     self.capabilities.local_models.get(model)
-                    and self._local_service_available("qwen_asr")
+                    and (
+                        self._local_service_available("qwen_asr")
+                        if require_healthy
+                        else self._local_runtime_available("qwen_asr")
+                    )
                     and self._asr_local_meets_sla(model)
                 ):
                     reasons.append(f"{model} passed local ASR calibration")
@@ -90,19 +117,31 @@ class RuntimeRouter:
         ):
             reasons.append("local ASR did not meet SLA; cloud is configured")
             return "qwen_cloud", False
-        if self.capabilities.local_models.get(light) and self._local_service_available("qwen_asr"):
+        local_ready = (
+            self._local_service_available("qwen_asr")
+            if require_healthy
+            else self._local_runtime_available("qwen_asr")
+        )
+        if self.capabilities.local_models.get(light) and local_ready:
             reasons.append("cloud unavailable or disallowed; using lightweight local ASR")
             return "qwen_local", True
         raise BackendUnavailableError("no ASR backend is available under the current policy")
 
-    def _select_translation(self, reasons: list[str]) -> tuple[str, bool]:
+    def _select_translation(
+        self, reasons: list[str], *, require_healthy: bool
+    ) -> tuple[str, bool]:
         requested = self.config.translation.provider
         if requested == "none":
             return "none", False
         if requested != "auto":
             if requested == "qwen_cloud" and not self._cloud_available():
                 raise BackendUnavailableError("Cloud Qwen-MT credentials or network unavailable")
-            if requested == "hymt_local" and not self._local_service_available("hymt"):
+            local_ready = (
+                self._local_service_available("hymt")
+                if require_healthy
+                else self._local_runtime_available("hymt")
+            )
+            if requested == "hymt_local" and not local_ready:
                 raise BackendUnavailableError("Local Hy-MT runtime service is unavailable")
             return requested, False
 
@@ -112,7 +151,11 @@ class RuntimeRouter:
             for model in (quality, light):
                 if (
                     self.capabilities.local_models.get(model)
-                    and self._local_service_available("hymt")
+                    and (
+                        self._local_service_available("hymt")
+                        if require_healthy
+                        else self._local_runtime_available("hymt")
+                    )
                     and self._translation_local_meets_sla(model)
                 ):
                     reasons.append(f"{model} passed local translation calibration")
@@ -124,16 +167,23 @@ class RuntimeRouter:
         ):
             reasons.append("local translation did not meet SLA; cloud is configured")
             return "qwen_cloud", False
-        if self.capabilities.local_models.get(light) and self._local_service_available("hymt"):
+        local_ready = (
+            self._local_service_available("hymt")
+            if require_healthy
+            else self._local_runtime_available("hymt")
+        )
+        if self.capabilities.local_models.get(light) and local_ready:
             reasons.append("cloud unavailable or disallowed; using lightweight local translation")
             return "hymt_local", True
         reasons.append("no translation backend available; translation disabled")
         return "none", True
 
-    def select(self) -> RouteDecision:
+    def _select(self, *, require_healthy: bool) -> RouteDecision:
         reasons: list[str] = []
-        asr, asr_degraded = self._select_asr(reasons)
-        translation, mt_degraded = self._select_translation(reasons)
+        asr, asr_degraded = self._select_asr(reasons, require_healthy=require_healthy)
+        translation, mt_degraded = self._select_translation(
+            reasons, require_healthy=require_healthy
+        )
         local = {"qwen_local", "simulstreaming", "hymt_local", "none", "mock"}
         asr_cloud = asr == "qwen_cloud"
         mt_cloud = translation == "qwen_cloud"
@@ -148,3 +198,22 @@ class RuntimeRouter:
             status = DeploymentStatus.DEGRADED
         assert asr in local or asr_cloud
         return RouteDecision(asr, translation, status, degraded, tuple(reasons))
+
+    def select(self) -> RouteDecision:
+        """Resolve a route whose local services are already healthy."""
+        return self._select(require_healthy=True)
+
+    def plan(self) -> RoutePlan:
+        """Resolve a cold-start route before local services are launched."""
+        decision = self._select(require_healthy=False)
+        services: list[str] = []
+        if decision.asr_provider == "qwen_local" and not self._local_service_available(
+            "qwen_asr"
+        ):
+            services.append("qwen_asr")
+        if (
+            decision.translation_provider == "hymt_local"
+            and not self._local_service_available("hymt")
+        ):
+            services.append("hymt")
+        return RoutePlan(decision, tuple(services))

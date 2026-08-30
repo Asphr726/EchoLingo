@@ -1,3 +1,5 @@
+import json
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -5,8 +7,12 @@ import pytest
 from echolingo.config import AppConfig, load_config
 from echolingo.errors import BackendUnavailableError, ConfigurationError
 from echolingo.models import DeploymentStatus
-from echolingo.runtime.calibration import CalibrationRecord, hardware_fingerprint
-from echolingo.runtime.capabilities import RuntimeCapabilities
+from echolingo.runtime.calibration import (
+    CalibrationRecord,
+    CalibrationStore,
+    hardware_fingerprint,
+)
+from echolingo.runtime.capabilities import CapabilityDetector, RuntimeCapabilities
 from echolingo.runtime.router import RuntimeRouter
 
 
@@ -22,6 +28,7 @@ def capabilities(**overrides) -> RuntimeCapabilities:
         apple_silicon=True,
         metal_available=True,
         local_models={"qwen3-asr-0.6b": True, "hymt2-1.8b": False},
+        local_runtimes={"qwen_asr": True, "hymt": False},
         local_services={"qwen_asr": True, "hymt": False},
         network_available=False,
         credentials={},
@@ -78,6 +85,47 @@ def test_router_does_not_treat_model_weights_as_a_running_backend() -> None:
             config,
             capabilities(local_services={"qwen_asr": False}),
         ).select()
+
+
+def test_router_plans_cold_local_runtime_without_treating_it_as_healthy() -> None:
+    config = AppConfig()
+    config.translation.provider = "none"
+    caps = capabilities(local_services={"qwen_asr": False})
+    plan = RuntimeRouter(
+        config,
+        caps,
+        {"qwen3-asr-0.6b": calibration("qwen3-asr-0.6b")},
+    ).plan()
+    assert plan.decision.asr_provider == "qwen_local"
+    assert plan.services_to_start == ("qwen_asr",)
+
+
+def test_metal_detection_returns_a_boolean() -> None:
+    assert CapabilityDetector._metal(False) is False
+    assert isinstance(CapabilityDetector._metal(True), bool)
+
+
+def test_calibration_store_filters_other_runtime_and_hardware(tmp_path: Path) -> None:
+    store = CalibrationStore(tmp_path / "calibration.json")
+    valid = calibration("qwen3-asr-0.6b")
+    wrong_runtime = calibration("qwen3-asr-1.7b")
+    wrong_runtime.runtime_fingerprint = "old-runtime"
+    wrong_hardware = calibration("hymt2-1.8b")
+    wrong_hardware.hardware_fingerprint = "other-machine"
+    store.path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "records": [
+                    asdict(valid),
+                    asdict(wrong_runtime),
+                    asdict(wrong_hardware),
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert list(store.current("test")) == ["qwen3-asr-0.6b"]
 
 
 def test_router_can_select_hybrid_independently() -> None:
