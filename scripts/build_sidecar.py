@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import platform
 import shutil
@@ -34,6 +35,10 @@ def main() -> int:
         shutil.rmtree(work)
     work.mkdir(parents=True, exist_ok=True)
     binaries.mkdir(parents=True, exist_ok=True)
+    nagisa_spec = importlib.util.find_spec("nagisa")
+    nagisa_paths = list(nagisa_spec.submodule_search_locations or []) if nagisa_spec else []
+    if not nagisa_paths:
+        raise RuntimeError("nagisa package directory is required for forced-alignment packaging")
     command = [
         sys.executable,
         "-m",
@@ -45,6 +50,11 @@ def main() -> int:
         "echolingo-sidecar",
         "--paths",
         str(root / "src"),
+        # nagisa 0.2.11 still uses package-local absolute imports (``prepro``,
+        # ``tagger`` and friends).  Add its package directory to the frozen
+        # search path so Japanese forced alignment works outside Conda too.
+        "--paths",
+        nagisa_paths[0],
         "--collect-submodules",
         "whisperlivekit.qwen3_streaming",
         "--add-data",

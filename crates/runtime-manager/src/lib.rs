@@ -211,7 +211,7 @@ impl LocalRuntimeManager {
                     "qwen3-streaming".into(),
                     "--model_dir".into(),
                     model.to_string_lossy().into_owned(),
-                    "--language".into(),
+                    "--lan".into(),
                     "en".into(),
                     "--pcm-input".into(),
                     "--no-vac".into(),
@@ -868,6 +868,11 @@ mod tests {
             .args
             .windows(2)
             .any(|pair| { pair[0] == "--qwen3-streaming-device" && pair[1] == "mps" }));
+        assert!(command
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "--lan" && pair[1] == "en"));
+        assert!(!command.args.iter().any(|argument| argument == "--language"));
     }
 
     #[cfg(unix)]

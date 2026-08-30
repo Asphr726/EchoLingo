@@ -59,6 +59,17 @@ function message(error: unknown): string {
 export function applyUiEvent(snapshot: SessionSnapshot, event: UiEventEnvelope): SessionSnapshot {
   const payload = event.payload as Record<string, unknown>;
   if (event.kind === "session_state") return event.payload as SessionSnapshot;
+  if (event.kind === "backend_health") {
+    const service = String(payload.service ?? "inference backend");
+    const state = String(payload.state ?? "starting");
+    const label = service === "qwen_asr" ? "Qwen3-ASR" : service === "hymt" ? "Hy-MT2" : service;
+    const startupStatus = state === "connected"
+      ? `${label} is ready.`
+      : service === "qwen_asr"
+        ? "Loading Qwen3-ASR on this device. The first start can take 1–2 minutes."
+        : `Loading ${label} on this device…`;
+    return { ...snapshot, startup_status: startupStatus };
+  }
   if (event.kind === "metrics") {
     return { ...snapshot, metrics: { ...snapshot.metrics, ...payload } };
   }

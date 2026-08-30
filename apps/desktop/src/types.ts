@@ -90,6 +90,7 @@ export interface SessionSnapshot {
   previous_segments: SegmentSummary[];
   metrics: LiveMetrics;
   recoverable_error: string | null;
+  startup_status?: string | null;
 }
 
 export interface AudioDevice {
@@ -222,6 +223,7 @@ export const emptySnapshot: SessionSnapshot = {
     dropped_audio_ms: 0,
   },
   recoverable_error: null,
+  startup_status: null,
 };
 
 export const defaultCaptionPreferences: CaptionPreferences = {

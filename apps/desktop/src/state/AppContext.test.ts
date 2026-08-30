@@ -46,4 +46,17 @@ describe("canonical desktop event projection", () => {
     expect(stable.live.original_committed).toBe("real-time interpretation");
     expect(stable.live.original_unstable).toBe("");
   });
+
+  it("projects local model startup progress from backend health events", () => {
+    const loading = applyUiEvent(
+      { ...emptySnapshot, phase: "STARTING" },
+      event("backend_health", { service: "qwen_asr", state: "starting" }),
+    );
+    const ready = applyUiEvent(
+      loading,
+      event("backend_health", { service: "qwen_asr", state: "connected" }),
+    );
+    expect(loading.startup_status).toContain("1–2 minutes");
+    expect(ready.startup_status).toBe("Qwen3-ASR is ready.");
+  });
 });

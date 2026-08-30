@@ -187,6 +187,11 @@ export function LiveView() {
           </button>
         </div>
         {actionPending && <div className="action-progress" aria-label="Session action in progress" />}
+        {snapshot.phase === "STARTING" && (
+          <p className="startup-status" role="status">
+            {snapshot.startup_status ?? "Starting the inference service and checking local models…"}
+          </p>
+        )}
         {privacyBlocked && (
           <p className="field-error" role="alert">
             Enable the required upload permission before starting this cloud route.

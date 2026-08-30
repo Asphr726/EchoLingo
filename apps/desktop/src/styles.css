@@ -200,6 +200,7 @@ select:hover, input[type="text"]:hover, textarea:hover { border-color: #b6b8ae; 
 .icon-button--danger { color: var(--danger); }
 .action-progress { height: 2px; margin-top: 13px; overflow: hidden; border-radius: 2px; background: #d9ddd7; }
 .action-progress::after { display: block; width: 32%; height: 100%; content: ""; background: var(--accent); animation: progress-slide 1.2s var(--ease) infinite; }
+.startup-status { margin: 10px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
 @keyframes progress-slide { from { transform: translateX(-100%); } to { transform: translateX(320%); } }
 .field-error, .inline-error { margin: 10px 0 0; color: var(--danger); font-size: 11px; }
 
