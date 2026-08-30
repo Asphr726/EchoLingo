@@ -10,7 +10,9 @@ fn main() {
         for framework in [
             "AppKit",
             "AudioToolbox",
+            "AVFAudio",
             "CoreAudio",
+            "CoreGraphics",
             "CoreMedia",
             "Foundation",
             "ScreenCaptureKit",

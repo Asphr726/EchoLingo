@@ -9,6 +9,7 @@ import { useState } from "react";
 import { useApp } from "../state/AppContext";
 import { HistoryView } from "./HistoryView";
 import { LiveView } from "./LiveView";
+import { Onboarding } from "./Onboarding";
 import { SettingsView } from "./SettingsView";
 
 type View = "live" | "history" | "settings";
@@ -21,8 +22,12 @@ const views = [
 
 export function MainWindow() {
   const [view, setView] = useState<View>("live");
-  const { clearError, error, loading, snapshot } = useApp();
+  const { clearError, error, loading, onboardingComplete, snapshot } = useApp();
   const activeRoute = snapshot.route?.deployment ?? "not routed";
+
+  if (!loading && !onboardingComplete) {
+    return <Onboarding />;
+  }
 
   return (
     <main className="desktop-shell">

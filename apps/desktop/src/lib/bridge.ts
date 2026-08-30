@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AudioDevice,
+  AudioPermissionStatus,
+  AudioTestResult,
   CaptionPreferences,
   CloudCredentialStatus,
   ModelProgress,
@@ -26,6 +28,7 @@ export async function command<T>(name: string, args?: Record<string, unknown>): 
 function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
   const values: Record<string, unknown> = {
     get_app_snapshot: emptySnapshot,
+    onboarding_status: false,
     list_audio_devices: [
       {
         id: "preview-microphone",
@@ -63,6 +66,10 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
         revision: "5eb144179a02acc5e5ba31e748d22b0cf3e303b0",
       },
     ] satisfies ModelStatus[],
+    audio_permission_status: {
+      microphone: "not_determined",
+      system_audio: "not_determined",
+    } satisfies AudioPermissionStatus,
   };
   if (name === "update_session_defaults") {
     return args?.defaults as T;
@@ -90,7 +97,15 @@ export async function subscribeModelProgress(
 
 export const api = {
   snapshot: () => command<SessionSnapshot>("get_app_snapshot"),
+  onboardingStatus: () => command<boolean>("onboarding_status"),
+  completeOnboarding: () => command<boolean>("complete_onboarding"),
   audioDevices: () => command<AudioDevice[]>("list_audio_devices"),
+  audioPermissionStatus: () =>
+    command<AudioPermissionStatus>("audio_permission_status"),
+  requestAudioPermission: (kind: "microphone" | "system_audio") =>
+    command<string>("request_audio_permission", { kind }),
+  testAudioInput: (source: StartSessionRequest["audio_source"], deviceId: string | null) =>
+    command<AudioTestResult>("test_audio_input", { source, deviceId }),
   start: (request: StartSessionRequest) =>
     command<SessionSnapshot>("start_session", { request }),
   pause: (revision: number) =>

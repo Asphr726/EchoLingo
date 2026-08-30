@@ -3,8 +3,11 @@ use app_core::{
     SegmentSummary, SessionPhase, SessionSnapshot, StartSessionRequest,
 };
 use audio_core::{
-    list_audio_devices as enumerate_audio_devices, start_microphone, start_system_audio,
-    AudioCaptureSession, AudioDevice, AudioSourceEvent,
+    audio_permission_status as native_permission_status,
+    list_audio_devices as enumerate_audio_devices,
+    request_audio_permission as request_native_audio_permission, start_microphone,
+    start_system_audio, AudioCaptureSession, AudioDevice, AudioPermissionStatus, AudioSourceEvent,
+    PermissionKind, PermissionState,
 };
 use inference_ipc::{
     AudioFrameHeader, InferenceSupervisor, SidecarCommand, SidecarEvent, SidecarLaunchConfig,
@@ -158,6 +161,7 @@ struct RuntimeState {
     preferences_path: std::sync::OnceLock<PathBuf>,
     credentials: CredentialStore,
     models: std::sync::OnceLock<ModelManager>,
+    onboarding_complete: std::sync::atomic::AtomicBool,
 }
 
 impl Default for RuntimeState {
@@ -176,6 +180,7 @@ impl Default for RuntimeState {
             preferences_path: std::sync::OnceLock::new(),
             credentials: CredentialStore,
             models: std::sync::OnceLock::new(),
+            onboarding_complete: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -225,6 +230,7 @@ impl RuntimeState {
     fn preferences(&self) -> Result<DesktopPreferences, String> {
         Ok(DesktopPreferences {
             schema_version: 1,
+            onboarding_complete: self.onboarding_complete.load(Ordering::Acquire),
             session: self
                 .session_defaults
                 .lock()
@@ -257,6 +263,7 @@ impl RuntimeState {
 #[serde(default)]
 struct DesktopPreferences {
     schema_version: u16,
+    onboarding_complete: bool,
     session: StartSessionRequest,
     caption: CaptionPreferences,
 }
@@ -265,6 +272,7 @@ impl Default for DesktopPreferences {
     fn default() -> Self {
         Self {
             schema_version: 1,
+            onboarding_complete: false,
             session: StartSessionRequest::default(),
             caption: CaptionPreferences::default(),
         }
@@ -349,6 +357,117 @@ fn save_preferences(
 #[tauri::command]
 fn get_app_snapshot(state: State<'_, RuntimeState>) -> Result<SessionSnapshot, String> {
     state.snapshot()
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AudioTestResult {
+    source: String,
+    sample_rate_hz: u32,
+    channels: u16,
+    peak_rms_dbfs: f32,
+    frames_observed: u64,
+}
+
+#[tauri::command]
+fn onboarding_status(state: State<'_, RuntimeState>) -> Result<bool, String> {
+    Ok(state.preferences()?.onboarding_complete)
+}
+
+#[tauri::command]
+fn complete_onboarding(state: State<'_, RuntimeState>) -> Result<bool, String> {
+    let path = state
+        .preferences_path
+        .get()
+        .ok_or_else(|| "preferences path is not initialized".to_string())?;
+    let mut preferences = state.preferences()?;
+    preferences.onboarding_complete = true;
+    save_preferences(path, &preferences)?;
+    state.onboarding_complete.store(true, Ordering::Release);
+    Ok(true)
+}
+
+#[tauri::command]
+async fn audio_permission_status() -> Result<AudioPermissionStatus, String> {
+    tauri::async_runtime::spawn_blocking(native_permission_status)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn request_audio_permission(kind: PermissionKind) -> Result<PermissionState, String> {
+    tauri::async_runtime::spawn_blocking(move || request_native_audio_permission(kind))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn test_audio_input(
+    state: State<'_, RuntimeState>,
+    source: AppAudioSourceKind,
+    device_id: Option<String>,
+) -> Result<AudioTestResult, String> {
+    if !matches!(
+        state.snapshot()?.phase,
+        SessionPhase::Idle | SessionPhase::Completed
+    ) {
+        return Err("audio test is unavailable during a session".into());
+    }
+    let mut capture = match source {
+        AppAudioSourceKind::Microphone => start_microphone(device_id.as_deref()),
+        AppAudioSourceKind::SystemAudio => start_system_audio(),
+        AppAudioSourceKind::SystemAudioAndMicrophone => {
+            return Err("combined audio testing is not implemented".into())
+        }
+    }
+    .map_err(|error| error.to_string())?;
+    let mut events = capture
+        .take_events()
+        .ok_or_else(|| "audio test event stream is unavailable".to_string())?;
+    let mut frames = capture
+        .take_frames()
+        .ok_or_else(|| "audio test frame stream is unavailable".to_string())?;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        while let Some(event) = events.recv().await {
+            match event {
+                AudioSourceEvent::Started => break,
+                AudioSourceEvent::PickerCancelled => {
+                    return Err("system audio selection was cancelled".into())
+                }
+                AudioSourceEvent::Error { message, .. }
+                | AudioSourceEvent::DeviceRemoved { message } => return Err(message),
+                _ => {}
+            }
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut peak = -120.0_f32;
+        let mut observed = 0_u64;
+        let mut format = None;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(500), frames.recv()).await {
+                Ok(Some(frame)) => {
+                    peak = peak.max(frame.rms_dbfs());
+                    observed += frame.frame_count() as u64;
+                    format = Some((frame.sample_rate_hz, frame.channels));
+                }
+                Ok(None) => break,
+                Err(_) if observed > 0 => break,
+                Err(_) => continue,
+            }
+        }
+        let (sample_rate_hz, channels) =
+            format.ok_or_else(|| "audio source started but produced no samples".to_string())?;
+        Ok(AudioTestResult {
+            source: value_name(&source),
+            sample_rate_hz,
+            channels,
+            peak_rms_dbfs: peak,
+            frames_observed: observed,
+        })
+    })
+    .await
+    .map_err(|_| "audio test timed out".to_string())?;
+    let _ = capture.stop();
+    result
 }
 
 #[tauri::command]
@@ -1387,6 +1506,11 @@ pub fn run() {
         .manage(RuntimeState::default())
         .invoke_handler(tauri::generate_handler![
             get_app_snapshot,
+            onboarding_status,
+            complete_onboarding,
+            audio_permission_status,
+            request_audio_permission,
+            test_audio_input,
             credential_status,
             set_cloud_credentials,
             clear_cloud_credentials,
@@ -1427,6 +1551,9 @@ pub fn run() {
                 .set(ModelManager::new(app_data_directory.join("models")))
                 .map_err(|_| std::io::Error::other("model manager already initialized"))?;
             let preferences = load_preferences(&preferences_path);
+            state
+                .onboarding_complete
+                .store(preferences.onboarding_complete, Ordering::Release);
             *state
                 .session_defaults
                 .lock()
@@ -1482,6 +1609,7 @@ mod tests {
         preferences.session.target_language = "en".into();
         preferences.session.audio_profile = "lecture".into();
         preferences.caption.opacity = 0.75;
+        preferences.onboarding_complete = true;
         save_preferences(&path, &preferences).unwrap();
         let serialized = std::fs::read_to_string(&path).unwrap();
         assert!(!serialized.contains("API_KEY") && !serialized.contains("DASHSCOPE"));
@@ -1489,6 +1617,7 @@ mod tests {
         let loaded = load_preferences(&path);
         assert_eq!(loaded.session.source_language, "ja");
         assert_eq!(loaded.caption.opacity, 0.75);
+        assert!(loaded.onboarding_complete);
 
         std::fs::write(&path, b"not-json").unwrap();
         let fallback = load_preferences(&path);

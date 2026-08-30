@@ -101,6 +101,21 @@ export interface AudioDevice {
   requires_picker: boolean;
 }
 
+export type PermissionState = "not_determined" | "denied" | "granted" | "unavailable";
+
+export interface AudioPermissionStatus {
+  microphone: PermissionState;
+  system_audio: PermissionState;
+}
+
+export interface AudioTestResult {
+  source: string;
+  sample_rate_hz: number;
+  channels: number;
+  peak_rms_dbfs: number;
+  frames_observed: number;
+}
+
 export interface CaptionPreferences {
   display: CaptionDisplay;
   recent_segments: number;

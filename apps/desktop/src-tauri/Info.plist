@@ -4,5 +4,9 @@
 <dict>
   <key>NSMicrophoneUsageDescription</key>
   <string>EchoLingo uses the selected microphone to generate live local or explicitly authorized cloud captions.</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>EchoLingo captures audio from a display or application you explicitly select for live captions.</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>EchoLingo captures system audio only after you choose a source and start a session.</string>
 </dict>
 </plist>

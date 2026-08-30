@@ -39,8 +39,10 @@ interface AppContextValue {
   caption: CaptionPreferences;
   loading: boolean;
   actionPending: boolean;
+  onboardingComplete: boolean;
   error: string | null;
   clearError: () => void;
+  completeOnboarding: () => Promise<void>;
   start: () => Promise<void>;
   pause: () => Promise<void>;
   resume: () => Promise<void>;
@@ -102,6 +104,7 @@ export function AppProvider({ children }: PropsWithChildren) {
   const [caption, setCaption] = useState<CaptionPreferences>(defaultCaptionPreferences);
   const [loading, setLoading] = useState(true);
   const [actionPending, setActionPending] = useState(false);
+  const [onboardingComplete, setOnboardingComplete] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -109,13 +112,15 @@ export function AppProvider({ children }: PropsWithChildren) {
     let unlisten: () => void = () => undefined;
     Promise.all([
       api.snapshot(),
+      api.onboardingStatus(),
       api.audioDevices(),
       api.captionPreferences(),
       api.sessionDefaults(),
     ])
-      .then(([nextSnapshot, nextDevices, nextCaption, nextDefaults]) => {
+      .then(([nextSnapshot, nextOnboarding, nextDevices, nextCaption, nextDefaults]) => {
         if (!active) return;
         setSnapshot(nextSnapshot);
+        setOnboardingComplete(nextOnboarding);
         setDraft({
           ...nextDefaults,
           expected_state_revision: nextSnapshot.state_revision,
@@ -206,6 +211,17 @@ export function AppProvider({ children }: PropsWithChildren) {
       setError(message(failure));
     }
   }, []);
+  const completeOnboarding = useCallback(async () => {
+    setActionPending(true);
+    setError(null);
+    try {
+      setOnboardingComplete(await api.completeOnboarding());
+    } catch (failure) {
+      setError(message(failure));
+    } finally {
+      setActionPending(false);
+    }
+  }, []);
 
   const value = useMemo<AppContextValue>(
     () => ({
@@ -216,8 +232,10 @@ export function AppProvider({ children }: PropsWithChildren) {
       caption,
       loading,
       actionPending,
+      onboardingComplete,
       error,
       clearError: () => setError(null),
+      completeOnboarding,
       start,
       pause,
       resume,
@@ -231,6 +249,8 @@ export function AppProvider({ children }: PropsWithChildren) {
       draft,
       error,
       loading,
+      onboardingComplete,
+      completeOnboarding,
       pause,
       resume,
       snapshot,

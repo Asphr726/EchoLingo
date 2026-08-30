@@ -22,6 +22,77 @@ pub enum AudioSourceKind {
     SystemAudio,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionKind {
+    Microphone,
+    SystemAudio,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionState {
+    NotDetermined,
+    Denied,
+    Granted,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioPermissionStatus {
+    pub microphone: PermissionState,
+    pub system_audio: PermissionState,
+}
+
+#[cfg(target_os = "macos")]
+fn permission_from_native(value: i32) -> PermissionState {
+    match value {
+        0 => PermissionState::NotDetermined,
+        1 => PermissionState::Denied,
+        2 => PermissionState::Granted,
+        _ => PermissionState::Unavailable,
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn audio_permission_status() -> AudioPermissionStatus {
+    extern "C" {
+        fn el_macos_audio_permission_status(kind: i32) -> i32;
+    }
+    AudioPermissionStatus {
+        microphone: permission_from_native(unsafe { el_macos_audio_permission_status(0) }),
+        system_audio: permission_from_native(unsafe { el_macos_audio_permission_status(1) }),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn audio_permission_status() -> AudioPermissionStatus {
+    AudioPermissionStatus {
+        microphone: PermissionState::NotDetermined,
+        system_audio: PermissionState::Unavailable,
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn request_audio_permission(kind: PermissionKind) -> PermissionState {
+    extern "C" {
+        fn el_macos_request_audio_permission(kind: i32) -> i32;
+    }
+    let kind = match kind {
+        PermissionKind::Microphone => 0,
+        PermissionKind::SystemAudio => 1,
+    };
+    permission_from_native(unsafe { el_macos_request_audio_permission(kind) })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn request_audio_permission(kind: PermissionKind) -> PermissionState {
+    match kind {
+        PermissionKind::Microphone => PermissionState::NotDetermined,
+        PermissionKind::SystemAudio => PermissionState::Unavailable,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioDevice {
     pub id: String,

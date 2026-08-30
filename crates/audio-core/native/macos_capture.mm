@@ -1,6 +1,8 @@
 #import <AppKit/AppKit.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import <AVFAudio/AVFAudio.h>
 #import <CoreMedia/CoreMedia.h>
+#import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <mach/mach_time.h>
@@ -9,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+#include <atomic>
 
 extern "C" {
 typedef void (*ELAudioCallback)(const float *samples, size_t frames,
@@ -19,6 +22,8 @@ typedef void (*ELStateCallback)(int32_t code, const char *message,
 }
 
 namespace {
+std::atomic_bool screenPermissionRequested{false};
+
 uint64_t monotonicNanoseconds() {
   static mach_timebase_info_data_t info = [] {
     mach_timebase_info_data_t value{};
@@ -29,6 +34,56 @@ uint64_t monotonicNanoseconds() {
   return ticks * info.numer / info.denom;
 }
 } // namespace
+
+extern "C" int32_t el_macos_audio_permission_status(int32_t kind) {
+  @autoreleasepool {
+    if (kind == 0) {
+      switch (AVAudioApplication.sharedInstance.recordPermission) {
+      case AVAudioApplicationRecordPermissionGranted:
+        return 2;
+      case AVAudioApplicationRecordPermissionDenied:
+        return 1;
+      default:
+        return 0;
+      }
+    }
+    if (kind == 1) {
+      if (CGPreflightScreenCaptureAccess()) {
+        return 2;
+      }
+      return screenPermissionRequested.load() ? 1 : 0;
+    }
+    return 3;
+  }
+}
+
+extern "C" int32_t el_macos_request_audio_permission(int32_t kind) {
+  @autoreleasepool {
+    if (kind == 0) {
+      dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+      __block BOOL granted = NO;
+      dispatch_async(dispatch_get_main_queue(), ^{
+        [AVAudioApplication
+            requestRecordPermissionWithCompletionHandler:^(BOOL allowed) {
+              granted = allowed;
+              dispatch_semaphore_signal(semaphore);
+            }];
+      });
+      if (dispatch_semaphore_wait(
+              semaphore,
+              dispatch_time(DISPATCH_TIME_NOW,
+                            static_cast<int64_t>(120 * NSEC_PER_SEC))) != 0) {
+        return 0;
+      }
+      return granted ? 2 : 1;
+    }
+    if (kind == 1) {
+      screenPermissionRequested.store(true);
+      return CGRequestScreenCaptureAccess() ? 2 : 1;
+    }
+    return 3;
+  }
+}
 
 @interface ELMacSystemAudioCapture
     : NSObject <SCStreamOutput, SCStreamDelegate,
