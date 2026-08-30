@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -12,6 +13,35 @@ import numpy as np
 from ..alignment import alignment_update_event
 from ..models import AlignmentRequest, AlignmentResult, TranscriptEvent, TranscriptKind
 from ..protocols import AlignmentService
+
+
+ALIGNMENT_SPOOL_ENV = "ECHOLINGO_ALIGNMENT_SPOOL_ROOT"
+ALIGNMENT_SPOOL_MAX_AGE_SECONDS = 24 * 60 * 60
+
+
+def prepare_alignment_spool_directory(
+    directory: Path | None = None, *, now: float | None = None
+) -> Path | None:
+    """Create the private spool and expire crash leftovers after 24 hours."""
+    configured = directory
+    if configured is None:
+        value = os.environ.get(ALIGNMENT_SPOOL_ENV)
+        configured = Path(value) if value else None
+    if configured is None:
+        return None
+    configured.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        configured.chmod(0o700)
+    except OSError:
+        pass
+    cutoff = (time.time() if now is None else now) - ALIGNMENT_SPOOL_MAX_AGE_SECONDS
+    for candidate in configured.glob("echolingo-alignment-*.pcm16"):
+        try:
+            if candidate.lstat().st_mtime <= cutoff:
+                candidate.unlink()
+        except FileNotFoundError:
+            continue
+    return configured
 
 
 class SessionAlignmentCapture:
@@ -26,6 +56,7 @@ class SessionAlignmentCapture:
     ) -> None:
         self.service = service
         self.sample_rate_hz = sample_rate_hz
+        temporary_directory = prepare_alignment_spool_directory(temporary_directory)
         temporary = tempfile.NamedTemporaryFile(
             mode="wb",
             prefix="echolingo-alignment-",

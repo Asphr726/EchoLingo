@@ -76,6 +76,10 @@ impl InferenceSupervisor {
         *self.secret_environment.lock().await = values;
     }
 
+    pub async fn is_connected(&self) -> bool {
+        self.commands.lock().await.is_some()
+    }
+
     pub async fn ensure_started(self: &Arc<Self>) -> Result<(), SupervisorError> {
         if self.commands.lock().await.is_some() {
             return Ok(());
@@ -170,6 +174,7 @@ impl InferenceSupervisor {
         let (commands, mut outbound) = mpsc::channel::<Message>(512);
         *self.commands.lock().await = Some(commands);
         let event_bus = self.events.clone();
+        let weak_supervisor = Arc::downgrade(self);
         tokio::spawn(async move {
             while let Some(message) = outbound.recv().await {
                 if writer.send(message).await.is_err() {
@@ -185,6 +190,18 @@ impl InferenceSupervisor {
                         let _ = event_bus.send(event);
                     }
                 }
+            }
+            if let Some(supervisor) = weak_supervisor.upgrade() {
+                supervisor.commands.lock().await.take();
+                if let Some(mut child) = supervisor.child.lock().await.take() {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                }
+                let _ = event_bus.send(SidecarEvent::Error {
+                    code: "sidecar_disconnected".into(),
+                    message: "Inference process disconnected; the desktop remains available".into(),
+                    recoverable: true,
+                });
             }
         });
         Ok(())

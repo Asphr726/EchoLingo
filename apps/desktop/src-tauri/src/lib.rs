@@ -162,6 +162,7 @@ struct RuntimeState {
     credentials: CredentialStore,
     models: std::sync::OnceLock<ModelManager>,
     onboarding_complete: std::sync::atomic::AtomicBool,
+    persistence_throttle: Mutex<PersistenceThrottle>,
 }
 
 impl Default for RuntimeState {
@@ -181,7 +182,47 @@ impl Default for RuntimeState {
             credentials: CredentialStore,
             models: std::sync::OnceLock::new(),
             onboarding_complete: std::sync::atomic::AtomicBool::new(false),
+            persistence_throttle: Mutex::new(PersistenceThrottle::default()),
         }
+    }
+}
+
+#[derive(Default)]
+struct PersistenceThrottle {
+    last_metrics_ms: HashMap<uuid::Uuid, f64>,
+    last_partial_at: HashMap<(uuid::Uuid, &'static str), std::time::Instant>,
+}
+
+impl PersistenceThrottle {
+    fn allow_metrics(&mut self, session_id: uuid::Uuid, captured_ms: f64) -> bool {
+        let previous = self.last_metrics_ms.entry(session_id).or_insert(-1_000.0);
+        if captured_ms - *previous < 1_000.0 {
+            return false;
+        }
+        *previous = captured_ms;
+        true
+    }
+
+    fn allow_revision(&mut self, session_id: uuid::Uuid, stream: &'static str, kind: &str) -> bool {
+        if kind != "partial" {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        let previous = self.last_partial_at.entry((session_id, stream)).or_insert(
+            now.checked_sub(std::time::Duration::from_millis(500))
+                .unwrap_or(now),
+        );
+        if now.duration_since(*previous) < std::time::Duration::from_millis(500) {
+            return false;
+        }
+        *previous = now;
+        true
+    }
+
+    fn finish(&mut self, session_id: uuid::Uuid) {
+        self.last_metrics_ms.remove(&session_id);
+        self.last_partial_at
+            .retain(|(stored_session, _), _| *stored_session != session_id);
     }
 }
 
@@ -622,6 +663,14 @@ async fn persist_sidecar_event(
             let kind = payload["kind"].as_str().unwrap_or("partial");
             let text = payload["text"].as_str().unwrap_or_default();
             let segment_id = payload["event_id"].as_str().and_then(|id| id.parse().ok());
+            let persist_revision = state
+                .persistence_throttle
+                .lock()
+                .map_err(|_| "persistence throttle lock poisoned".to_string())?
+                .allow_revision(session_id, "source", kind);
+            if !persist_revision {
+                return Ok(());
+            }
             store
                 .append_revision(
                     session_id,
@@ -685,6 +734,14 @@ async fn persist_sidecar_event(
             let revision = payload["revision_id"].as_i64().unwrap_or(0);
             let kind = payload["kind"].as_str().unwrap_or("partial");
             let text = payload["text"].as_str().unwrap_or_default();
+            let persist_revision = state
+                .persistence_throttle
+                .lock()
+                .map_err(|_| "persistence throttle lock poisoned".to_string())?
+                .allow_revision(session_id, "target", kind);
+            if !persist_revision {
+                return Ok(());
+            }
             store
                 .append_revision(
                     session_id,
@@ -707,12 +764,17 @@ async fn persist_sidecar_event(
                 .map_err(|error| error.to_string())?;
         }
         SidecarEvent::Metrics(payload) => {
+            let captured_audio_ms = payload["captured_audio_ms"].as_f64().unwrap_or(0.0);
+            let persist_metrics = state
+                .persistence_throttle
+                .lock()
+                .map_err(|_| "persistence throttle lock poisoned".to_string())?
+                .allow_metrics(session_id, captured_audio_ms);
+            if !persist_metrics {
+                return Ok(());
+            }
             store
-                .record_metrics(
-                    session_id,
-                    payload["captured_audio_ms"].as_f64().unwrap_or(0.0),
-                    payload,
-                )
+                .record_metrics(session_id, captured_audio_ms, payload)
                 .await
                 .map_err(|error| error.to_string())?;
         }
@@ -1239,6 +1301,16 @@ async fn start_session(
             "ECHOLINGO_MODEL_ROOT".into(),
             state.models()?.root().to_string_lossy().into_owned(),
         );
+        let alignment_spool = state
+            .models()?
+            .root()
+            .parent()
+            .ok_or_else(|| "model directory has no application-data parent".to_string())?
+            .join("alignment-spool");
+        sidecar_environment.insert(
+            "ECHOLINGO_ALIGNMENT_SPOOL_ROOT".into(),
+            alignment_spool.to_string_lossy().into_owned(),
+        );
         state
             .supervisor
             .configure_secret_environment(sidecar_environment)
@@ -1441,6 +1513,9 @@ async fn stop_session(
             .complete_session(session_id, &[])
             .await
             .map_err(|error| error.to_string())?;
+        if let Ok(mut throttle) = state.persistence_throttle.lock() {
+            throttle.finish(session_id);
+        }
     }
     state.emit_snapshot(&app, &completed)?;
     Ok(completed)
@@ -1588,6 +1663,8 @@ pub fn run() {
             let database_path = app_data_directory.join("history.sqlite");
             let store = tauri::async_runtime::block_on(TranscriptStore::open(database_path))
                 .map_err(std::io::Error::other)?;
+            tauri::async_runtime::block_on(store.recover_active_sessions())
+                .map_err(std::io::Error::other)?;
             state
                 .store
                 .set(store)
@@ -1687,5 +1764,19 @@ mod tests {
         };
         let error = validate_cloud_credentials(&input).unwrap_err();
         assert!(!error.contains("sekrit"));
+    }
+
+    #[test]
+    fn persistence_throttle_bounds_hot_path_writes() {
+        let session = uuid::Uuid::new_v4();
+        let mut throttle = PersistenceThrottle::default();
+        assert!(throttle.allow_metrics(session, 0.0));
+        assert!(!throttle.allow_metrics(session, 10.0));
+        assert!(throttle.allow_metrics(session, 1_000.0));
+        assert!(throttle.allow_revision(session, "source", "partial"));
+        assert!(!throttle.allow_revision(session, "source", "partial"));
+        assert!(throttle.allow_revision(session, "source", "stable"));
+        throttle.finish(session);
+        assert!(throttle.allow_metrics(session, 20.0));
     }
 }

@@ -10,6 +10,25 @@ import pytest
 from echolingo.alignment import MockAlignmentService, QwenForcedAlignmentService
 from echolingo.models import BackendLocality, TranscriptEvent, TranscriptKind
 from echolingo.service.alignment import SessionAlignmentCapture
+from echolingo.service.alignment import (
+    ALIGNMENT_SPOOL_MAX_AGE_SECONDS,
+    prepare_alignment_spool_directory,
+)
+
+
+def test_alignment_spool_expires_only_old_capture_files(tmp_path) -> None:
+    current = tmp_path / "echolingo-alignment-current.pcm16"
+    expired = tmp_path / "echolingo-alignment-expired.pcm16"
+    unrelated = tmp_path / "keep-me.txt"
+    for path in (current, expired, unrelated):
+        path.write_bytes(b"audio")
+    now = time.time()
+    os.utime(expired, (now - ALIGNMENT_SPOOL_MAX_AGE_SECONDS - 1,) * 2)
+
+    assert prepare_alignment_spool_directory(tmp_path, now=now) == tmp_path
+    assert current.exists()
+    assert not expired.exists()
+    assert unrelated.exists()
 
 
 async def test_session_alignment_is_async_revision_update_and_deletes_audio(tmp_path) -> None:

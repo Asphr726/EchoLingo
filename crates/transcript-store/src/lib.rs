@@ -178,6 +178,20 @@ impl TranscriptStore {
         Ok(())
     }
 
+    pub async fn recover_active_sessions(&self) -> Result<u64, StoreError> {
+        let now = timestamp(Utc::now());
+        let warning = serde_json::to_string(&["Application stopped before the session completed"])?;
+        let result = sqlx::query(
+            "UPDATE sessions SET status='interrupted',ended_at=?,warnings_json=?,updated_at=? WHERE status='active'",
+        )
+        .bind(&now)
+        .bind(warning)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn upsert_segment(
         &self,
         segment: &SegmentDraft,
@@ -547,5 +561,41 @@ mod tests {
             store.session(session_id).await,
             Err(StoreError::SessionNotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn active_session_is_preserved_and_marked_interrupted_on_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.sqlite");
+        let session_id = Uuid::new_v4();
+        {
+            let store = TranscriptStore::open(&path).await.unwrap();
+            store
+                .create_session(&session_draft(session_id))
+                .await
+                .unwrap();
+            store
+                .upsert_segment(&SegmentDraft {
+                    id: Uuid::new_v4(),
+                    session_id,
+                    ordinal: 1,
+                    start_ms: 0.0,
+                    end_ms: 500.0,
+                    source_text: "Preserved before crash".into(),
+                    source_final: false,
+                    asr_confidence: None,
+                    source_revision: 1,
+                    timestamp_quality: "interpolated".into(),
+                    word_timings: serde_json::json!([]),
+                })
+                .await
+                .unwrap();
+        }
+        let reopened = TranscriptStore::open(&path).await.unwrap();
+        assert_eq!(reopened.recover_active_sessions().await.unwrap(), 1);
+        let detail = reopened.detail(session_id).await.unwrap();
+        assert_eq!(detail.session.status, "interrupted");
+        assert!(detail.session.ended_at.is_some());
+        assert_eq!(detail.segments[0].source_text, "Preserved before crash");
     }
 }
