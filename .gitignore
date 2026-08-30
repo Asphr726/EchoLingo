@@ -15,6 +15,7 @@ data/generated/
 node_modules/
 dist/
 target/
+apps/desktop/src-tauri/binaries/
 *.log
 apps/desktop/src-tauri/gen/
 apps/desktop/.vite/

@@ -1,6 +1,6 @@
 # Spike 1 third-party component review
 
-Status checked on 2026-08-29. Python versions are pinned in `pyproject.toml`;
+Status checked on 2026-08-30. Python versions are pinned in `pyproject.toml`;
 desktop Rust versions are locked in `Cargo.lock`.
 
 | Component | Role | License | Languages | Platforms / status |
@@ -23,6 +23,7 @@ desktop Rust versions are locked in `Cargo.lock`.
 | keyring-rs 4.2 | secure cloud credential abstraction | MIT OR Apache-2.0 | n/a | Current native macOS Keychain, Windows Credential Manager and Linux Secret Service adapters |
 | hf-hub 1.0 | pinned model download, retry and progress | Apache-2.0 | n/a | Current async Rust client; content-addressed cache and cross-platform filesystem support; Rust 1.88+ |
 | llama.cpp / llama-server | Hy-MT2 GGUF runtime | MIT | model-dependent | Active; OpenAI-compatible local server with Apple Metal, CUDA and CPU paths |
+| PyInstaller 6.22.2 | self-contained Python sidecar packaging | GPL-2.0-or-later with distribution exception | n/a | Released 2026-08-17; Python 3.8+, native macOS/Windows/Linux builds; not a cross-compiler |
 
 Primary sources: QwenLM/Qwen3-ASR, ufal/SimulStreaming,
 QuentinFuxa/WhisperLiveKit, spatialaudio/python-sounddevice,
@@ -30,5 +31,5 @@ strands-labs/pywebrtc-audio, snakers4/silero-vad,
 tuxu/python-samplerate, Rikorose/DeepFilterNet, Google FLEURS, and OpenSLR.
 Cloud protocol sources: Alibaba Cloud Model Studio realtime ASR interaction
 flow and Qwen-MT API reference. Hy-MT2 source: Tencent's official model cards.
-Desktop runtime sources: the official keyring-rs, hf-hub and llama.cpp
-repositories/documentation.
+Desktop runtime sources: the official keyring-rs, hf-hub, llama.cpp and
+PyInstaller repositories/documentation.

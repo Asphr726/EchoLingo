@@ -8,7 +8,19 @@ import pytest
 
 from echolingo.service.protocol import ProtocolError, decode_audio_packet
 from echolingo.service.server import SidecarConnection
-from echolingo.service.session import DesktopInferenceSession, resolve_frontend_profile
+from echolingo.service.session import (
+    DesktopInferenceSession,
+    resolve_frontend_profile,
+    runtime_resource_path,
+)
+
+
+def test_runtime_resource_path_uses_explicit_packaged_root(tmp_path, monkeypatch) -> None:
+    resource = tmp_path / "models" / "silero_vad.onnx"
+    resource.parent.mkdir()
+    resource.write_bytes(b"onnx")
+    monkeypatch.setenv("ECHOLINGO_RESOURCE_ROOT", str(tmp_path))
+    assert runtime_resource_path("models/silero_vad.onnx") == resource
 
 
 def audio_packet(samples: np.ndarray, *, sequence: int = 1, rate: int = 16_000) -> bytes:

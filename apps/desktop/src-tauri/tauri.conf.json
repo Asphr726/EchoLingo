@@ -42,6 +42,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "externalBin": ["binaries/echolingo-sidecar"],
     "icon": ["icons/icon.png"],
     "macOS": {"minimumSystemVersion": "14.0"}
   }

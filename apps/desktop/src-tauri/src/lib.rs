@@ -176,7 +176,7 @@ impl Default for RuntimeState {
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             caption_preferences: Mutex::new(CaptionPreferences::default()),
             session_defaults: Mutex::new(StartSessionRequest::default()),
-            supervisor: InferenceSupervisor::new(SidecarLaunchConfig::development(project_root)),
+            supervisor: InferenceSupervisor::new(SidecarLaunchConfig::desktop(project_root)),
             store: tokio::sync::OnceCell::new(),
             preferences_path: std::sync::OnceLock::new(),
             credentials: CredentialStore,

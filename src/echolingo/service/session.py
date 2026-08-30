@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -30,6 +32,22 @@ def resolve_frontend_profile(product_profile: str) -> str:
         "raw": "raw",
     }
     return aliases.get(product_profile, product_profile)
+
+
+def runtime_resource_path(relative: str) -> Path:
+    candidates = []
+    configured = os.environ.get("ECHOLINGO_RESOURCE_ROOT")
+    if configured:
+        candidates.append(Path(configured))
+    frozen_root = getattr(sys, "_MEIPASS", None)
+    if frozen_root:
+        candidates.append(Path(frozen_root))
+    candidates.append(Path.cwd())
+    for root in candidates:
+        candidate = root / relative
+        if candidate.exists():
+            return candidate
+    return candidates[0] / relative
 
 
 class InputRateAdapter:
@@ -112,8 +130,10 @@ class DesktopInferenceSession:
     async def create(
         cls, payload: dict[str, Any], events: asyncio.Queue[dict[str, Any]]
     ) -> "DesktopInferenceSession":
-        config_path = Path(payload.get("config_path", "configs/lecture.toml"))
-        config = load_config(config_path)
+        config_path = payload.get("config_path")
+        config = load_config(Path(config_path)) if config_path else load_config()
+        if config_path is None:
+            config.alignment.enabled = True
         config.asr.language = payload.get("source_language", config.asr.language)
         config.translation.source_language = config.asr.language
         config.translation.target_language = payload.get(
@@ -153,7 +173,7 @@ class DesktopInferenceSession:
             frontend_rate_hz = 48_000
             input_rate_adapter = InputRateAdapter(input_rate_hz, channels)
         processor = make_processor(config.frontend.profile, frontend_rate_hz, channels)
-        silero_path = Path("models/silero_vad.onnx")
+        silero_path = runtime_resource_path("models/silero_vad.onnx")
         vad = make_vad(config.vad.backend, silero_path if silero_path.exists() else None)
         speech_policy = LectureSpeechPolicy(
             config.vad.start_probability,
@@ -177,6 +197,10 @@ class DesktopInferenceSession:
             if config.alignment.provider == "mock":
                 alignment_service = MockAlignmentService()
             else:
+                model_root = Path(os.environ.get("ECHOLINGO_MODEL_ROOT", "models"))
+                managed_model = model_root / "qwen3-forced-aligner-0.6b"
+                if managed_model.exists():
+                    config.alignment.model_path = str(managed_model)
                 alignment_service = QwenForcedAlignmentService(
                     Path(config.alignment.model_path)
                 )

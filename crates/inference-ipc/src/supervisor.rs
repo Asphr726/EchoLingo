@@ -17,6 +17,7 @@ use uuid::Uuid;
 pub struct SidecarLaunchConfig {
     pub project_root: PathBuf,
     pub conda_environment: String,
+    pub executable: Option<PathBuf>,
     pub configured_url: Option<String>,
     pub startup_timeout: Duration,
 }
@@ -26,9 +27,24 @@ impl SidecarLaunchConfig {
         Self {
             project_root,
             conda_environment: "echolingo-spike1".into(),
+            executable: std::env::var_os("ECHOLINGO_SIDECAR_EXECUTABLE").map(PathBuf::from),
             configured_url: std::env::var("ECHOLINGO_SIDECAR_URL").ok(),
             startup_timeout: Duration::from_secs(15),
         }
+    }
+
+    pub fn desktop(project_root: PathBuf) -> Self {
+        let mut config = Self::development(project_root);
+        if config.executable.is_none() {
+            config.executable = std::env::current_exe()
+                .ok()
+                .and_then(|path| path.parent().map(|parent| parent.join("echolingo-sidecar")))
+                .filter(|path| path.is_file());
+        }
+        if config.executable.is_some() {
+            config.startup_timeout = Duration::from_secs(120);
+        }
+        config
     }
 }
 
@@ -97,11 +113,18 @@ impl InferenceSupervisor {
             let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(SupervisorError::Port)?;
             let port = listener.local_addr().map_err(SupervisorError::Port)?.port();
             drop(listener);
-            let mut command = Command::new("conda");
-            command
-                .current_dir(&self.config.project_root)
-                .env("ECHOLINGO_IPC_TOKEN", &token)
-                .args([
+            let (mut command, working_directory) = if let Some(executable) = &self.config.executable
+            {
+                let mut command = Command::new(executable);
+                command.args(["--port", &port.to_string()]);
+                let working_directory = executable
+                    .parent()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("."));
+                (command, working_directory)
+            } else {
+                let mut command = Command::new("conda");
+                command.args([
                     "run",
                     "--no-capture-output",
                     "-n",
@@ -111,7 +134,12 @@ impl InferenceSupervisor {
                     "echolingo.service",
                     "--port",
                     &port.to_string(),
-                ])
+                ]);
+                (command, self.config.project_root.clone())
+            };
+            command
+                .current_dir(working_directory)
+                .env("ECHOLINGO_IPC_TOKEN", &token)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -253,12 +281,18 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires loopback sockets and the echolingo-spike1 Conda environment"]
     async fn rust_supervises_python_sidecar_end_to_end() {
-        let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let executable = std::env::var_os("ECHOLINGO_SIDECAR_EXECUTABLE").map(PathBuf::from);
+        let project_root = if executable.is_some() {
+            PathBuf::from("/path/intentionally/absent-from-packaged-sidecar-test")
+        } else {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+        };
         let supervisor = InferenceSupervisor::new(SidecarLaunchConfig {
             project_root,
             conda_environment: "echolingo-spike1".into(),
+            executable: executable.clone(),
             configured_url: None,
-            startup_timeout: Duration::from_secs(20),
+            startup_timeout: Duration::from_secs(if executable.is_some() { 120 } else { 20 }),
         });
         supervisor.ensure_started().await.unwrap();
         let mut events = supervisor.subscribe();

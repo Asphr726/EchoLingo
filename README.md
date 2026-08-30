@@ -69,5 +69,15 @@ npm run test:desktop
 cargo test --workspace
 ```
 
+Build the self-contained macOS sidecar before the signed Tauri artifact:
+
+```bash
+conda run --no-capture-output -n echolingo-spike1 python scripts/build_sidecar.py --clean
+APPLE_SIGNING_IDENTITY=- npm run desktop:build
+```
+
+The `-` identity is only for an internal ad-hoc build. External distribution
+requires a Developer ID identity and notarization credentials.
+
 See [Phase 4 release hardening](docs/phase4-release.md) and
 [ADR 0004](docs/adr/0004-v1-beta-runtime-and-release.md).
