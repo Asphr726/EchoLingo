@@ -12,6 +12,7 @@ use inference_ipc::{
 };
 #[cfg(target_os = "macos")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use runtime_manager::{ModelManager, ModelProgress, ModelStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -25,6 +26,7 @@ use transcript_store::{
 };
 
 const UI_EVENT_CHANNEL: &str = "echolingo://ui-event";
+const MODEL_PROGRESS_CHANNEL: &str = "echolingo://model-progress";
 const KEYCHAIN_SERVICE: &str = "app.echolingo.desktop";
 const DASHSCOPE_API_KEY_ACCOUNT: &str = "dashscope-api-key";
 const DASHSCOPE_WORKSPACE_ACCOUNT: &str = "dashscope-workspace-id";
@@ -155,6 +157,7 @@ struct RuntimeState {
     store: tokio::sync::OnceCell<TranscriptStore>,
     preferences_path: std::sync::OnceLock<PathBuf>,
     credentials: CredentialStore,
+    models: std::sync::OnceLock<ModelManager>,
 }
 
 impl Default for RuntimeState {
@@ -172,6 +175,7 @@ impl Default for RuntimeState {
             store: tokio::sync::OnceCell::new(),
             preferences_path: std::sync::OnceLock::new(),
             credentials: CredentialStore,
+            models: std::sync::OnceLock::new(),
         }
     }
 }
@@ -240,6 +244,12 @@ impl RuntimeState {
             .get()
             .ok_or_else(|| "preferences path is not initialized".to_string())?;
         save_preferences(path, &self.preferences()?)
+    }
+
+    fn models(&self) -> Result<&ModelManager, String> {
+        self.models
+            .get()
+            .ok_or_else(|| "model manager is not initialized".to_string())
     }
 }
 
@@ -370,6 +380,48 @@ async fn clear_cloud_credentials(
     CredentialStore::delete(DASHSCOPE_WORKSPACE_ACCOUNT)?;
     state.supervisor.shutdown().await;
     state.credentials.status()
+}
+
+#[tauri::command]
+fn list_models(state: State<'_, RuntimeState>) -> Result<Vec<ModelStatus>, String> {
+    Ok(state.models()?.list())
+}
+
+#[tauri::command]
+async fn install_model(
+    app: AppHandle,
+    state: State<'_, RuntimeState>,
+    model_id: String,
+) -> Result<ModelStatus, String> {
+    let progress_app = app.clone();
+    let callback = Arc::new(move |progress: ModelProgress| {
+        let _ = progress_app.emit(MODEL_PROGRESS_CHANNEL, progress);
+    });
+    state
+        .models()?
+        .install(&model_id, callback)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn verify_model(
+    state: State<'_, RuntimeState>,
+    model_id: String,
+) -> Result<ModelStatus, String> {
+    let root = state.models()?.root().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || ModelManager::new(root).verify(&model_id))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn delete_model(state: State<'_, RuntimeState>, model_id: String) -> Result<ModelStatus, String> {
+    state
+        .models()?
+        .delete(&model_id)
+        .map_err(|error| error.to_string())
 }
 
 fn route_status(value: &Value) -> RouteStatus {
@@ -1048,9 +1100,14 @@ async fn start_session(
         .map_err(|error| error.to_string())?;
     state.emit_snapshot(&app, &starting)?;
     let result = async {
+        let mut sidecar_environment = state.credentials.sidecar_environment()?;
+        sidecar_environment.insert(
+            "ECHOLINGO_MODEL_ROOT".into(),
+            state.models()?.root().to_string_lossy().into_owned(),
+        );
         state
             .supervisor
-            .configure_secret_environment(state.credentials.sidecar_environment()?)
+            .configure_secret_environment(sidecar_environment)
             .await;
         state
             .supervisor
@@ -1333,6 +1390,10 @@ pub fn run() {
             credential_status,
             set_cloud_credentials,
             clear_cloud_credentials,
+            list_models,
+            install_model,
+            verify_model,
+            delete_model,
             list_audio_devices,
             get_caption_preferences,
             get_session_defaults,
@@ -1361,6 +1422,10 @@ pub fn run() {
                 .set(store)
                 .map_err(|_| std::io::Error::other("store already initialized"))?;
             let preferences_path = app_data_directory.join("preferences.json");
+            state
+                .models
+                .set(ModelManager::new(app_data_directory.join("models")))
+                .map_err(|_| std::io::Error::other("model manager already initialized"))?;
             let preferences = load_preferences(&preferences_path);
             *state
                 .session_defaults

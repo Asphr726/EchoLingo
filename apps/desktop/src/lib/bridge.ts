@@ -4,6 +4,8 @@ import type {
   AudioDevice,
   CaptionPreferences,
   CloudCredentialStatus,
+  ModelProgress,
+  ModelStatus,
   SessionDetail,
   SessionRecord,
   SessionSnapshot,
@@ -50,6 +52,17 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
       workspace_id_available: false,
       source: "none",
     } satisfies CloudCredentialStatus,
+    list_models: [
+      {
+        id: "qwen3-asr-0.6b",
+        display_name: "Qwen3-ASR 0.6B",
+        role: "asr",
+        size_bytes: 1876091704,
+        state: "not_downloaded",
+        path: "/Applications/EchoLingo/models/qwen3-asr-0.6b",
+        revision: "5eb144179a02acc5e5ba31e748d22b0cf3e303b0",
+      },
+    ] satisfies ModelStatus[],
   };
   if (name === "update_session_defaults") {
     return args?.defaults as T;
@@ -66,6 +79,13 @@ export async function subscribeUiEvents(
 ): Promise<UnlistenFn> {
   if (!isTauri()) return () => undefined;
   return listen<UiEventEnvelope>("echolingo://ui-event", ({ payload }) => handler(payload));
+}
+
+export async function subscribeModelProgress(
+  handler: (event: ModelProgress) => void,
+): Promise<UnlistenFn> {
+  if (!isTauri()) return () => undefined;
+  return listen<ModelProgress>("echolingo://model-progress", ({ payload }) => handler(payload));
 }
 
 export const api = {
@@ -92,6 +112,13 @@ export const api = {
     }),
   clearCloudCredentials: () =>
     command<CloudCredentialStatus>("clear_cloud_credentials"),
+  models: () => command<ModelStatus[]>("list_models"),
+  installModel: (modelId: string) =>
+    command<ModelStatus>("install_model", { modelId }),
+  verifyModel: (modelId: string) =>
+    command<ModelStatus>("verify_model", { modelId }),
+  deleteModel: (modelId: string) =>
+    command<ModelStatus>("delete_model", { modelId }),
   showCaption: () => command<void>("show_caption_window"),
   hideCaption: () => command<void>("hide_caption_window"),
   historySearch: (query = "") =>

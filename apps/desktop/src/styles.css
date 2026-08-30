@@ -331,6 +331,17 @@ select:hover, input[type="text"]:hover, textarea:hover { border-color: #b6b8ae; 
 .credential-status small { color: var(--muted); font-size: 9px; line-height: 1.45; }
 .settings-error { max-width: 570px; margin: 0; color: #91483c; font-size: 10px; line-height: 1.5; }
 .settings-inline { gap: 8px; }
+.model-list { display: grid; max-width: 620px; border-top: 1px solid var(--line); }
+.model-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 18px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+.model-row-copy { display: grid; gap: 3px; }
+.model-row-copy > span { color: var(--muted); font-size: 8px; font-weight: 680; letter-spacing: .08em; text-transform: uppercase; }
+.model-row-copy strong { font-size: 11px; }
+.model-row-copy small { color: var(--muted); font-size: 9px; text-transform: capitalize; }
+.model-row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+.model-progress { display: grid; width: 140px; height: 24px; align-content: end; gap: 4px; overflow: hidden; }
+.model-progress::before { content: ""; grid-area: 1 / 1; align-self: end; height: 3px; border-radius: 2px; background: #d8d9d1; }
+.model-progress > span { z-index: 1; grid-area: 1 / 1; align-self: end; height: 3px; border-radius: 2px; background: var(--accent); transition: width .2s var(--ease); }
+.model-progress small { color: var(--muted); font-size: 8px; text-align: right; text-transform: capitalize; }
 .privacy-toggle { display: grid; max-width: 590px; grid-template-columns: 34px minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 15px 0; border-top: 1px solid var(--line); }
 .privacy-toggle:first-child { border-top: 0; }
 .privacy-toggle-icon { display: grid; width: 32px; height: 32px; place-items: center; border-radius: 9px; background: var(--accent-soft); color: var(--accent-deep); }

@@ -114,6 +114,26 @@ export interface CloudCredentialStatus {
   source: "macos_keychain" | "environment" | "none";
 }
 
+export type ModelInstallState = "not_downloaded" | "installing" | "ready" | "corrupt";
+
+export interface ModelStatus {
+  id: string;
+  display_name: string;
+  role: "asr" | "translation" | "alignment";
+  size_bytes: number;
+  state: ModelInstallState;
+  path: string;
+  revision: string;
+}
+
+export interface ModelProgress {
+  model_id: string;
+  bytes_completed: number;
+  total_bytes: number;
+  bytes_per_second: number | null;
+  phase: string;
+}
+
 export interface SessionRecord {
   id: string;
   title: string;

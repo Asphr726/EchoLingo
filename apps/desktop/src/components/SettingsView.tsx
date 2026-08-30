@@ -1,8 +1,8 @@
 import { CheckCircle, ClosedCaptioning, CloudArrowUp, Key, LockKey, SlidersHorizontal, Warning } from "@phosphor-icons/react";
 import { type ReactNode, useEffect, useState } from "react";
-import { api } from "../lib/bridge";
+import { api, subscribeModelProgress } from "../lib/bridge";
 import { useApp } from "../state/AppContext";
-import type { CaptionDisplay, CloudCredentialStatus, InferenceMode, StartSessionRequest } from "../types";
+import type { CaptionDisplay, CloudCredentialStatus, InferenceMode, ModelProgress, ModelStatus, StartSessionRequest } from "../types";
 
 const sections = [
   "General",
@@ -23,6 +23,10 @@ export function SettingsView() {
   const [workspaceId, setWorkspaceId] = useState("");
   const [credentialPending, setCredentialPending] = useState(false);
   const [credentialError, setCredentialError] = useState<string | null>(null);
+  const [models, setModels] = useState<ModelStatus[]>([]);
+  const [modelProgress, setModelProgress] = useState<Record<string, ModelProgress>>({});
+  const [modelPending, setModelPending] = useState<string | null>(null);
+  const [modelError, setModelError] = useState<string | null>(null);
   const { caption, draft, setDraft, snapshot, updateCaption } = useApp();
   const update = <K extends keyof StartSessionRequest>(key: K, value: StartSessionRequest[K]) =>
     setDraft((current) => ({ ...current, [key]: value }));
@@ -32,6 +36,45 @@ export function SettingsView() {
       setCredentialError(String(error));
     });
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    let dispose: () => void = () => undefined;
+    void api.models().then((value) => active && setModels(value)).catch((error) => {
+      if (active) setModelError(String(error));
+    });
+    void subscribeModelProgress((progress) => {
+      setModelProgress((current) => ({ ...current, [progress.model_id]: progress }));
+    }).then((unlisten) => {
+      if (active) dispose = unlisten;
+      else unlisten();
+    });
+    return () => {
+      active = false;
+      dispose();
+    };
+  }, []);
+
+  const updateModel = async (modelId: string, action: "install" | "verify" | "delete") => {
+    setModelPending(modelId);
+    setModelError(null);
+    try {
+      const status = action === "install" ? await api.installModel(modelId) : action === "verify" ? await api.verifyModel(modelId) : await api.deleteModel(modelId);
+      setModels((current) => current.map((model) => model.id === modelId ? status : model));
+      if (action !== "install") {
+        setModelProgress((current) => {
+          const next = { ...current };
+          delete next[modelId];
+          return next;
+        });
+      }
+    } catch (error) {
+      setModelError(String(error));
+      setModels(await api.models().catch(() => models));
+    } finally {
+      setModelPending(null);
+    }
+  };
 
   const saveCredentials = async () => {
     setCredentialPending(true);
@@ -180,7 +223,45 @@ export function SettingsView() {
                   <option value="qwen_cloud">Qwen-MT cloud</option>
                 </select>
               </Control>
-              <p className="settings-helper">Model downloads and calibration controls will activate when their runtime packages are available.</p>
+              <p className="settings-helper">Auto uses an installed model only after the matching runtime calibration meets the configured latency target.</p>
+            </SettingsGroup>
+            <SettingsGroup title="Local model manager" description="Downloads are pinned, checked, and activated atomically in EchoLingo application storage.">
+              <div className="model-list">
+                {models.length === 0 && <p className="settings-helper">Loading the local model catalog…</p>}
+                {models.map((model) => {
+                  const progress = modelProgress[model.id];
+                  const total = progress?.total_bytes || model.size_bytes;
+                  const completed = progress?.bytes_completed ?? 0;
+                  const percentage = total > 0 ? Math.min(100, Math.round(completed / total * 100)) : 0;
+                  const busy = modelPending === model.id;
+                  return (
+                    <article className="model-row" key={model.id}>
+                      <div className="model-row-copy">
+                        <span>{model.role}</span>
+                        <strong>{model.display_name}</strong>
+                        <small>{formatBytes(model.size_bytes)} · {model.state.replace("_", " ")}</small>
+                      </div>
+                      <div className="model-row-actions">
+                        {(busy || model.state === "installing") && (
+                          <div className="model-progress" aria-label={`${model.display_name} ${percentage}%`}>
+                            <span style={{ width: `${percentage}%` }} />
+                            <small>{progress?.phase ?? "preparing"} · {percentage}%</small>
+                          </div>
+                        )}
+                        {model.state === "ready" ? (
+                          <>
+                            <button className="button" type="button" disabled={busy} onClick={() => void updateModel(model.id, "verify")}>Verify</button>
+                            <button className="button" type="button" disabled={busy} onClick={() => void updateModel(model.id, "delete")}>Delete</button>
+                          </>
+                        ) : (
+                          <button className="button button--primary" type="button" disabled={busy} onClick={() => void updateModel(model.id, "install")}>{model.state === "corrupt" ? "Retry" : "Download"}</button>
+                        )}
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+              {modelError && <p className="settings-error" role="alert">{modelError}</p>}
             </SettingsGroup>
             <SettingsGroup title="Cloud credentials" description="Saved in macOS Keychain. Secret values never enter EchoLingo settings, history, events, or logs.">
               <div className="credential-status" role="status">
@@ -264,6 +345,10 @@ export function SettingsView() {
       </section>
     </div>
   );
+}
+
+function formatBytes(bytes: number): string {
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
 }
 
 function SettingsGroup({ children, description, title }: { children: ReactNode; description: string; title: string }) {
