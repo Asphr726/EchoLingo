@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import platform
 import shutil
 import subprocess
@@ -54,6 +55,12 @@ def main() -> int:
         str(work),
         str(root / "packaging" / "sidecar_entry.py"),
     ]
+    if sys.platform == "darwin":
+        identity = os.environ.get("APPLE_SIGNING_IDENTITY")
+        if identity and identity != "-":
+            # PyInstaller must sign binaries before they enter a one-file
+            # archive; Tauri cannot recursively re-sign them afterwards.
+            command[3:3] = ["--codesign-identity", identity]
     subprocess.run(command, cwd=root, check=True)
     suffix = ".exe" if sys.platform == "win32" else ""
     source = dist / f"echolingo-sidecar{suffix}"

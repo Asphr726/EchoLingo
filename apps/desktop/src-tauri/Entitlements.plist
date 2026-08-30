@@ -4,5 +4,12 @@
 <dict>
   <key>com.apple.security.device.audio-input</key>
   <true/>
+  <!-- The PyInstaller one-file sidecar extracts ad-hoc-signed native Python
+       extensions at runtime. Internal ad-hoc builds have no Team ID, so the
+       hardened sidecar needs this entitlement to load its own extracted
+       libraries. Developer-ID builds still sign every collected binary with
+       the release identity in scripts/build_sidecar.py. -->
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
 </dict>
 </plist>

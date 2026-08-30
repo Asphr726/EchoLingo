@@ -7,6 +7,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::time::sleep;
@@ -56,6 +57,13 @@ pub enum SupervisorError {
     Launch(std::io::Error),
     #[error("inference sidecar startup timed out")]
     StartupTimeout,
+    #[error("inference sidecar exited during startup ({status}): {diagnostics}")]
+    StartupExit {
+        status: String,
+        diagnostics: String,
+    },
+    #[error("cannot inspect inference sidecar process: {0}")]
+    ProcessStatus(std::io::Error),
     #[error("inference sidecar WebSocket failed: {0}")]
     WebSocket(String),
     #[error("inference sidecar protocol error: {0}")]
@@ -142,25 +150,42 @@ impl InferenceSupervisor {
                 .env("ECHOLINGO_IPC_TOKEN", &token)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .kill_on_drop(true);
             for (name, value) in self.secret_environment.lock().await.iter() {
                 command.env(name, value);
             }
-            *self.child.lock().await = Some(command.spawn().map_err(SupervisorError::Launch)?);
-            format!("ws://127.0.0.1:{port}")
+            let mut child = command.spawn().map_err(SupervisorError::Launch)?;
+            let diagnostics = Arc::new(Mutex::new(Vec::new()));
+            let stderr_task = child.stderr.take().map(|mut stderr| {
+                let diagnostics = diagnostics.clone();
+                tokio::spawn(async move {
+                    let mut chunk = [0_u8; 2048];
+                    while let Ok(read) = stderr.read(&mut chunk).await {
+                        if read == 0 {
+                            break;
+                        }
+                        let mut output = diagnostics.lock().await;
+                        output.extend_from_slice(&chunk[..read]);
+                        if output.len() > 16 * 1024 {
+                            let excess = output.len() - 16 * 1024;
+                            output.drain(..excess);
+                        }
+                    }
+                })
+            });
+            *self.child.lock().await = Some(child);
+            self.wait_for_websocket_or_exit(&format!("ws://127.0.0.1:{port}"), diagnostics, stderr_task)
+                .await?
         };
 
-        let deadline = tokio::time::Instant::now() + self.config.startup_timeout;
-        let mut websocket = loop {
-            match connect_async(&url).await {
-                Ok((websocket, _)) => break websocket,
-                Err(error) if tokio::time::Instant::now() < deadline => {
-                    let _ = error;
-                    sleep(Duration::from_millis(100)).await;
-                }
-                Err(_) => return Err(SupervisorError::StartupTimeout),
-            }
+        let mut websocket = if self.config.configured_url.is_some() {
+            self.wait_for_configured_websocket(&url).await?
+        } else {
+            connect_async(&url)
+                .await
+                .map_err(|error| SupervisorError::WebSocket(error.to_string()))?
+                .0
         };
         let hello = SidecarCommand::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
@@ -235,6 +260,67 @@ impl InferenceSupervisor {
         Ok(())
     }
 
+    async fn wait_for_configured_websocket(
+        &self,
+        url: &str,
+    ) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, SupervisorError> {
+        let deadline = tokio::time::Instant::now() + self.config.startup_timeout;
+        loop {
+            match connect_async(url).await {
+                Ok((websocket, _)) => return Ok(websocket),
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    sleep(Duration::from_millis(100)).await;
+                }
+                Err(_) => return Err(SupervisorError::StartupTimeout),
+            }
+        }
+    }
+
+    async fn wait_for_websocket_or_exit(
+        &self,
+        url: &str,
+        diagnostics: Arc<Mutex<Vec<u8>>>,
+        stderr_task: Option<tokio::task::JoinHandle<()>>,
+    ) -> Result<String, SupervisorError> {
+        let deadline = tokio::time::Instant::now() + self.config.startup_timeout;
+        loop {
+            match connect_async(url).await {
+                Ok((websocket, _)) => {
+                    drop(websocket);
+                    return Ok(url.to_string());
+                }
+                Err(_) => {}
+            }
+            let exited = {
+                let mut child = self.child.lock().await;
+                match child.as_mut() {
+                    Some(child) => child.try_wait().map_err(SupervisorError::ProcessStatus)?,
+                    None => None,
+                }
+            };
+            if let Some(status) = exited {
+                self.child.lock().await.take();
+                if let Some(task) = stderr_task {
+                    let _ = task.await;
+                }
+                let output = diagnostics.lock().await;
+                let diagnostics = String::from_utf8_lossy(&output).trim().to_string();
+                return Err(SupervisorError::StartupExit {
+                    status: status.to_string(),
+                    diagnostics: if diagnostics.is_empty() {
+                        "no diagnostics were produced".into()
+                    } else {
+                        diagnostics
+                    },
+                });
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(SupervisorError::StartupTimeout);
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     pub async fn send_command(&self, command: SidecarCommand) -> Result<(), SupervisorError> {
         let message = Message::Text(
             serde_json::to_string(&command)
@@ -277,6 +363,41 @@ mod tests {
     use super::*;
     use crate::AudioFrameHeader;
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_reports_child_exit_without_waiting_for_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("broken-sidecar");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\necho 'dyld: incompatible embedded library signature' >&2\nexit 86\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let supervisor = InferenceSupervisor::new(SidecarLaunchConfig {
+            project_root: directory.path().to_path_buf(),
+            conda_environment: "unused".into(),
+            executable: Some(executable),
+            configured_url: None,
+            startup_timeout: Duration::from_secs(5),
+        });
+        let started = std::time::Instant::now();
+        let error = supervisor.ensure_started().await.unwrap_err();
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(
+            &error,
+            SupervisorError::StartupExit { status, diagnostics }
+                if status.contains("86")
+                    && diagnostics.contains("incompatible embedded library signature")
+        ), "unexpected startup error: {error:?}");
+    }
 
     #[tokio::test]
     #[ignore = "requires loopback sockets and the echolingo-spike1 Conda environment"]
