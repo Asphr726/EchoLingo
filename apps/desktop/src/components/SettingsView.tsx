@@ -1,8 +1,8 @@
-import { ClosedCaptioning, CloudArrowUp, LockKey, SlidersHorizontal } from "@phosphor-icons/react";
-import { type ReactNode, useState } from "react";
+import { CheckCircle, ClosedCaptioning, CloudArrowUp, Key, LockKey, SlidersHorizontal, Warning } from "@phosphor-icons/react";
+import { type ReactNode, useEffect, useState } from "react";
 import { api } from "../lib/bridge";
 import { useApp } from "../state/AppContext";
-import type { CaptionDisplay, InferenceMode, StartSessionRequest } from "../types";
+import type { CaptionDisplay, CloudCredentialStatus, InferenceMode, StartSessionRequest } from "../types";
 
 const sections = [
   "General",
@@ -18,9 +18,46 @@ type Section = (typeof sections)[number];
 
 export function SettingsView() {
   const [section, setSection] = useState<Section>("General");
+  const [credentialStatus, setCredentialStatus] = useState<CloudCredentialStatus | null>(null);
+  const [apiKey, setApiKey] = useState("");
+  const [workspaceId, setWorkspaceId] = useState("");
+  const [credentialPending, setCredentialPending] = useState(false);
+  const [credentialError, setCredentialError] = useState<string | null>(null);
   const { caption, draft, setDraft, snapshot, updateCaption } = useApp();
   const update = <K extends keyof StartSessionRequest>(key: K, value: StartSessionRequest[K]) =>
     setDraft((current) => ({ ...current, [key]: value }));
+
+  useEffect(() => {
+    void api.credentialStatus().then(setCredentialStatus).catch((error) => {
+      setCredentialError(String(error));
+    });
+  }, []);
+
+  const saveCredentials = async () => {
+    setCredentialPending(true);
+    setCredentialError(null);
+    try {
+      setCredentialStatus(await api.setCloudCredentials(apiKey, workspaceId));
+      setApiKey("");
+      setWorkspaceId("");
+    } catch (error) {
+      setCredentialError(String(error));
+    } finally {
+      setCredentialPending(false);
+    }
+  };
+
+  const clearCredentials = async () => {
+    setCredentialPending(true);
+    setCredentialError(null);
+    try {
+      setCredentialStatus(await api.clearCloudCredentials());
+    } catch (error) {
+      setCredentialError(String(error));
+    } finally {
+      setCredentialPending(false);
+    }
+  };
 
   return (
     <div className="settings-layout">
@@ -144,6 +181,35 @@ export function SettingsView() {
                 </select>
               </Control>
               <p className="settings-helper">Model downloads and calibration controls will activate when their runtime packages are available.</p>
+            </SettingsGroup>
+            <SettingsGroup title="Cloud credentials" description="Saved in macOS Keychain. Secret values never enter EchoLingo settings, history, events, or logs.">
+              <div className="credential-status" role="status">
+                {credentialStatus?.api_key_available && credentialStatus.workspace_id_available ? (
+                  <CheckCircle size={20} weight="fill" aria-hidden="true" />
+                ) : (
+                  <Warning size={20} weight="fill" aria-hidden="true" />
+                )}
+                <div>
+                  <strong>{credentialStatus?.api_key_available && credentialStatus.workspace_id_available ? "Qwen Cloud configured" : "Qwen Cloud not configured"}</strong>
+                  <small>{credentialStatus?.source === "macos_keychain" ? "Credentials are stored in macOS Keychain." : credentialStatus?.source === "environment" ? "Using development environment variables." : "Cloud sessions stay unavailable until both values are saved."}</small>
+                </div>
+              </div>
+              <Control label="DashScope API key">
+                <input type="password" autoComplete="off" value={apiKey} placeholder={credentialStatus?.api_key_available ? "Saved — enter to replace" : "Enter API key"} onChange={(event) => setApiKey(event.target.value)} />
+              </Control>
+              <Control label="DashScope workspace ID">
+                <input type="password" autoComplete="off" value={workspaceId} placeholder={credentialStatus?.workspace_id_available ? "Saved — enter to replace" : "Enter workspace ID"} onChange={(event) => setWorkspaceId(event.target.value)} />
+              </Control>
+              {credentialError && <p className="settings-error" role="alert">{credentialError}</p>}
+              <div className="settings-inline">
+                <button className="button button--primary" type="button" disabled={credentialPending || apiKey.trim().length < 8 || workspaceId.trim().length < 3} onClick={() => void saveCredentials()}>
+                  <Key size={18} weight="regular" aria-hidden="true" />
+                  {credentialPending ? "Saving…" : "Save to Keychain"}
+                </button>
+                <button className="button" type="button" disabled={credentialPending || credentialStatus?.source !== "macos_keychain"} onClick={() => void clearCredentials()}>
+                  Remove
+                </button>
+              </div>
             </SettingsGroup>
           </div>
         )}

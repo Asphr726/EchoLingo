@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AudioDevice,
   CaptionPreferences,
+  CloudCredentialStatus,
   SessionDetail,
   SessionRecord,
   SessionSnapshot,
@@ -44,6 +45,11 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
     get_caption_preferences: defaultCaptionPreferences,
     get_session_defaults: defaultSessionDefaults,
     history_search: [],
+    credential_status: {
+      api_key_available: false,
+      workspace_id_available: false,
+      source: "none",
+    } satisfies CloudCredentialStatus,
   };
   if (name === "update_session_defaults") {
     return args?.defaults as T;
@@ -79,6 +85,13 @@ export const api = {
     command<StartSessionRequest>("update_session_defaults", { defaults }),
   updateCaptionPreferences: (preferences: CaptionPreferences) =>
     command<CaptionPreferences>("update_caption_preferences", { preferences }),
+  credentialStatus: () => command<CloudCredentialStatus>("credential_status"),
+  setCloudCredentials: (apiKey: string, workspaceId: string) =>
+    command<CloudCredentialStatus>("set_cloud_credentials", {
+      input: { api_key: apiKey, workspace_id: workspaceId },
+    }),
+  clearCloudCredentials: () =>
+    command<CloudCredentialStatus>("clear_cloud_credentials"),
   showCaption: () => command<void>("show_caption_window"),
   hideCaption: () => command<void>("hide_caption_window"),
   historySearch: (query = "") =>

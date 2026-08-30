@@ -325,6 +325,12 @@ select:hover, input[type="text"]:hover, textarea:hover { border-color: #b6b8ae; 
 .auto-decision span { color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: .09em; }
 .auto-decision strong { font-size: 12px; }
 .auto-decision p, .settings-helper { margin: 2px 0 0; color: var(--muted); font-size: 10px; line-height: 1.55; }
+.credential-status { display: flex; max-width: 570px; align-items: center; gap: 11px; padding: 13px 14px; border: 1px solid var(--line); border-radius: 9px; background: rgba(255, 255, 255, .34); color: var(--accent-deep); }
+.credential-status > div { display: grid; gap: 3px; }
+.credential-status strong { font-size: 11px; }
+.credential-status small { color: var(--muted); font-size: 9px; line-height: 1.45; }
+.settings-error { max-width: 570px; margin: 0; color: #91483c; font-size: 10px; line-height: 1.5; }
+.settings-inline { gap: 8px; }
 .privacy-toggle { display: grid; max-width: 590px; grid-template-columns: 34px minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 15px 0; border-top: 1px solid var(--line); }
 .privacy-toggle:first-child { border-top: 0; }
 .privacy-toggle-icon { display: grid; width: 32px; height: 32px; place-items: center; border-radius: 9px; background: var(--accent-soft); color: var(--accent-deep); }

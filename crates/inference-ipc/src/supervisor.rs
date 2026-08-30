@@ -1,5 +1,6 @@
 use crate::{Hello, SidecarCommand, SidecarEvent, PROTOCOL_VERSION};
 use futures_util::{SinkExt, StreamExt};
+use std::collections::HashMap;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -52,6 +53,7 @@ pub struct InferenceSupervisor {
     commands: Mutex<Option<mpsc::Sender<Message>>>,
     child: Mutex<Option<Child>>,
     events: broadcast::Sender<SidecarEvent>,
+    secret_environment: Mutex<HashMap<String, String>>,
 }
 
 impl InferenceSupervisor {
@@ -62,11 +64,16 @@ impl InferenceSupervisor {
             commands: Mutex::new(None),
             child: Mutex::new(None),
             events,
+            secret_environment: Mutex::new(HashMap::new()),
         })
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<SidecarEvent> {
         self.events.subscribe()
+    }
+
+    pub async fn configure_secret_environment(&self, values: HashMap<String, String>) {
+        *self.secret_environment.lock().await = values;
     }
 
     pub async fn ensure_started(self: &Arc<Self>) -> Result<(), SupervisorError> {
@@ -105,6 +112,9 @@ impl InferenceSupervisor {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .kill_on_drop(true);
+            for (name, value) in self.secret_environment.lock().await.iter() {
+                command.env(name, value);
+            }
             *self.child.lock().await = Some(command.spawn().map_err(SupervisorError::Launch)?);
             format!("ws://127.0.0.1:{port}")
         };

@@ -108,6 +108,12 @@ export interface CaptionPreferences {
   opacity: number;
 }
 
+export interface CloudCredentialStatus {
+  api_key_available: boolean;
+  workspace_id_available: boolean;
+  source: "macos_keychain" | "environment" | "none";
+}
+
 export interface SessionRecord {
   id: string;
   title: string;

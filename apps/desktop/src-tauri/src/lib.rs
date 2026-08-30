@@ -14,6 +14,7 @@ use inference_ipc::{
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -24,6 +25,96 @@ use transcript_store::{
 };
 
 const UI_EVENT_CHANNEL: &str = "echolingo://ui-event";
+const KEYCHAIN_SERVICE: &str = "app.echolingo.desktop";
+const DASHSCOPE_API_KEY_ACCOUNT: &str = "dashscope-api-key";
+const DASHSCOPE_WORKSPACE_ACCOUNT: &str = "dashscope-workspace-id";
+
+#[derive(Default)]
+struct CredentialStore;
+
+#[derive(Debug, Clone, Serialize)]
+struct CloudCredentialStatus {
+    api_key_available: bool,
+    workspace_id_available: bool,
+    source: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudCredentialInput {
+    api_key: String,
+    workspace_id: String,
+}
+
+impl CredentialStore {
+    fn entry(account: &str) -> Result<keyring::Entry, String> {
+        keyring::Entry::new(KEYCHAIN_SERVICE, account).map_err(|error| error.to_string())
+    }
+
+    fn get(account: &str) -> Result<Option<String>, String> {
+        match Self::entry(account)?.get_password() {
+            Ok(value) => Ok(Some(value)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn set(account: &str, value: &str) -> Result<(), String> {
+        Self::entry(account)?
+            .set_password(value)
+            .map_err(|error| error.to_string())
+    }
+
+    fn delete(account: &str) -> Result<(), String> {
+        match Self::entry(account)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn status(&self) -> Result<CloudCredentialStatus, String> {
+        let keychain_key = Self::get(DASHSCOPE_API_KEY_ACCOUNT)?.is_some();
+        let keychain_workspace = Self::get(DASHSCOPE_WORKSPACE_ACCOUNT)?.is_some();
+        let environment_key = std::env::var_os("DASHSCOPE_API_KEY").is_some();
+        let environment_workspace = std::env::var_os("DASHSCOPE_WORKSPACE_ID").is_some();
+        let source = if keychain_key || keychain_workspace {
+            "macos_keychain"
+        } else if environment_key || environment_workspace {
+            "environment"
+        } else {
+            "none"
+        };
+        Ok(CloudCredentialStatus {
+            api_key_available: keychain_key || environment_key,
+            workspace_id_available: keychain_workspace || environment_workspace,
+            source: source.into(),
+        })
+    }
+
+    fn sidecar_environment(&self) -> Result<HashMap<String, String>, String> {
+        let mut values = HashMap::new();
+        let api_key = Self::get(DASHSCOPE_API_KEY_ACCOUNT)?
+            .or_else(|| std::env::var("DASHSCOPE_API_KEY").ok());
+        let workspace = Self::get(DASHSCOPE_WORKSPACE_ACCOUNT)?
+            .or_else(|| std::env::var("DASHSCOPE_WORKSPACE_ID").ok());
+        if let Some(value) = api_key {
+            values.insert("DASHSCOPE_API_KEY".into(), value);
+        }
+        if let Some(value) = workspace {
+            values.insert("DASHSCOPE_WORKSPACE_ID".into(), value);
+        }
+        Ok(values)
+    }
+}
+
+fn validate_cloud_credentials(input: &CloudCredentialInput) -> Result<(), String> {
+    if input.api_key.trim().len() < 8 {
+        return Err("DashScope API key is too short".into());
+    }
+    if input.workspace_id.trim().len() < 3 {
+        return Err("DashScope workspace ID is too short".into());
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,6 +154,7 @@ struct RuntimeState {
     supervisor: Arc<InferenceSupervisor>,
     store: tokio::sync::OnceCell<TranscriptStore>,
     preferences_path: std::sync::OnceLock<PathBuf>,
+    credentials: CredentialStore,
 }
 
 impl Default for RuntimeState {
@@ -79,6 +171,7 @@ impl Default for RuntimeState {
             supervisor: InferenceSupervisor::new(SidecarLaunchConfig::development(project_root)),
             store: tokio::sync::OnceCell::new(),
             preferences_path: std::sync::OnceLock::new(),
+            credentials: CredentialStore,
         }
     }
 }
@@ -246,6 +339,37 @@ fn save_preferences(
 #[tauri::command]
 fn get_app_snapshot(state: State<'_, RuntimeState>) -> Result<SessionSnapshot, String> {
     state.snapshot()
+}
+
+#[tauri::command]
+fn credential_status(state: State<'_, RuntimeState>) -> Result<CloudCredentialStatus, String> {
+    state.credentials.status()
+}
+
+#[tauri::command]
+async fn set_cloud_credentials(
+    state: State<'_, RuntimeState>,
+    input: CloudCredentialInput,
+) -> Result<CloudCredentialStatus, String> {
+    validate_cloud_credentials(&input)?;
+    CredentialStore::set(DASHSCOPE_API_KEY_ACCOUNT, input.api_key.trim())?;
+    if let Err(error) = CredentialStore::set(DASHSCOPE_WORKSPACE_ACCOUNT, input.workspace_id.trim())
+    {
+        let _ = CredentialStore::delete(DASHSCOPE_API_KEY_ACCOUNT);
+        return Err(error);
+    }
+    state.supervisor.shutdown().await;
+    state.credentials.status()
+}
+
+#[tauri::command]
+async fn clear_cloud_credentials(
+    state: State<'_, RuntimeState>,
+) -> Result<CloudCredentialStatus, String> {
+    CredentialStore::delete(DASHSCOPE_API_KEY_ACCOUNT)?;
+    CredentialStore::delete(DASHSCOPE_WORKSPACE_ACCOUNT)?;
+    state.supervisor.shutdown().await;
+    state.credentials.status()
 }
 
 fn route_status(value: &Value) -> RouteStatus {
@@ -926,6 +1050,10 @@ async fn start_session(
     let result = async {
         state
             .supervisor
+            .configure_secret_environment(state.credentials.sidecar_environment()?)
+            .await;
+        state
+            .supervisor
             .ensure_started()
             .await
             .map_err(|error| error.to_string())?;
@@ -1202,6 +1330,9 @@ pub fn run() {
         .manage(RuntimeState::default())
         .invoke_handler(tauri::generate_handler![
             get_app_snapshot,
+            credential_status,
+            set_cloud_credentials,
+            clear_cloud_credentials,
             list_audio_devices,
             get_caption_preferences,
             get_session_defaults,
@@ -1305,5 +1436,15 @@ mod tests {
         let mut defaults = StartSessionRequest::default();
         defaults.target_language = defaults.source_language.clone();
         assert!(validate_session_defaults(&defaults).is_err());
+    }
+
+    #[test]
+    fn cloud_credential_validation_never_echoes_secret() {
+        let input = CloudCredentialInput {
+            api_key: "sekrit".into(),
+            workspace_id: "workspace".into(),
+        };
+        let error = validate_cloud_credentials(&input).unwrap_err();
+        assert!(!error.contains("sekrit"));
     }
 }
