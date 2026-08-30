@@ -924,10 +924,24 @@ fn forward_sidecar_events(app: AppHandle) {
                     code,
                     message,
                     recoverable,
-                } => (
-                    UiEventKind::Error,
-                    json!({"code": code, "message": message, "recoverable": recoverable}),
-                ),
+                } => {
+                    if code == "sidecar_disconnected" {
+                        let recovery = state.core.lock().ok().and_then(|mut core| {
+                            if core.snapshot().phase == SessionPhase::Listening {
+                                core.backend_disconnected(&message).ok()
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(snapshot) = recovery {
+                            let _ = state.emit_snapshot(&app, &snapshot);
+                        }
+                    }
+                    (
+                        UiEventKind::Error,
+                        json!({"code": code, "message": message, "recoverable": recoverable}),
+                    )
+                }
                 SidecarEvent::Ready { route, .. } => (UiEventKind::RouteDecision, route),
                 SidecarEvent::HelloAccepted { .. } | SidecarEvent::SessionFinished { .. } => {
                     continue
@@ -1059,7 +1073,7 @@ fn pump_audio_frames(
                             "recoverable": true
                         }),
                     );
-                    break;
+                    return;
                 }
             }
         }
@@ -1488,18 +1502,36 @@ async fn stop_session(
         .map_err(|error| error.to_string())?;
     state.emit_snapshot(&app, &stopping)?;
     stop_audio_capture(&state).await?;
+    let mut warnings = Vec::new();
     if let Some(session_id) = stopping.session_id {
         let mut receiver = state.supervisor.subscribe();
-        state
+        match state
             .supervisor
             .send_command(SidecarCommand::FinishSession { session_id })
             .await
-            .map_err(|error| error.to_string())?;
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async move {
-            while let Ok(event) = receiver.recv().await {
-                if matches!(event, SidecarEvent::SessionFinished { session_id: finished } if finished == session_id) { break; }
+        {
+            Ok(()) => {
+                let finished = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    async move {
+                        while let Ok(event) = receiver.recv().await {
+                            if matches!(event, SidecarEvent::SessionFinished { session_id: finished } if finished == session_id) {
+                                return true;
+                            }
+                        }
+                        false
+                    },
+                )
+                .await
+                .unwrap_or(false);
+                if !finished {
+                    warnings.push("Inference backend did not acknowledge session finish".into());
+                }
             }
-        }).await;
+            Err(error) => warnings.push(format!(
+                "Inference backend was unavailable during Stop: {error}"
+            )),
+        }
     }
     let completed = state
         .core
@@ -1510,7 +1542,7 @@ async fn stop_session(
     if let Some(session_id) = completed.session_id {
         state
             .store()?
-            .complete_session(session_id, &[])
+            .complete_session(session_id, &warnings)
             .await
             .map_err(|error| error.to_string())?;
         if let Ok(mut throttle) = state.persistence_throttle.lock() {
@@ -1724,6 +1756,123 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct SoakCounts {
+        transcripts: u64,
+        translations: u64,
+        metrics: u64,
+        alignments: u64,
+        errors: u64,
+        ui_updates: u64,
+        max_dropped_audio_ms: f64,
+    }
+
+    async fn consume_soak_event(
+        state: &RuntimeState,
+        fallback_session_id: uuid::Uuid,
+        event: &SidecarEvent,
+        counts: &mut SoakCounts,
+    ) -> Result<(), String> {
+        let payload = match event {
+            SidecarEvent::Transcript(payload) => {
+                counts.transcripts += 1;
+                counts.ui_updates += 1;
+                payload
+            }
+            SidecarEvent::Translation(payload) => {
+                counts.translations += 1;
+                counts.ui_updates += 1;
+                payload
+            }
+            SidecarEvent::Metrics(payload) => {
+                counts.metrics += 1;
+                counts.ui_updates += 1;
+                counts.max_dropped_audio_ms = counts
+                    .max_dropped_audio_ms
+                    .max(payload["dropped_audio_ms"].as_f64().unwrap_or(0.0));
+                payload
+            }
+            SidecarEvent::AlignmentUpdate(payload) => {
+                counts.alignments += 1;
+                counts.ui_updates += 1;
+                payload
+            }
+            SidecarEvent::Error { .. } => {
+                counts.errors += 1;
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+        let event_session_id = payload["session_id"]
+            .as_str()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(fallback_session_id);
+        persist_sidecar_event(state, event_session_id, event).await
+    }
+
+    fn resident_set_bytes() -> Option<u64> {
+        let output = std::process::Command::new("/bin/ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .ok()?;
+        let kib = String::from_utf8(output.stdout)
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        Some(kib * 1024)
+    }
+
+    fn mock_session_payload(session_id: uuid::Uuid, alignment_enabled: bool) -> Value {
+        json!({
+            "session_id": session_id,
+            "source_language": "en",
+            "target_language": "zh",
+            "sample_rate_hz": 16_000,
+            "channels": 1,
+            "audio_profile": "raw",
+            "inference_mode": "auto",
+            "asr_provider": "mock",
+            "translation_provider": "mock",
+            "alignment_enabled": alignment_enabled,
+            "alignment_provider": if alignment_enabled { "mock" } else { "none" },
+            "privacy": {
+                "audio_upload_allowed": false,
+                "transcript_upload_allowed": false
+            }
+        })
+    }
+
+    async fn create_soak_history(
+        state: &RuntimeState,
+        session_id: uuid::Uuid,
+        route: &Value,
+        ordinal: usize,
+    ) -> Result<(), String> {
+        state
+            .store()?
+            .create_session(&SessionDraft {
+                id: session_id,
+                title: format!("Desktop soak session {ordinal}"),
+                source_language: "en".into(),
+                target_language: "zh".into(),
+                audio_source: "synthetic".into(),
+                audio_profile: "lecture".into(),
+                inference_mode: "auto".into(),
+                asr_backend: "mock".into(),
+                translation_backend: "mock".into(),
+                route_reason: "deterministic release soak".into(),
+                privacy: json!({
+                    "audio_upload_allowed": false,
+                    "transcript_upload_allowed": false
+                }),
+                model_config: route.clone(),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     #[test]
     fn desktop_preferences_round_trip_and_reject_corruption() {
         let directory = tempfile::tempdir().unwrap();
@@ -1778,5 +1927,270 @@ mod tests {
         assert!(throttle.allow_revision(session, "source", "stable"));
         throttle.finish(session);
         assert!(throttle.allow_metrics(session, 20.0));
+    }
+
+    #[tokio::test]
+    #[ignore = "60 audio-minute Rust/Desktop/Python/SQLite release soak"]
+    async fn desktop_product_soak_60_audio_minutes() {
+        let audio_minutes = std::env::var("ECHOLINGO_SOAK_AUDIO_MINUTES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(60);
+        let realtime = std::env::var("ECHOLINGO_SOAK_REALTIME").as_deref() == Ok("1");
+        let frame_ms = 100_u64;
+        let frame_count = 1_600_u16;
+        let total_frames = audio_minutes * 60_000 / frame_ms;
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("history.sqlite");
+        let state = Arc::new(RuntimeState::default());
+        state
+            .store
+            .set(TranscriptStore::open(&database_path).await.unwrap())
+            .unwrap();
+        state.supervisor.ensure_started().await.unwrap();
+        let mut receiver = state.supervisor.subscribe();
+
+        let mut request = StartSessionRequest::default();
+        request.asr_provider = "mock".into();
+        request.translation_provider = "mock".into();
+        request.audio_profile = "lecture".into();
+        let starting = state.core.lock().unwrap().start(request).unwrap();
+        let session_id = starting.session_id.unwrap();
+        state
+            .supervisor
+            .send_command(SidecarCommand::StartSession(mock_session_payload(
+                session_id, true,
+            )))
+            .await
+            .unwrap();
+        let route = loop {
+            if let SidecarEvent::Ready {
+                session_id: ready_id,
+                route,
+            } = receiver.recv().await.unwrap()
+            {
+                if ready_id == session_id {
+                    break route;
+                }
+            }
+        };
+        state
+            .core
+            .lock()
+            .unwrap()
+            .mark_listening(route_status(&route))
+            .unwrap();
+        create_soak_history(&state, session_id, &route, 1)
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let initial_rss = resident_set_bytes();
+        let sender_state = Arc::clone(&state);
+        let mut audio_task = tokio::spawn(async move {
+            let pcm = 0.08_f32.to_le_bytes().repeat(usize::from(frame_count));
+            for sequence in 0..total_frames {
+                if sequence == total_frames / 3 {
+                    let paused = {
+                        let mut core = sender_state.core.lock().unwrap();
+                        let revision = core.snapshot().state_revision;
+                        core.pause(revision).unwrap()
+                    };
+                    sender_state
+                        .supervisor
+                        .send_command(SidecarCommand::Pause {
+                            session_id,
+                            epoch: paused.state_revision as u32,
+                        })
+                        .await
+                        .unwrap();
+                    sender_state
+                        .supervisor
+                        .send_command(SidecarCommand::Resume {
+                            session_id,
+                            epoch: paused.state_revision as u32 + 1,
+                        })
+                        .await
+                        .unwrap();
+                    sender_state
+                        .core
+                        .lock()
+                        .unwrap()
+                        .resume(paused.state_revision)
+                        .unwrap();
+                }
+                let header = AudioFrameHeader {
+                    flags: 0,
+                    sequence,
+                    capture_monotonic_ns: sequence * frame_ms * 1_000_000,
+                    sample_rate_hz: 16_000,
+                    channels: 1,
+                    frame_count,
+                };
+                let mut packet = Vec::with_capacity(32 + pcm.len());
+                packet.extend_from_slice(&header.encode());
+                packet.extend_from_slice(&pcm);
+                sender_state.supervisor.send_audio(packet).await.unwrap();
+                if realtime {
+                    tokio::time::sleep(std::time::Duration::from_millis(frame_ms)).await;
+                } else if sequence % 100 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        let mut counts = SoakCounts::default();
+        loop {
+            tokio::select! {
+                result = &mut audio_task => {
+                    result.unwrap();
+                    break;
+                }
+                event = receiver.recv() => {
+                    consume_soak_event(&state, session_id, &event.unwrap(), &mut counts)
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+
+        let current_revision = state.core.lock().unwrap().snapshot().state_revision;
+        state
+            .core
+            .lock()
+            .unwrap()
+            .begin_stop(current_revision)
+            .unwrap();
+        state
+            .supervisor
+            .send_command(SidecarCommand::FinishSession { session_id })
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut finished = false;
+        while tokio::time::Instant::now() < deadline && !(finished && counts.alignments > 0) {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(event, SidecarEvent::SessionFinished { session_id: finished_id } if finished_id == session_id)
+            {
+                finished = true;
+            }
+            consume_soak_event(&state, session_id, &event, &mut counts)
+                .await
+                .unwrap();
+        }
+        assert!(finished, "sidecar did not acknowledge the first session");
+        assert!(
+            counts.alignments > 0,
+            "asynchronous alignment did not complete"
+        );
+        state.core.lock().unwrap().complete().unwrap();
+        state
+            .store()
+            .unwrap()
+            .complete_session(session_id, &[])
+            .await
+            .unwrap();
+        let detail = state.store().unwrap().detail(session_id).await.unwrap();
+        assert!(!detail.segments.is_empty());
+        assert_eq!(detail.segments[0].timestamp_quality, "forced");
+
+        let second_request = StartSessionRequest {
+            expected_state_revision: state.core.lock().unwrap().snapshot().state_revision,
+            asr_provider: "mock".into(),
+            translation_provider: "mock".into(),
+            ..StartSessionRequest::default()
+        };
+        let second = state.core.lock().unwrap().start(second_request).unwrap();
+        let second_id = second.session_id.unwrap();
+        state
+            .supervisor
+            .send_command(SidecarCommand::StartSession(mock_session_payload(
+                second_id, false,
+            )))
+            .await
+            .unwrap();
+        let second_route = loop {
+            if let SidecarEvent::Ready {
+                session_id: ready_id,
+                route,
+            } = receiver.recv().await.unwrap()
+            {
+                if ready_id == second_id {
+                    break route;
+                }
+            }
+        };
+        state
+            .core
+            .lock()
+            .unwrap()
+            .mark_listening(route_status(&second_route))
+            .unwrap();
+        create_soak_history(&state, second_id, &second_route, 2)
+            .await
+            .unwrap();
+        let revision = state.core.lock().unwrap().snapshot().state_revision;
+        state.core.lock().unwrap().begin_stop(revision).unwrap();
+        state
+            .supervisor
+            .send_command(SidecarCommand::FinishSession {
+                session_id: second_id,
+            })
+            .await
+            .unwrap();
+        loop {
+            let event = receiver.recv().await.unwrap();
+            consume_soak_event(&state, second_id, &event, &mut counts)
+                .await
+                .unwrap();
+            if matches!(event, SidecarEvent::SessionFinished { session_id: finished_id } if finished_id == second_id)
+            {
+                break;
+            }
+        }
+        state.core.lock().unwrap().complete().unwrap();
+        state
+            .store()
+            .unwrap()
+            .complete_session(second_id, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            state.store().unwrap().search("", 10).await.unwrap().len(),
+            2
+        );
+        state.supervisor.shutdown().await;
+
+        let database_bytes = std::fs::metadata(&database_path).unwrap().len()
+            + std::fs::metadata(database_path.with_extension("sqlite-wal"))
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+        let elapsed = started.elapsed().as_secs_f64();
+        let final_rss = resident_set_bytes();
+        println!(
+            "DESKTOP_SOAK_RESULT={}",
+            json!({
+                "audio_minutes": audio_minutes,
+                "wall_clock_realtime": realtime,
+                "wall_seconds": elapsed,
+                "processing_rtf": elapsed / (audio_minutes as f64 * 60.0),
+                "frames": total_frames,
+                "transcript_events": counts.transcripts,
+                "translation_events": counts.translations,
+                "metric_events": counts.metrics,
+                "alignment_events": counts.alignments,
+                "ui_updates_projected": counts.ui_updates,
+                "recoverable_errors": counts.errors,
+                "max_dropped_audio_ms": counts.max_dropped_audio_ms,
+                "initial_rss_bytes": initial_rss,
+                "final_rss_bytes": final_rss,
+                "database_bytes": database_bytes,
+                "second_session_completed": true
+            })
+        );
+        assert_eq!(counts.errors, 0);
+        assert_eq!(counts.max_dropped_audio_ms, 0.0);
     }
 }
