@@ -50,6 +50,47 @@ def runtime_resource_path(relative: str) -> Path:
     return candidates[0] / relative
 
 
+def desktop_config(payload: dict[str, Any]):
+    """Resolve a desktop payload into the single validated backend config."""
+    config_path = payload.get("config_path")
+    config = load_config(Path(config_path)) if config_path else load_config()
+    if config_path is None:
+        config.alignment.enabled = True
+    config.asr.language = payload.get("source_language", config.asr.language)
+    config.translation.source_language = config.asr.language
+    config.translation.target_language = payload.get(
+        "target_language", config.translation.target_language
+    )
+    config.frontend.profile = resolve_frontend_profile(
+        payload.get("audio_profile", config.frontend.profile)
+    )
+    config.inference.mode = payload.get("inference_mode", config.inference.mode)
+    config.asr.provider = payload.get("asr_provider", config.asr.provider)
+    config.translation.provider = payload.get(
+        "translation_provider", config.translation.provider
+    )
+    if "alignment_enabled" in payload:
+        config.alignment.enabled = bool(payload["alignment_enabled"])
+    if "alignment_provider" in payload:
+        config.alignment.provider = str(payload["alignment_provider"])
+    privacy = payload.get("privacy", {})
+    config.privacy.audio_upload_allowed = bool(
+        privacy.get("audio_upload_allowed", False)
+    )
+    config.privacy.transcript_upload_allowed = bool(
+        privacy.get("transcript_upload_allowed", False)
+    )
+    config.validate()
+    return config
+
+
+def route_payload(decision) -> dict[str, Any]:
+    route = asdict(decision)
+    route["status"] = decision.status.value
+    route["reasons"] = list(decision.reasons)
+    return route
+
+
 class InputRateAdapter:
     """Preserve channels while adapting uncommon device rates to WebRTC's 48 kHz."""
 
@@ -127,38 +168,21 @@ class DesktopInferenceSession:
         self.input_rate_adapter = input_rate_adapter
 
     @classmethod
+    def plan(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        config = desktop_config(payload)
+        capabilities = CapabilityDetector(Path.cwd()).detect()
+        plan = RuntimeRouter(config, capabilities).plan()
+        return {
+            "session_id": str(payload["session_id"]),
+            "route": route_payload(plan.decision),
+            "services_to_start": list(plan.services_to_start),
+        }
+
+    @classmethod
     async def create(
         cls, payload: dict[str, Any], events: asyncio.Queue[dict[str, Any]]
     ) -> "DesktopInferenceSession":
-        config_path = payload.get("config_path")
-        config = load_config(Path(config_path)) if config_path else load_config()
-        if config_path is None:
-            config.alignment.enabled = True
-        config.asr.language = payload.get("source_language", config.asr.language)
-        config.translation.source_language = config.asr.language
-        config.translation.target_language = payload.get(
-            "target_language", config.translation.target_language
-        )
-        config.frontend.profile = resolve_frontend_profile(
-            payload.get("audio_profile", config.frontend.profile)
-        )
-        config.inference.mode = payload.get("inference_mode", config.inference.mode)
-        config.asr.provider = payload.get("asr_provider", config.asr.provider)
-        config.translation.provider = payload.get(
-            "translation_provider", config.translation.provider
-        )
-        if "alignment_enabled" in payload:
-            config.alignment.enabled = bool(payload["alignment_enabled"])
-        if "alignment_provider" in payload:
-            config.alignment.provider = str(payload["alignment_provider"])
-        privacy = payload.get("privacy", {})
-        config.privacy.audio_upload_allowed = bool(
-            privacy.get("audio_upload_allowed", False)
-        )
-        config.privacy.transcript_upload_allowed = bool(
-            privacy.get("transcript_upload_allowed", False)
-        )
-        config.validate()
+        config = desktop_config(payload)
 
         capabilities = CapabilityDetector(Path.cwd()).detect()
         decision = RuntimeRouter(config, capabilities).select()
@@ -214,9 +238,7 @@ class DesktopInferenceSession:
         pipeline = StreamingPipelineSession(
             core_pipeline, session_id=session_id, language=config.asr.language
         )
-        route = asdict(decision)
-        route["status"] = decision.status.value
-        route["reasons"] = list(decision.reasons)
+        route = route_payload(decision)
         instance = cls(
             pipeline, events, route, alignment_capture, input_rate_adapter
         )

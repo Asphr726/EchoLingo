@@ -73,6 +73,31 @@ def test_desktop_audio_profiles_map_to_frontend_implementations(
     assert resolve_frontend_profile(product_profile) == frontend_profile
 
 
+def test_sidecar_plans_cold_local_qwen_service(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("ECHOLINGO_MODEL_ROOT", str(tmp_path))
+    monkeypatch.setenv("ECHOLINGO_QWEN_ASR_COMMAND", "bundled")
+    monkeypatch.setattr(
+        "echolingo.runtime.capabilities.CapabilityDetector._loopback_service",
+        staticmethod(lambda _port: False),
+    )
+    plan = DesktopInferenceSession.plan(
+        {
+            "session_id": "cold-local",
+            "source_language": "en",
+            "target_language": "zh",
+            "inference_mode": "local",
+            "asr_provider": "qwen_local",
+            "translation_provider": "none",
+            "privacy": {
+                "audio_upload_allowed": False,
+                "transcript_upload_allowed": False,
+            },
+        }
+    )
+    assert plan["route"]["asr_provider"] == "qwen_local"
+    assert plan["services_to_start"] == ["qwen_asr"]
+
+
 async def test_sidecar_mock_session_emits_canonical_metrics_and_transcript() -> None:
     events: asyncio.Queue[dict[str, object]] = asyncio.Queue()
     session = await DesktopInferenceSession.create(

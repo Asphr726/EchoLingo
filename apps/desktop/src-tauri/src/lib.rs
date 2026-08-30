@@ -15,7 +15,10 @@ use inference_ipc::{
 };
 #[cfg(target_os = "macos")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use runtime_manager::{ModelManager, ModelProgress, ModelStatus};
+use runtime_manager::{
+    LocalRuntimeLayout, LocalRuntimeManager, ModelManager, ModelProgress, ModelStatus,
+    RuntimeCommand,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -161,6 +164,7 @@ struct RuntimeState {
     preferences_path: std::sync::OnceLock<PathBuf>,
     credentials: CredentialStore,
     models: std::sync::OnceLock<ModelManager>,
+    local_runtimes: std::sync::OnceLock<LocalRuntimeManager>,
     onboarding_complete: std::sync::atomic::AtomicBool,
     persistence_throttle: Mutex<PersistenceThrottle>,
 }
@@ -181,6 +185,7 @@ impl Default for RuntimeState {
             preferences_path: std::sync::OnceLock::new(),
             credentials: CredentialStore,
             models: std::sync::OnceLock::new(),
+            local_runtimes: std::sync::OnceLock::new(),
             onboarding_complete: std::sync::atomic::AtomicBool::new(false),
             persistence_throttle: Mutex::new(PersistenceThrottle::default()),
         }
@@ -298,6 +303,12 @@ impl RuntimeState {
             .get()
             .ok_or_else(|| "model manager is not initialized".to_string())
     }
+
+    fn local_runtimes(&self) -> Result<&LocalRuntimeManager, String> {
+        self.local_runtimes
+            .get()
+            .ok_or_else(|| "local runtime manager is not initialized".to_string())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,6 +372,75 @@ fn validate_caption_preferences(preferences: &CaptionPreferences) -> Result<(), 
         return Err("caption recent segments must be between 1 and 3".into());
     }
     Ok(())
+}
+
+fn executable_on_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|directory| directory.join(name))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+fn local_runtime_layout(
+    model_root: PathBuf,
+    app_data_directory: &std::path::Path,
+    resource_directory: &std::path::Path,
+) -> LocalRuntimeLayout {
+    let bundled_sidecar = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join("echolingo-sidecar")))
+        .filter(|path| path.is_file());
+    let qwen_command = if let Some(executable) =
+        std::env::var_os("ECHOLINGO_QWEN_ASR_COMMAND").map(PathBuf::from)
+    {
+        RuntimeCommand {
+            executable,
+            args: Vec::new(),
+            environment: HashMap::new(),
+        }
+    } else if let Some(executable) = bundled_sidecar {
+        RuntimeCommand {
+            executable,
+            args: vec!["qwen-asr-server".into()],
+            environment: HashMap::new(),
+        }
+    } else {
+        RuntimeCommand {
+            executable: PathBuf::from("conda"),
+            args: vec![
+                "run".into(),
+                "--no-capture-output".into(),
+                "-n".into(),
+                "echolingo-spike1".into(),
+                "whisperlivekit-server".into(),
+            ],
+            environment: HashMap::new(),
+        }
+    };
+    let bundled_llama = resource_directory.join("runtimes/llama.cpp/llama-server");
+    let llama_server = std::env::var_os("ECHOLINGO_LLAMA_SERVER")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| bundled_llama.is_file().then_some(bundled_llama))
+        .or_else(|| executable_on_path("llama-server"));
+    LocalRuntimeLayout {
+        qwen_command,
+        llama_server,
+        model_root,
+        log_root: app_data_directory.join("logs"),
+        qwen_device: if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            "mps".into()
+        } else {
+            "auto".into()
+        },
+        local_api_key: format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        ),
+        startup_timeout: std::time::Duration::from_secs(180),
+    }
 }
 
 fn load_preferences(path: &std::path::Path) -> DesktopPreferences {
@@ -943,9 +1023,9 @@ fn forward_sidecar_events(app: AppHandle) {
                     )
                 }
                 SidecarEvent::Ready { route, .. } => (UiEventKind::RouteDecision, route),
-                SidecarEvent::HelloAccepted { .. } | SidecarEvent::SessionFinished { .. } => {
-                    continue
-                }
+                SidecarEvent::HelloAccepted { .. }
+                | SidecarEvent::RoutePlan { .. }
+                | SidecarEvent::SessionFinished { .. } => continue,
             };
             let active_session_id = state
                 .snapshot()
@@ -1170,6 +1250,9 @@ async fn shutdown_application(app: &AppHandle) {
         let _ = stop_audio_capture(&state).await;
     }
     state.supervisor.shutdown().await;
+    if let Ok(runtimes) = state.local_runtimes() {
+        runtimes.shutdown().await;
+    }
 }
 
 #[tauri::command]
@@ -1325,6 +1408,7 @@ async fn start_session(
             "ECHOLINGO_ALIGNMENT_SPOOL_ROOT".into(),
             alignment_spool.to_string_lossy().into_owned(),
         );
+        sidecar_environment.extend(state.local_runtimes()?.capability_environment());
         state
             .supervisor
             .configure_secret_environment(sidecar_environment)
@@ -1351,6 +1435,46 @@ async fn start_session(
             json!(capture_format.sample_rate_hz),
         );
         object.insert("channels".into(), json!(capture_format.channels));
+        state
+            .supervisor
+            .send_command(SidecarCommand::PlanSession(payload.clone()))
+            .await
+            .map_err(|error| error.to_string())?;
+        let services_to_start = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                match receiver.recv().await {
+                    Ok(SidecarEvent::RoutePlan {
+                        session_id,
+                        services_to_start,
+                        ..
+                    }) if Some(session_id) == starting.session_id => return Ok(services_to_start),
+                    Ok(SidecarEvent::Error { message, .. }) => return Err(message),
+                    Ok(_) => continue,
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        })
+        .await
+        .map_err(|_| "inference route planning timed out".to_string())??;
+        for service in &services_to_start {
+            state.emit_event(
+                &app,
+                starting.session_id,
+                UiEventKind::BackendHealth,
+                json!({"service": service, "state": "starting"}),
+            )?;
+            state
+                .local_runtimes()?
+                .ensure_service(service)
+                .await
+                .map_err(|error| error.to_string())?;
+            state.emit_event(
+                &app,
+                starting.session_id,
+                UiEventKind::BackendHealth,
+                json!({"service": service, "state": "connected"}),
+            )?;
+        }
         state
             .supervisor
             .send_command(SidecarCommand::StartSession(payload))
@@ -1702,10 +1826,20 @@ pub fn run() {
                 .set(store)
                 .map_err(|_| std::io::Error::other("store already initialized"))?;
             let preferences_path = app_data_directory.join("preferences.json");
+            let model_root = app_data_directory.join("models");
             state
                 .models
-                .set(ModelManager::new(app_data_directory.join("models")))
+                .set(ModelManager::new(model_root.clone()))
                 .map_err(|_| std::io::Error::other("model manager already initialized"))?;
+            let resource_directory = app.path().resource_dir()?;
+            state
+                .local_runtimes
+                .set(LocalRuntimeManager::new(local_runtime_layout(
+                    model_root,
+                    &app_data_directory,
+                    &resource_directory,
+                )))
+                .map_err(|_| std::io::Error::other("local runtime manager already initialized"))?;
             let preferences = load_preferences(&preferences_path);
             state
                 .onboarding_complete

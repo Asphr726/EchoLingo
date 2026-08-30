@@ -38,6 +38,19 @@ class SidecarConnection:
             await self.websocket.send(
                 _event("error", {"code": "invalid_request", "message": str(error), "recoverable": True})
             )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            await self.websocket.send(
+                _event(
+                    "error",
+                    {
+                        "code": "backend_start_failed",
+                        "message": str(error),
+                        "recoverable": True,
+                    },
+                )
+            )
         finally:
             if self.session is not None:
                 await self.session.close()
@@ -74,6 +87,12 @@ class SidecarConnection:
             self.session = await DesktopInferenceSession.create(payload, self.events)
             await self.websocket.send(
                 _event("ready", {"session_id": payload["session_id"], "route": self.session.route})
+            )
+        elif command_type == "plan_session":
+            if self.session is not None:
+                raise ProtocolError("cannot plan while a sidecar session is active")
+            await self.websocket.send(
+                _event("route_plan", DesktopInferenceSession.plan(payload))
             )
         elif command_type == "pause":
             self._require_session().paused = True

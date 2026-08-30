@@ -19,3 +19,10 @@ def test_packaged_entrypoint_exposes_qwen_runtime_mode() -> None:
     source = (ROOT / "packaging/sidecar_entry.py").read_text()
     assert 'sys.argv[1] == "qwen-asr-server"' in source
     assert "whisperlivekit.basic_server" in source
+
+
+def test_llama_runtime_download_is_pinned_and_integrity_checked() -> None:
+    source = (ROOT / "scripts/fetch_llama_runtime.py").read_text()
+    assert 'TAG = "b10516"' in source
+    assert 'SHA256 = "ee3324327d621026ae80c24031670e65fa62a0b23a3a027dbe2f65f240affd30"' in source
+    assert "llama-server" in source

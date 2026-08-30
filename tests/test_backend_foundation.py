@@ -1,9 +1,17 @@
 import numpy as np
 
+from echolingo.backends.asr.local_qwen import _with_language
 from echolingo.backends.asr.mock import MockStreamingAsrBackend
 from echolingo.models import AsrAudioChunk, AsrSessionConfig, TranscriptKind
 from echolingo.networking import AudioRingBuffer, RetryPolicy
 from echolingo.runtime.calibration import CalibrationStore, InferenceCalibrator
+
+
+def test_local_qwen_url_carries_ephemeral_loopback_token() -> None:
+    url = _with_language("ws://127.0.0.1:8000/asr", "ja", "secret-token")
+    assert "language=ja" in url
+    assert "mode=full" in url
+    assert "token=secret-token" in url
 
 
 def chunk(sequence: int, start: float, end: float) -> AsrAudioChunk:

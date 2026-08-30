@@ -45,6 +45,8 @@ def main() -> int:
         "echolingo-sidecar",
         "--paths",
         str(root / "src"),
+        "--collect-submodules",
+        "whisperlivekit.qwen3_streaming",
         "--add-data",
         f"{root / 'models' / 'silero_vad.onnx'}:models",
         "--distpath",

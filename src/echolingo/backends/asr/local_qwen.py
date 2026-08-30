@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from collections.abc import AsyncIterator
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -19,10 +20,12 @@ from ...streaming import WlkEventMapper
 from ._queue import AsrEventQueue
 
 
-def _with_language(url: str, language: str) -> str:
+def _with_language(url: str, language: str, token: str | None = None) -> str:
     parts = urlsplit(url)
     query = dict(parse_qsl(parts.query))
     query.update({"language": language, "mode": "full"})
+    if token:
+        query["token"] = token
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
@@ -72,7 +75,8 @@ class LocalQwenAsrBackend:
             config.session_id, config.language, self.model, config.streaming_mode
         )
         self._websocket = await websockets.connect(
-            _with_language(self.url, config.language), max_size=8 * 1024 * 1024
+            _with_language(self.url, config.language, os.getenv("WLK_API_TOKEN")),
+            max_size=8 * 1024 * 1024,
         )
         first = json.loads(await self._websocket.recv())
         if first.get("type") != "config":

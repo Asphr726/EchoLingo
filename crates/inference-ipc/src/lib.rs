@@ -24,6 +24,7 @@ pub struct Hello {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum SidecarCommand {
     Hello(Hello),
+    PlanSession(Value),
     StartSession(Value),
     Pause { session_id: Uuid, epoch: u32 },
     Resume { session_id: Uuid, epoch: u32 },
@@ -40,6 +41,11 @@ pub enum SidecarEvent {
     Ready {
         session_id: Uuid,
         route: Value,
+    },
+    RoutePlan {
+        session_id: Uuid,
+        route: Value,
+        services_to_start: Vec<String>,
     },
     Transcript(Value),
     Translation(Value),

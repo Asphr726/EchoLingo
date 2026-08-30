@@ -58,10 +58,7 @@ pub enum SupervisorError {
     #[error("inference sidecar startup timed out")]
     StartupTimeout,
     #[error("inference sidecar exited during startup ({status}): {diagnostics}")]
-    StartupExit {
-        status: String,
-        diagnostics: String,
-    },
+    StartupExit { status: String, diagnostics: String },
     #[error("cannot inspect inference sidecar process: {0}")]
     ProcessStatus(std::io::Error),
     #[error("inference sidecar WebSocket failed: {0}")]
@@ -175,8 +172,12 @@ impl InferenceSupervisor {
                 })
             });
             *self.child.lock().await = Some(child);
-            self.wait_for_websocket_or_exit(&format!("ws://127.0.0.1:{port}"), diagnostics, stderr_task)
-                .await?
+            self.wait_for_websocket_or_exit(
+                &format!("ws://127.0.0.1:{port}"),
+                diagnostics,
+                stderr_task,
+            )
+            .await?
         };
 
         let mut websocket = if self.config.configured_url.is_some() {
@@ -263,7 +264,12 @@ impl InferenceSupervisor {
     async fn wait_for_configured_websocket(
         &self,
         url: &str,
-    ) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, SupervisorError> {
+    ) -> Result<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        SupervisorError,
+    > {
         let deadline = tokio::time::Instant::now() + self.config.startup_timeout;
         loop {
             match connect_async(url).await {
@@ -391,12 +397,15 @@ mod tests {
         let error = supervisor.ensure_started().await.unwrap_err();
 
         assert!(started.elapsed() < Duration::from_secs(2));
-        assert!(matches!(
-            &error,
-            SupervisorError::StartupExit { status, diagnostics }
-                if status.contains("86")
-                    && diagnostics.contains("incompatible embedded library signature")
-        ), "unexpected startup error: {error:?}");
+        assert!(
+            matches!(
+                &error,
+                SupervisorError::StartupExit { status, diagnostics }
+                    if status.contains("86")
+                        && diagnostics.contains("incompatible embedded library signature")
+            ),
+            "unexpected startup error: {error:?}"
+        );
     }
 
     #[tokio::test]
@@ -418,21 +427,35 @@ mod tests {
         supervisor.ensure_started().await.unwrap();
         let mut events = supervisor.subscribe();
         let session_id = Uuid::new_v4();
+        let payload = json!({
+            "session_id": session_id,
+            "source_language": "en",
+            "target_language": "zh",
+            "sample_rate_hz": 16_000,
+            "channels": 1,
+            "audio_profile": "raw",
+            "inference_mode": "auto",
+            "asr_provider": "mock",
+            "translation_provider": "mock",
+            "alignment_enabled": true,
+            "alignment_provider": "mock",
+            "privacy": {"audio_upload_allowed": false, "transcript_upload_allowed": false}
+        });
         supervisor
-            .send_command(SidecarCommand::StartSession(json!({
-                "session_id": session_id,
-                "source_language": "en",
-                "target_language": "zh",
-                "sample_rate_hz": 16_000,
-                "channels": 1,
-                "audio_profile": "raw",
-                "inference_mode": "auto",
-                "asr_provider": "mock",
-                "translation_provider": "mock",
-                "alignment_enabled": true,
-                "alignment_provider": "mock",
-                "privacy": {"audio_upload_allowed": false, "transcript_upload_allowed": false}
-            })))
+            .send_command(SidecarCommand::PlanSession(payload.clone()))
+            .await
+            .unwrap();
+        let plan = tokio::time::timeout(Duration::from_secs(10), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            plan,
+            SidecarEvent::RoutePlan { session_id: planned_id, services_to_start, .. }
+                if planned_id == session_id && services_to_start.is_empty()
+        ));
+        supervisor
+            .send_command(SidecarCommand::StartSession(payload))
             .await
             .unwrap();
         let ready = tokio::time::timeout(Duration::from_secs(10), events.recv())
