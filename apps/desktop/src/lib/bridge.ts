@@ -146,4 +146,6 @@ export const api = {
     command<void>("history_delete", { sessionId }),
   historyExport: (sessionId: string, format: string) =>
     command<string>("history_export", { sessionId, format }),
+  historyExportToPath: (sessionId: string, format: string, path: string) =>
+    command<void>("history_export_to_path", { sessionId, format, path }),
 };

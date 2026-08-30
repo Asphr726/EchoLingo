@@ -7,6 +7,7 @@ import {
   X,
 } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
+import { save } from "@tauri-apps/plugin-dialog";
 import { api } from "../lib/bridge";
 import type { SessionDetail, SessionRecord } from "../types";
 
@@ -81,14 +82,12 @@ export function HistoryView() {
   const exportSession = async (format: (typeof formats)[number]) => {
     if (!selected) return;
     try {
-      const contents = await api.historyExport(selected.session.id, format);
-      const blob = new Blob([contents], { type: mime(format) });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = `${safeFilename(selected.session.title)}.${extension(format)}`;
-      link.click();
-      URL.revokeObjectURL(url);
+      const suffix = extension(format);
+      const path = await save({
+        defaultPath: `${safeFilename(selected.session.title)}.${suffix}`,
+        filters: [{ name: format === "markdown" ? "Markdown" : format.toUpperCase(), extensions: [suffix] }],
+      });
+      if (path) await api.historyExportToPath(selected.session.id, format, path);
     } catch (failure) {
       setError(String(failure));
     }
@@ -258,10 +257,4 @@ function safeFilename(value: string) {
 
 function extension(format: string) {
   return format === "markdown" ? "md" : format;
-}
-
-function mime(format: string) {
-  if (format === "json") return "application/json";
-  if (format === "vtt") return "text/vtt";
-  return "text/plain";
 }

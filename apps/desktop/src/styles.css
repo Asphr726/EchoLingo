@@ -158,6 +158,9 @@ select, input[type="text"] { min-height: 36px; padding: 0 11px; }
 textarea { padding: 10px 11px; resize: vertical; }
 select:hover, input[type="text"]:hover, textarea:hover { border-color: #b6b8ae; background: var(--surface-raised); }
 .session-actions { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 21px; }
+.live-session-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding-bottom: 17px; border-bottom: 1px solid var(--line); }
+.live-session-header h2 { margin-top: 5px; }
+.live-session-header time { font-variant-numeric: tabular-nums; color: var(--accent-deep); font-family: var(--mono-font); font-size: 19px; }
 .primary-actions { display: flex; gap: 8px; }
 .button {
   display: inline-flex;

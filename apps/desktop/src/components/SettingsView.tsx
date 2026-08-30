@@ -12,6 +12,7 @@ const sections = [
   "Models",
   "Privacy",
   "Translation",
+  "Appearance",
   "Advanced",
 ] as const;
 type Section = (typeof sections)[number];
@@ -131,26 +132,6 @@ export function SettingsView() {
                   Open caption
                 </button>
               </div>
-              <Control label="Display">
-                <select value={caption.display} onChange={(event) => void updateCaption({ ...caption, display: event.target.value as CaptionDisplay })}>
-                  <option value="both">Original and translation</option>
-                  <option value="original">Original only</option>
-                  <option value="translation">Translation only</option>
-                </select>
-              </Control>
-              <Control label={`Font size — ${caption.font_size_px} px`}>
-                <input type="range" min="18" max="72" step="1" value={caption.font_size_px} onChange={(event) => void updateCaption({ ...caption, font_size_px: Number(event.target.value) })} />
-              </Control>
-              <Control label={`Opacity — ${Math.round(caption.opacity * 100)}%`}>
-                <input type="range" min="0.35" max="1" step="0.05" value={caption.opacity} onChange={(event) => void updateCaption({ ...caption, opacity: Number(event.target.value) })} />
-              </Control>
-              <Control label="Recent segments">
-                <select value={caption.recent_segments} onChange={(event) => void updateCaption({ ...caption, recent_segments: Number(event.target.value) })}>
-                  <option value="1">1 segment</option>
-                  <option value="2">2 segments</option>
-                  <option value="3">3 segments</option>
-                </select>
-              </Control>
             </SettingsGroup>
           </div>
         )}
@@ -326,6 +307,31 @@ export function SettingsView() {
                 <textarea rows={5} placeholder="One source = target term per line" disabled title="Glossary editor backend persistence is scheduled for the next increment" />
               </Control>
               <p className="settings-helper">The backend interfaces already accept domain, context, glossary, and editable-window data. Desktop persistence for these fields is next.</p>
+            </SettingsGroup>
+          </div>
+        )}
+
+        {section === "Appearance" && (
+          <div className="settings-groups">
+            <SettingsGroup title="Floating caption" description="Adjust caption density and contrast for long lectures without changing transcript data.">
+              <Control label="Display">
+                <select value={caption.display} onChange={(event) => void updateCaption({ ...caption, display: event.target.value as CaptionDisplay })}>
+                  <option value="both">Original and translation</option>
+                  <option value="original">Original only</option>
+                  <option value="translation">Translation only</option>
+                </select>
+              </Control>
+              <Control label={`Font size — ${caption.font_size_px} px`}>
+                <input type="range" min="18" max="72" step="1" value={caption.font_size_px} onChange={(event) => void updateCaption({ ...caption, font_size_px: Number(event.target.value) })} />
+              </Control>
+              <Control label={`Opacity — ${Math.round(caption.opacity * 100)}%`}>
+                <input type="range" min="0.35" max="1" step="0.05" value={caption.opacity} onChange={(event) => void updateCaption({ ...caption, opacity: Number(event.target.value) })} />
+              </Control>
+              <Control label="Recent segments">
+                <select value={caption.recent_segments} onChange={(event) => void updateCaption({ ...caption, recent_segments: Number(event.target.value) })}>
+                  <option value="1">1 segment</option><option value="2">2 segments</option><option value="3">3 segments</option>
+                </select>
+              </Control>
             </SettingsGroup>
           </div>
         )}

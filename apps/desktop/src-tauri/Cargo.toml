@@ -23,6 +23,7 @@ keyring = "4.2"
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2.4"
 raw-window-handle = "0.6"
 tokio.workspace = true
 uuid.workspace = true

@@ -8,7 +8,7 @@ import {
   Stop,
   Waveform,
 } from "@phosphor-icons/react";
-import type { ReactNode } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 import { api } from "../lib/bridge";
 import { useApp } from "../state/AppContext";
 import type { StartSessionRequest } from "../types";
@@ -53,7 +53,7 @@ export function LiveView() {
   return (
     <div className="live-layout">
       <section className="live-main">
-        <div className="session-config" aria-label="Session configuration">
+        {!locked && <div className="session-config" aria-label="Session configuration">
           <Field label="Source language">
             <select
               value={draft.source_language}
@@ -145,7 +145,9 @@ export function LiveView() {
               <option value="cloud">Cloud</option>
             </select>
           </Field>
-        </div>
+        </div>}
+
+        {locked && <LiveSessionHeader />}
 
         <div className="session-actions">
           <div className="primary-actions">
@@ -201,6 +203,26 @@ export function LiveView() {
         <PrivacyDisclosure needsAudio={needsAudioUpload} needsTranscript={needsTranscriptUpload} />
       </aside>
     </div>
+  );
+}
+
+function LiveSessionHeader() {
+  const { snapshot } = useApp();
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const started = snapshot.started_at ? new Date(snapshot.started_at).valueOf() : now;
+  const duration = Math.max(0, now - started);
+  return (
+    <header className="live-session-header">
+      <div>
+        <span className="section-kicker">Live session</span>
+        <h2>{snapshot.phase === "PAUSED" ? "Lecture paused" : snapshot.phase === "STARTING" ? "Preparing inference" : "Listening to the lecture"}</h2>
+      </div>
+      <time>{formatDuration(duration)}</time>
+    </header>
   );
 }
 
@@ -426,6 +448,14 @@ function PrivacyDisclosure({ needsAudio, needsTranscript }: { needsAudio: boolea
 function formatTime(ms: number) {
   const seconds = Math.max(0, Math.floor(ms / 1000));
   return `${Math.floor(seconds / 60).toString().padStart(2, "0")}:${(seconds % 60).toString().padStart(2, "0")}`;
+}
+
+function formatDuration(ms: number) {
+  const seconds = Math.floor(ms / 1000);
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor(seconds % 3600 / 60);
+  const remainder = seconds % 60;
+  return `${hours > 0 ? `${hours.toString().padStart(2, "0")}:` : ""}${minutes.toString().padStart(2, "0")}:${remainder.toString().padStart(2, "0")}`;
 }
 
 function formatMs(value?: number | null) {

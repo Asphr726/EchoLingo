@@ -1518,9 +1518,37 @@ async fn history_export(
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+async fn history_export_to_path(
+    state: State<'_, RuntimeState>,
+    session_id: String,
+    format: ExportFormat,
+    path: String,
+) -> Result<(), String> {
+    let id = session_id
+        .parse()
+        .map_err(|_| "invalid session id".to_string())?;
+    let contents = state
+        .store()?
+        .export(id, format)
+        .await
+        .map_err(|error| error.to_string())?;
+    let destination = PathBuf::from(path);
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "export destination has no parent".to_string())?;
+    if !parent.is_dir() {
+        return Err("export destination directory is unavailable".into());
+    }
+    let temporary = destination.with_extension("echolingo-export.tmp");
+    std::fs::write(&temporary, contents).map_err(|error| error.to_string())?;
+    std::fs::rename(&temporary, &destination).map_err(|error| error.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(RuntimeState::default())
         .invoke_handler(tauri::generate_handler![
             get_app_snapshot,
@@ -1552,6 +1580,7 @@ pub fn run() {
             history_rename,
             history_delete,
             history_export,
+            history_export_to_path,
         ])
         .setup(|app| {
             let state = app.state::<RuntimeState>();

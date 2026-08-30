@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "EchoLingo main and caption windows",
   "windows": ["main", "caption"],
-  "permissions": ["core:default", "core:window:allow-start-dragging"]
+  "permissions": ["core:default", "core:window:allow-start-dragging", "dialog:allow-save"]
 }
