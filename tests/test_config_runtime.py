@@ -105,6 +105,20 @@ def test_metal_detection_returns_a_boolean() -> None:
     assert isinstance(CapabilityDetector._metal(True), bool)
 
 
+def test_local_qwen_runtime_uses_whisperlivekit_import_name(monkeypatch) -> None:
+    requested = []
+
+    def find_spec(name: str):
+        requested.append(name)
+        return object() if name == "whisperlivekit" else None
+
+    monkeypatch.setattr("echolingo.runtime.capabilities.importlib.util.find_spec", find_spec)
+    monkeypatch.setattr("echolingo.runtime.capabilities.shutil.which", lambda _: None)
+    runtimes = CapabilityDetector(environ={})._local_runtimes()
+    assert runtimes["qwen_asr"]
+    assert requested == ["whisperlivekit"]
+
+
 def test_calibration_store_filters_other_runtime_and_hardware(tmp_path: Path) -> None:
     store = CalibrationStore(tmp_path / "calibration.json")
     valid = calibration("qwen3-asr-0.6b")

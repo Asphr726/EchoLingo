@@ -124,7 +124,7 @@ class CapabilityDetector:
         llama_command = self.environ.get("ECHOLINGO_LLAMA_SERVER")
         return {
             "qwen_asr": bool(qwen_command)
-            or importlib.util.find_spec("whisper_livekit") is not None,
+            or importlib.util.find_spec("whisperlivekit") is not None,
             "hymt": bool(llama_command)
             or shutil.which("llama-server") is not None,
         }
