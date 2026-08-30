@@ -15,8 +15,8 @@
 
 extern "C" {
 typedef void (*ELAudioCallback)(const float *samples, size_t frames,
-                                uint32_t sample_rate, uint64_t capture_ns,
-                                void *context);
+                                uint32_t sample_rate, uint32_t channels,
+                                uint64_t capture_ns, void *context);
 typedef void (*ELStateCallback)(int32_t code, const char *message,
                                 void *context);
 }
@@ -98,6 +98,7 @@ extern "C" int32_t el_macos_request_audio_permission(int32_t kind) {
                          stateCallback:(ELStateCallback)stateCallback
                                context:(void *)context;
 - (void)presentPicker;
+- (void)setPausedSynchronously:(BOOL)paused;
 - (void)stopSynchronously;
 @end
 
@@ -236,7 +237,8 @@ extern "C" int32_t el_macos_request_audio_permission(int32_t kind) {
   }
 
   const CMItemCount frameCount = CMSampleBufferGetNumSamples(sampleBuffer);
-  std::vector<float> mono(static_cast<size_t>(frameCount), 0.0f);
+  std::vector<float> interleaved(static_cast<size_t>(frameCount) * channels,
+                                 0.0f);
   const bool nonInterleaved =
       (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
   if (nonInterleaved) {
@@ -248,28 +250,45 @@ extern "C" int32_t el_macos_request_audio_permission(int32_t kind) {
         continue;
       }
       for (CMItemCount frame = 0; frame < frameCount; ++frame) {
-        mono[static_cast<size_t>(frame)] += source[frame] / bufferCount;
+        interleaved[static_cast<size_t>(frame) * channels + channel] =
+            source[frame];
       }
     }
   } else if (audioList->mNumberBuffers > 0 &&
              audioList->mBuffers[0].mData != nullptr) {
     const float *source =
         static_cast<const float *>(audioList->mBuffers[0].mData);
-    for (CMItemCount frame = 0; frame < frameCount; ++frame) {
-      float sum = 0.0f;
-      for (UInt32 channel = 0; channel < channels; ++channel) {
-        sum += source[static_cast<size_t>(frame) * channels + channel];
-      }
-      mono[static_cast<size_t>(frame)] = sum / channels;
-    }
+    std::copy_n(source, interleaved.size(), interleaved.data());
   }
 
-  self.audioCallback(mono.data(), mono.size(),
+  self.audioCallback(interleaved.data(), static_cast<size_t>(frameCount),
                      static_cast<uint32_t>(asbd->mSampleRate),
-                     monotonicNanoseconds(), self.callbackContext);
+                     channels, monotonicNanoseconds(), self.callbackContext);
   if (retainedBlock != nullptr) {
     CFRelease(retainedBlock);
   }
+}
+
+- (void)setPausedSynchronously:(BOOL)paused {
+  SCStream *activeStream = self.stream;
+  if (activeStream == nil || self.stopping) {
+    return;
+  }
+  dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+  void (^completion)(NSError *) = ^(NSError *error) {
+    if (error != nil) {
+      [self reportCode:-1 message:error.localizedDescription];
+    }
+    dispatch_semaphore_signal(semaphore);
+  };
+  if (paused) {
+    [activeStream stopCaptureWithCompletionHandler:completion];
+  } else {
+    [activeStream startCaptureWithCompletionHandler:completion];
+  }
+  dispatch_semaphore_wait(
+      semaphore,
+      dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(5 * NSEC_PER_SEC)));
 }
 
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
@@ -333,6 +352,18 @@ extern "C" void el_macos_system_audio_stop(void *handle) {
   ELMacSystemAudioCapture *capture =
       (__bridge ELMacSystemAudioCapture *)handle;
   [capture stopSynchronously];
+}
+
+extern "C" void el_macos_system_audio_pause(void *handle) {
+  ELMacSystemAudioCapture *capture =
+      (__bridge ELMacSystemAudioCapture *)handle;
+  [capture setPausedSynchronously:YES];
+}
+
+extern "C" void el_macos_system_audio_resume(void *handle) {
+  ELMacSystemAudioCapture *capture =
+      (__bridge ELMacSystemAudioCapture *)handle;
+  [capture setPausedSynchronously:NO];
 }
 
 extern "C" void el_macos_system_audio_destroy(void *handle) {

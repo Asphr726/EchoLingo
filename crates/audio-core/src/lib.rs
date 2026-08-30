@@ -1,4 +1,4 @@
-//! Native audio capture with a stable, provider-independent 48 kHz mono boundary.
+//! Native audio capture with a stable, provider-independent multichannel boundary.
 //!
 //! Capture never performs inference or uploads data. It only produces local PCM
 //! frames and lifecycle events for the Rust app core.
@@ -125,6 +125,12 @@ pub struct AudioFrame {
     pub overflow: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureFormat {
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+}
+
 impl AudioFrame {
     pub fn frame_count(&self) -> usize {
         self.samples.len() / usize::from(self.channels.max(1))
@@ -165,7 +171,7 @@ pub enum AudioError {
     Enumerate(String),
     #[error("audio input device was not found: {0}")]
     DeviceNotFound(String),
-    #[error("audio device does not support 48 kHz PCM input")]
+    #[error("audio device does not expose a supported PCM input format")]
     UnsupportedFormat,
     #[error("failed to build audio stream: {0}")]
     Build(String),
@@ -303,36 +309,7 @@ impl CaptureControl {
 }
 
 pub fn start_microphone(device_id: Option<&str>) -> Result<AudioCaptureSession, AudioError> {
-    let host = cpal::default_host();
-    let device = match device_id {
-        Some(expected) => host
-            .input_devices()
-            .map_err(|error| AudioError::Enumerate(error.to_string()))?
-            .find(|device| {
-                device
-                    .id()
-                    .map(|id| id.to_string() == expected)
-                    .unwrap_or(false)
-            })
-            .ok_or_else(|| AudioError::DeviceNotFound(expected.into()))?,
-        None => host
-            .default_input_device()
-            .ok_or_else(|| AudioError::DeviceNotFound("default".into()))?,
-    };
-    let supported = device
-        .supported_input_configs()
-        .map_err(|error| AudioError::Build(error.to_string()))?
-        .filter_map(|range| range.try_with_sample_rate(INTERNAL_SAMPLE_RATE_HZ))
-        .min_by_key(|config| {
-            let mono_penalty = if config.channels() == 1 { 0 } else { 1 };
-            let format_penalty = if config.sample_format() == SampleFormat::F32 {
-                0
-            } else {
-                1
-            };
-            (mono_penalty, format_penalty, config.channels())
-        })
-        .ok_or(AudioError::UnsupportedFormat)?;
+    let (device, supported) = select_microphone_config(device_id)?;
     let sample_format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
     let (frame_tx, frame_rx) = mpsc::channel(CAPTURE_QUEUE_FRAMES);
@@ -386,6 +363,69 @@ pub fn start_microphone(device_id: Option<&str>) -> Result<AudioCaptureSession, 
     })
 }
 
+pub fn preferred_capture_format(
+    source: AudioSourceKind,
+    device_id: Option<&str>,
+) -> Result<CaptureFormat, AudioError> {
+    match source {
+        AudioSourceKind::Microphone => {
+            let (_, config) = select_microphone_config(device_id)?;
+            Ok(CaptureFormat {
+                sample_rate_hz: config.sample_rate(),
+                channels: config.channels(),
+            })
+        }
+        AudioSourceKind::SystemAudio => Ok(CaptureFormat {
+            sample_rate_hz: INTERNAL_SAMPLE_RATE_HZ,
+            channels: 2,
+        }),
+    }
+}
+
+fn select_microphone_config(
+    device_id: Option<&str>,
+) -> Result<(cpal::Device, cpal::SupportedStreamConfig), AudioError> {
+    let host = cpal::default_host();
+    let device = match device_id {
+        Some(expected) => host
+            .input_devices()
+            .map_err(|error| AudioError::Enumerate(error.to_string()))?
+            .find(|device| {
+                device
+                    .id()
+                    .map(|id| id.to_string() == expected)
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| AudioError::DeviceNotFound(expected.into()))?,
+        None => host
+            .default_input_device()
+            .ok_or_else(|| AudioError::DeviceNotFound("default".into()))?,
+    };
+    let configurations = device
+        .supported_input_configs()
+        .map_err(|error| AudioError::Build(error.to_string()))?
+        .collect::<Vec<_>>();
+    let supported = configurations
+        .iter()
+        .filter_map(|range| range.clone().try_with_sample_rate(INTERNAL_SAMPLE_RATE_HZ))
+        .min_by_key(|config| {
+            let mono_penalty = if config.channels() == 1 { 0 } else { 1 };
+            let format_penalty = if config.sample_format() == SampleFormat::F32 {
+                0
+            } else {
+                1
+            };
+            (mono_penalty, format_penalty, config.channels())
+        });
+    if let Some(supported) = supported {
+        return Ok((device, supported));
+    }
+    let fallback = device
+        .default_input_config()
+        .map_err(|_| AudioError::UnsupportedFormat)?;
+    Ok((device, fallback))
+}
+
 fn build_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -398,6 +438,8 @@ where
     f32: FromSample<T>,
 {
     let channels = usize::from(config.channels);
+    let output_channels = config.channels;
+    let output_sample_rate = config.sample_rate;
     let error_events = event_tx.clone();
     device
         .build_input_stream::<T, _, _>(
@@ -406,16 +448,12 @@ where
                 if input.len() < channels {
                     return;
                 }
-                let mut mono = Vec::with_capacity(input.len() / channels);
-                for frame in input.chunks_exact(channels) {
-                    let sum = frame.iter().copied().map(f32::from_sample).sum::<f32>();
-                    mono.push(sum / channels as f32);
-                }
+                let samples = input.iter().copied().map(f32::from_sample).collect();
                 let overflow = dropped.swap(false, Ordering::Relaxed);
                 let audio = AudioFrame {
-                    samples: mono,
-                    sample_rate_hz: INTERNAL_SAMPLE_RATE_HZ,
-                    channels: 1,
+                    samples,
+                    sample_rate_hz: output_sample_rate,
+                    channels: output_channels,
                     capture_monotonic_ns: monotonic_ns(),
                     overflow,
                 };
@@ -470,7 +508,7 @@ mod macos {
     use std::ffi::{c_char, c_void, CStr};
     use std::slice;
 
-    type AudioCallback = unsafe extern "C" fn(*const f32, usize, u32, u64, *mut c_void);
+    type AudioCallback = unsafe extern "C" fn(*const f32, usize, u32, u32, u64, *mut c_void);
     type StateCallback = unsafe extern "C" fn(i32, *const c_char, *mut c_void);
 
     extern "C" {
@@ -480,6 +518,8 @@ mod macos {
             context: *mut c_void,
         ) -> *mut c_void;
         fn el_macos_system_audio_present(handle: *mut c_void);
+        fn el_macos_system_audio_pause(handle: *mut c_void);
+        fn el_macos_system_audio_resume(handle: *mut c_void);
         fn el_macos_system_audio_stop(handle: *mut c_void);
         fn el_macos_system_audio_destroy(handle: *mut c_void);
     }
@@ -505,11 +545,13 @@ mod macos {
     impl SystemCapture {
         pub(super) fn pause(&self) -> Result<(), AudioError> {
             unsafe { (*self.context).paused.store(true, Ordering::Release) };
+            unsafe { el_macos_system_audio_pause(self.handle) };
             let _ = self.events.try_send(AudioSourceEvent::Paused);
             Ok(())
         }
 
         pub(super) fn resume(&self) -> Result<(), AudioError> {
+            unsafe { el_macos_system_audio_resume(self.handle) };
             unsafe { (*self.context).paused.store(false, Ordering::Release) };
             let _ = self.events.try_send(AudioSourceEvent::Resumed);
             Ok(())
@@ -534,10 +576,11 @@ mod macos {
         samples: *const f32,
         frames: usize,
         sample_rate: u32,
+        channels: u32,
         capture_ns: u64,
         context: *mut c_void,
     ) {
-        if samples.is_null() || context.is_null() || frames == 0 {
+        if samples.is_null() || context.is_null() || frames == 0 || channels == 0 {
             return;
         }
         let context = &*(context.cast::<CallbackContext>());
@@ -545,9 +588,9 @@ mod macos {
             return;
         }
         let frame = AudioFrame {
-            samples: slice::from_raw_parts(samples, frames).to_vec(),
+            samples: slice::from_raw_parts(samples, frames * channels as usize).to_vec(),
             sample_rate_hz: sample_rate,
-            channels: 1,
+            channels: channels.try_into().unwrap_or(u16::MAX),
             capture_monotonic_ns: capture_ns,
             overflow: context.dropped.swap(false, Ordering::Relaxed),
         };

@@ -4,7 +4,7 @@ use app_core::{
 };
 use audio_core::{
     audio_permission_status as native_permission_status,
-    list_audio_devices as enumerate_audio_devices,
+    list_audio_devices as enumerate_audio_devices, preferred_capture_format,
     request_audio_permission as request_native_audio_permission, start_microphone,
     start_system_audio, AudioCaptureSession, AudioDevice, AudioPermissionStatus, AudioSourceEvent,
     PermissionKind, PermissionState,
@@ -967,7 +967,8 @@ fn pump_audio_frames(
         while let Some(frame) = frames.recv().await {
             let state = app.state::<RuntimeState>();
             let max_frames = usize::from(u16::MAX);
-            for (part, samples) in frame.samples.chunks(max_frames).enumerate() {
+            let channels = usize::from(frame.channels.max(1));
+            for (part, samples) in frame.samples.chunks(max_frames * channels).enumerate() {
                 let sequence = state.audio_sequence.fetch_add(1, Ordering::Relaxed) + 1;
                 let header = AudioFrameHeader {
                     flags: u16::from(frame.overflow && part == 0),
@@ -975,7 +976,7 @@ fn pump_audio_frames(
                     capture_monotonic_ns: frame.capture_monotonic_ns,
                     sample_rate_hz: frame.sample_rate_hz,
                     channels: frame.channels,
-                    frame_count: samples.len() as u16,
+                    frame_count: (samples.len() / channels) as u16,
                 };
                 let mut packet = Vec::with_capacity(32 + samples.len() * size_of::<f32>());
                 packet.extend_from_slice(&header.encode());
@@ -1219,6 +1220,20 @@ async fn start_session(
         .map_err(|error| error.to_string())?;
     state.emit_snapshot(&app, &starting)?;
     let result = async {
+        let session_config = starting
+            .config
+            .as_ref()
+            .ok_or_else(|| "missing session config".to_string())?;
+        let source_kind = match session_config.audio_source {
+            AppAudioSourceKind::Microphone => audio_core::AudioSourceKind::Microphone,
+            AppAudioSourceKind::SystemAudio => audio_core::AudioSourceKind::SystemAudio,
+            AppAudioSourceKind::SystemAudioAndMicrophone => {
+                return Err("combined audio capture is not implemented".into())
+            }
+        };
+        let capture_format =
+            preferred_capture_format(source_kind, session_config.audio_device_id.as_deref())
+                .map_err(|error| error.to_string())?;
         let mut sidecar_environment = state.credentials.sidecar_environment()?;
         sidecar_environment.insert(
             "ECHOLINGO_MODEL_ROOT".into(),
@@ -1245,8 +1260,11 @@ async fn start_session(
             .as_object_mut()
             .ok_or_else(|| "invalid session config".to_string())?;
         object.insert("session_id".into(), json!(starting.session_id));
-        object.insert("sample_rate_hz".into(), json!(48_000));
-        object.insert("channels".into(), json!(1));
+        object.insert(
+            "sample_rate_hz".into(),
+            json!(capture_format.sample_rate_hz),
+        );
+        object.insert("channels".into(), json!(capture_format.channels));
         state
             .supervisor
             .send_command(SidecarCommand::StartSession(payload))
