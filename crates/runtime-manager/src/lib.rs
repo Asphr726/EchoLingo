@@ -409,6 +409,7 @@ impl LocalRuntimeManager {
         command
             .args(&spec.args)
             .envs(&spec.environment)
+            .env("ECHOLINGO_PARENT_PID", std::process::id().to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr))

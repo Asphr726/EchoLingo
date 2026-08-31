@@ -41,6 +41,9 @@ def _install_qwen_import_shims() -> None:
 
 
 def main() -> int:
+    from echolingo.service.parent_watchdog import start_parent_watchdog_from_environment
+
+    start_parent_watchdog_from_environment()
     if len(sys.argv) > 1 and sys.argv[1] == "qwen-asr-server":
         del sys.argv[1]
         _install_qwen_import_shims()

@@ -145,6 +145,7 @@ impl InferenceSupervisor {
             command
                 .current_dir(working_directory)
                 .env("ECHOLINGO_IPC_TOKEN", &token)
+                .env("ECHOLINGO_PARENT_PID", std::process::id().to_string())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
