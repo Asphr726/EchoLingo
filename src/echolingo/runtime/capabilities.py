@@ -93,10 +93,21 @@ class CapabilityDetector:
     @staticmethod
     def _loopback_service(port: int) -> bool:
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.08):
-                return True
+            with socket.create_connection(("127.0.0.1", port), timeout=0.08) as connection:
+                connection.sendall(
+                    b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+                )
+                response = connection.recv(64)
+                return response.startswith((b"HTTP/1.1 200", b"HTTP/1.0 200"))
         except OSError:
             return False
+
+    def _loopback_port(self, variable: str, default: int) -> int:
+        try:
+            port = int(self.environ.get(variable, str(default)))
+        except ValueError:
+            return default
+        return port if 0 < port <= 65_535 else default
 
     def _model_roots(self) -> tuple[Path, ...]:
         roots: list[Path] = []
@@ -145,8 +156,12 @@ class CapabilityDetector:
             "openai_api_key": bool(self.environ.get("OPENAI_API_KEY")),
         }
         services = {
-            "qwen_asr": self._loopback_service(8000),
-            "hymt": self._loopback_service(8010),
+            "qwen_asr": self._loopback_service(
+                self._loopback_port("ECHOLINGO_LOCAL_QWEN_PORT", 8000)
+            ),
+            "hymt": self._loopback_service(
+                self._loopback_port("ECHOLINGO_LOCAL_HYMT_PORT", 8010)
+            ),
         }
         return RuntimeCapabilities(
             os=platform.system(),

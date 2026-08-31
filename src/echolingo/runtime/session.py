@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from ..backends.asr.cloud_qwen import CloudQwenAsrBackend
 from ..backends.asr.local_qwen import LocalQwenAsrBackend, SimulStreamingAsrBackend
 from ..backends.asr.mock import MockStreamingAsrBackend, NoopAsrBackend
@@ -44,7 +46,9 @@ class BackendFactory:
         )
         if provider == "qwen_local":
             return LocalQwenAsrBackend(
-                url=local.url, model=model, language=self.config.asr.language
+                url=os.getenv("ECHOLINGO_LOCAL_QWEN_URL", local.url),
+                model=model,
+                language=self.config.asr.language,
             )
         if provider == "simulstreaming":
             return SimulStreamingAsrBackend(
@@ -75,6 +79,7 @@ class BackendFactory:
                 if self.config.translation.local_profile == "quality"
                 else value.lightweight_model
             )
-            return LocalHyMtBackend(value.base_url, model)
+            return LocalHyMtBackend(
+                os.getenv("ECHOLINGO_LOCAL_HYMT_URL", value.base_url), model
+            )
         raise ValueError(f"unknown translation provider: {provider}")
-

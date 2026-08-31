@@ -121,6 +121,8 @@ pub struct LocalRuntimeLayout {
     pub log_root: PathBuf,
     pub qwen_device: String,
     pub local_api_key: String,
+    pub qwen_port: u16,
+    pub hymt_port: u16,
     pub startup_timeout: Duration,
 }
 
@@ -158,6 +160,7 @@ struct ManagedService {
 pub struct LocalRuntimeManager {
     layout: LocalRuntimeLayout,
     services: AsyncMutex<HashMap<String, ManagedService>>,
+    port_reservations: Mutex<HashMap<String, std::net::TcpListener>>,
 }
 
 impl LocalRuntimeManager {
@@ -165,6 +168,22 @@ impl LocalRuntimeManager {
         Self {
             layout,
             services: AsyncMutex::new(HashMap::new()),
+            port_reservations: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn new_with_reserved_ports(
+        layout: LocalRuntimeLayout,
+        qwen: std::net::TcpListener,
+        hymt: std::net::TcpListener,
+    ) -> Self {
+        Self {
+            layout,
+            services: AsyncMutex::new(HashMap::new()),
+            port_reservations: Mutex::new(HashMap::from([
+                ("qwen_asr".into(), qwen),
+                ("hymt".into(), hymt),
+            ])),
         }
     }
 
@@ -181,6 +200,22 @@ impl LocalRuntimeManager {
         values.insert(
             "ECHOLINGO_LOCAL_MT_API_KEY".into(),
             self.layout.local_api_key.clone(),
+        );
+        values.insert(
+            "ECHOLINGO_LOCAL_QWEN_URL".into(),
+            format!("ws://127.0.0.1:{}/asr", self.layout.qwen_port),
+        );
+        values.insert(
+            "ECHOLINGO_LOCAL_HYMT_URL".into(),
+            format!("http://127.0.0.1:{}/v1", self.layout.hymt_port),
+        );
+        values.insert(
+            "ECHOLINGO_LOCAL_QWEN_PORT".into(),
+            self.layout.qwen_port.to_string(),
+        );
+        values.insert(
+            "ECHOLINGO_LOCAL_HYMT_PORT".into(),
+            self.layout.hymt_port.to_string(),
         );
         if let Some(path) = &self.layout.llama_server {
             values.insert(
@@ -206,7 +241,7 @@ impl LocalRuntimeManager {
                     "--host".into(),
                     "127.0.0.1".into(),
                     "--port".into(),
-                    "8000".into(),
+                    self.layout.qwen_port.to_string(),
                     "--backend".into(),
                     "qwen3-streaming".into(),
                     "--model_dir".into(),
@@ -245,7 +280,7 @@ impl LocalRuntimeManager {
                         "--host".into(),
                         "127.0.0.1".into(),
                         "--port".into(),
-                        "8010".into(),
+                        self.layout.hymt_port.to_string(),
                         "--alias".into(),
                         "tencent/Hy-MT2-1.8B".into(),
                         "--ctx-size".into(),
@@ -272,12 +307,19 @@ impl LocalRuntimeManager {
     }
 
     pub async fn ensure_service(&self, service: &str) -> Result<(), LocalRuntimeError> {
-        let (port, health_path) = service_endpoint(service)?;
+        let (port, health_path) = self.service_endpoint(service)?;
+        self.port_reservations
+            .lock()
+            .map_err(|_| io::Error::other("local runtime port reservation lock poisoned"))?
+            .remove(service);
         if service_healthy(port, health_path).await {
             return Ok(());
         }
 
         let mut services = self.services.lock().await;
+        if service_healthy(port, health_path).await {
+            return Ok(());
+        }
         if let Some(mut previous) = services.remove(service) {
             let _ = previous.child.start_kill();
             let _ = previous.child.wait().await;
@@ -339,13 +381,13 @@ impl LocalRuntimeManager {
             let _ = service.child.wait().await;
         }
     }
-}
 
-fn service_endpoint(service: &str) -> Result<(u16, &'static str), LocalRuntimeError> {
-    match service {
-        "qwen_asr" => Ok((8000, "/health")),
-        "hymt" => Ok((8010, "/health")),
-        other => Err(LocalRuntimeError::UnknownService(other.into())),
+    fn service_endpoint(&self, service: &str) -> Result<(u16, &'static str), LocalRuntimeError> {
+        match service {
+            "qwen_asr" => Ok((self.layout.qwen_port, "/health")),
+            "hymt" => Ok((self.layout.hymt_port, "/health")),
+            other => Err(LocalRuntimeError::UnknownService(other.into())),
+        }
     }
 }
 
@@ -806,6 +848,8 @@ mod tests {
             log_root: root.join("logs"),
             qwen_device: "mps".into(),
             local_api_key: "test-local-token".into(),
+            qwen_port: 38_123,
+            hymt_port: 38_124,
             startup_timeout: Duration::from_secs(2),
         }
     }
@@ -872,7 +916,47 @@ mod tests {
             .args
             .windows(2)
             .any(|pair| pair[0] == "--lan" && pair[1] == "en"));
+        assert!(command
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "--port" && pair[1] == "38123"));
         assert!(!command.args.iter().any(|argument| argument == "--language"));
+    }
+
+    #[test]
+    fn sidecar_environment_uses_isolated_runtime_endpoints() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = LocalRuntimeManager::new(runtime_layout(
+            directory.path(),
+            PathBuf::from("echolingo-sidecar"),
+        ));
+
+        let environment = manager.capability_environment();
+
+        assert_eq!(
+            environment
+                .get("ECHOLINGO_LOCAL_QWEN_URL")
+                .map(String::as_str),
+            Some("ws://127.0.0.1:38123/asr")
+        );
+        assert_eq!(
+            environment
+                .get("ECHOLINGO_LOCAL_HYMT_URL")
+                .map(String::as_str),
+            Some("http://127.0.0.1:38124/v1")
+        );
+        assert_eq!(
+            environment
+                .get("ECHOLINGO_LOCAL_QWEN_PORT")
+                .map(String::as_str),
+            Some("38123")
+        );
+        assert_eq!(
+            environment
+                .get("ECHOLINGO_LOCAL_HYMT_PORT")
+                .map(String::as_str),
+            Some("38124")
+        );
     }
 
     #[cfg(unix)]

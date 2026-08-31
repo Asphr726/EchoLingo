@@ -386,6 +386,8 @@ fn local_runtime_layout(
     model_root: PathBuf,
     app_data_directory: &std::path::Path,
     resource_directory: &std::path::Path,
+    qwen_port: u16,
+    hymt_port: u16,
 ) -> LocalRuntimeLayout {
     let bundled_sidecar = std::env::current_exe()
         .ok()
@@ -439,8 +441,17 @@ fn local_runtime_layout(
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         ),
+        qwen_port,
+        hymt_port,
         startup_timeout: std::time::Duration::from_secs(180),
     }
+}
+
+fn reserve_local_runtime_ports() -> std::io::Result<(std::net::TcpListener, std::net::TcpListener)>
+{
+    let qwen = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    let hymt = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    Ok((qwen, hymt))
 }
 
 fn load_preferences(path: &std::path::Path) -> DesktopPreferences {
@@ -1832,13 +1843,22 @@ pub fn run() {
                 .set(ModelManager::new(model_root.clone()))
                 .map_err(|_| std::io::Error::other("model manager already initialized"))?;
             let resource_directory = app.path().resource_dir()?;
+            let (qwen_reservation, hymt_reservation) = reserve_local_runtime_ports()?;
+            let qwen_port = qwen_reservation.local_addr()?.port();
+            let hymt_port = hymt_reservation.local_addr()?.port();
             state
                 .local_runtimes
-                .set(LocalRuntimeManager::new(local_runtime_layout(
-                    model_root,
-                    &app_data_directory,
-                    &resource_directory,
-                )))
+                .set(LocalRuntimeManager::new_with_reserved_ports(
+                    local_runtime_layout(
+                        model_root,
+                        &app_data_directory,
+                        &resource_directory,
+                        qwen_port,
+                        hymt_port,
+                    ),
+                    qwen_reservation,
+                    hymt_reservation,
+                ))
                 .map_err(|_| std::io::Error::other("local runtime manager already initialized"))?;
             let preferences = load_preferences(&preferences_path);
             state

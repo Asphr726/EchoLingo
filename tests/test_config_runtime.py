@@ -14,6 +14,7 @@ from echolingo.runtime.calibration import (
 )
 from echolingo.runtime.capabilities import CapabilityDetector, RuntimeCapabilities
 from echolingo.runtime.router import RuntimeRouter
+from echolingo.runtime.session import BackendFactory
 
 
 def capabilities(**overrides) -> RuntimeCapabilities:
@@ -117,6 +118,34 @@ def test_local_qwen_runtime_uses_whisperlivekit_import_name(monkeypatch) -> None
     runtimes = CapabilityDetector(environ={})._local_runtimes()
     assert runtimes["qwen_asr"]
     assert requested == ["whisperlivekit"]
+
+
+def test_local_backends_use_desktop_supervised_loopback_endpoints(monkeypatch) -> None:
+    monkeypatch.setenv("ECHOLINGO_LOCAL_QWEN_URL", "ws://127.0.0.1:43123/asr")
+    monkeypatch.setenv("ECHOLINGO_LOCAL_HYMT_URL", "http://127.0.0.1:43124/v1")
+    factory = BackendFactory(AppConfig())
+
+    assert factory.asr("qwen_local").url == "ws://127.0.0.1:43123/asr"
+    assert factory.translation("hymt_local").base_url == "http://127.0.0.1:43124/v1"
+
+
+def test_capability_detector_probes_supervised_loopback_ports(monkeypatch) -> None:
+    probed: list[int] = []
+    monkeypatch.setattr(
+        "echolingo.runtime.capabilities.CapabilityDetector._loopback_service",
+        staticmethod(lambda port: probed.append(port) or False),
+    )
+    detector = CapabilityDetector(
+        environ={
+            "ECHOLINGO_LOCAL_QWEN_PORT": "43123",
+            "ECHOLINGO_LOCAL_HYMT_PORT": "43124",
+        },
+        network_probe=lambda: False,
+    )
+
+    detector.detect()
+
+    assert probed == [43123, 43124]
 
 
 def test_calibration_store_filters_other_runtime_and_hardware(tmp_path: Path) -> None:
