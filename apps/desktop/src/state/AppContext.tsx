@@ -81,27 +81,30 @@ export function applyUiEvent(snapshot: SessionSnapshot, event: UiEventEnvelope):
     const live = { ...snapshot.live, source_revision_id: revision };
     if (kind === "partial") {
       live.original_unstable = String(payload.unstable_text ?? text);
-      if (live.translation_source_revision_id !== revision) {
-        live.translation_editable = "";
-      }
     } else {
       live.original_committed = committed || text;
       live.original_unstable = "";
+      live.translation_editable = "";
     }
     return { ...snapshot, live };
   }
   if (event.kind === "translation_revision") {
+    const sourceRevision = Number(
+      payload.source_revision_id ?? snapshot.live.translation_source_revision_id,
+    );
+    const editable = String(payload.editable_text ?? payload.text ?? "");
     const live = {
       ...snapshot.live,
       translation_revision_id: Number(
         payload.revision_id ?? snapshot.live.translation_revision_id,
       ),
-      translation_source_revision_id: Number(
-        payload.source_revision_id ?? snapshot.live.translation_source_revision_id,
-      ),
+      translation_source_revision_id: sourceRevision,
       translation_committed:
         String(payload.committed_text ?? "") || snapshot.live.translation_committed,
-      translation_editable: String(payload.editable_text ?? payload.text ?? ""),
+      translation_editable:
+        snapshot.live.original_unstable || sourceRevision >= snapshot.live.source_revision_id
+          ? editable
+          : "",
     };
     return { ...snapshot, live };
   }

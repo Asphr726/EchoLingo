@@ -981,11 +981,6 @@ fn forward_sidecar_events(app: AppHandle) {
                                 .as_str()
                                 .unwrap_or(&text)
                                 .to_string();
-                            if live.translation_source_revision_id
-                                != payload["revision_id"].as_u64().unwrap_or(0)
-                            {
-                                live.translation_editable.clear();
-                            }
                         } else {
                             live.original_committed = if committed.is_empty() {
                                 text
@@ -993,6 +988,7 @@ fn forward_sidecar_events(app: AppHandle) {
                                 committed
                             };
                             live.original_unstable.clear();
+                            live.translation_editable.clear();
                         }
                         live.source_revision_id = payload["revision_id"]
                             .as_u64()
@@ -1043,13 +1039,19 @@ fn forward_sidecar_events(app: AppHandle) {
                         if !committed.is_empty() {
                             live.translation_committed = committed.into();
                         }
-                        live.translation_editable = editable.into();
+                        let source_revision = payload["source_revision_id"].as_u64();
+                        live.translation_editable = if !live.original_unstable.is_empty()
+                            || source_revision.unwrap_or(0) >= live.source_revision_id
+                        {
+                            editable.into()
+                        } else {
+                            String::new()
+                        };
                         live.translation_revision_id = payload["revision_id"]
                             .as_u64()
                             .unwrap_or(live.translation_revision_id);
-                        live.translation_source_revision_id = payload["source_revision_id"]
-                            .as_u64()
-                            .unwrap_or(live.translation_source_revision_id);
+                        live.translation_source_revision_id =
+                            source_revision.unwrap_or(live.translation_source_revision_id);
                         core.update_live_transcript(live);
                         if let Some(source_revision) = payload["source_revision_id"].as_u64() {
                             let text = payload["text"]

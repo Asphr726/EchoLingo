@@ -254,10 +254,9 @@ function TranscriptStage() {
   const feedRef = useRef<HTMLDivElement>(null);
   const [following, setFollowing] = useState(true);
   const pendingOriginal = snapshot.live.original_unstable.trim();
-  const pendingTranslation =
-    snapshot.live.translation_source_revision_id === snapshot.live.source_revision_id
-      ? snapshot.live.translation_editable.trim()
-      : "";
+  const pendingTranslation = pendingOriginal
+    ? snapshot.live.translation_editable.trim()
+    : "";
   const segments = snapshot.previous_segments;
   const hasCopy = segments.length > 0 || pendingOriginal || pendingTranslation;
   const lastSegment = segments.at(-1);

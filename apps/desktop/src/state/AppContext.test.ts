@@ -88,7 +88,7 @@ describe("canonical desktop event projection", () => {
     expect(translated.previous_segments[0].translation).toBe("早上好。");
   });
 
-  it("drops an editable translation when a newer source revision arrives", () => {
+  it("keeps a lagging editable translation until the source becomes stable", () => {
     const translated = applyUiEvent(
       emptySnapshot,
       event("translation_revision", {
@@ -107,6 +107,15 @@ describe("canonical desktop event projection", () => {
     );
 
     expect(translated.live.translation_source_revision_id).toBe(4);
-    expect(newerSource.live.translation_editable).toBe("");
+    expect(newerSource.live.translation_editable).toBe("临时译文");
+    const stable = applyUiEvent(
+      newerSource,
+      event("transcript_revision", {
+        kind: "stable",
+        revision_id: 6,
+        text: "new source committed",
+      }),
+    );
+    expect(stable.live.translation_editable).toBe("");
   });
 });
