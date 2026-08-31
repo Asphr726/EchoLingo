@@ -1,4 +1,5 @@
 import {
+  ArrowDown,
   ClosedCaptioning,
   CloudArrowUp,
   LockKey,
@@ -8,7 +9,7 @@ import {
   Stop,
   Waveform,
 } from "@phosphor-icons/react";
-import { type ReactNode, useEffect, useState } from "react";
+import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api } from "../lib/bridge";
 import { useApp } from "../state/AppContext";
 import type { StartSessionRequest } from "../types";
@@ -250,13 +251,32 @@ function Field({
 
 function TranscriptStage() {
   const { snapshot } = useApp();
-  const hasCopy =
-    snapshot.live.original_committed ||
-    snapshot.live.original_unstable ||
-    snapshot.live.translation_committed ||
-    snapshot.live.translation_editable;
+  const feedRef = useRef<HTMLDivElement>(null);
+  const [following, setFollowing] = useState(true);
+  const pendingOriginal = snapshot.live.original_unstable.trim();
+  const pendingTranslation =
+    snapshot.live.translation_source_revision_id === snapshot.live.source_revision_id
+      ? snapshot.live.translation_editable.trim()
+      : "";
+  const segments = snapshot.previous_segments;
+  const hasCopy = segments.length > 0 || pendingOriginal || pendingTranslation;
+  const lastSegment = segments.at(-1);
+  const contentToken = `${segments.length}:${lastSegment?.translation ?? ""}:${pendingOriginal}:${pendingTranslation}`;
+
+  const scrollToLive = () => {
+    const feed = feedRef.current;
+    if (!feed) return;
+    feed.scrollTo({ top: feed.scrollHeight, behavior: "smooth" });
+    setFollowing(true);
+  };
+
+  useLayoutEffect(() => {
+    const feed = feedRef.current;
+    if (feed && following) feed.scrollTop = feed.scrollHeight;
+  }, [contentToken, following]);
+
   return (
-    <section className="transcript-stage" aria-label="Live transcript" aria-live="polite">
+    <section className="transcript-stage" aria-label="Live transcript">
       <div className="transcript-heading">
         <div>
           <span className="section-kicker">Current</span>
@@ -278,39 +298,53 @@ function TranscriptStage() {
           </span>
         </div>
       ) : (
-        <div className="current-copy">
-          <article>
-            <span>Original</span>
-            <p lang={snapshot.config?.source_language}>
-              {snapshot.live.original_committed}
-              {snapshot.live.original_unstable && (
-                <em> {snapshot.live.original_unstable}</em>
-              )}
-            </p>
-          </article>
-          <article className="translation-copy">
-            <span>Translation</span>
-            <p lang={snapshot.config?.target_language}>
-              {snapshot.live.translation_committed}
-              {snapshot.live.translation_editable && (
-                <em> {snapshot.live.translation_editable}</em>
-              )}
-            </p>
-          </article>
-        </div>
-      )}
-      {snapshot.previous_segments.length > 0 && (
-        <div className="previous-segments">
-          <span className="section-kicker">Previous segments</span>
-          {snapshot.previous_segments.slice(-4).reverse().map((segment) => (
-            <article key={segment.id}>
-              <time>{formatTime(segment.start_ms)}</time>
-              <div>
-                <p>{segment.original}</p>
-                {segment.translation && <p className="segment-translation">{segment.translation}</p>}
-              </div>
-            </article>
-          ))}
+        <div className="live-feed-shell">
+          <div
+            className="live-transcript-feed"
+            ref={feedRef}
+            aria-live="polite"
+            onScroll={(event) => {
+              const feed = event.currentTarget;
+              setFollowing(feed.scrollHeight - feed.scrollTop - feed.clientHeight < 48);
+            }}
+          >
+            {segments.map((segment) => (
+              <article className="live-segment" key={segment.id}>
+                <time>{formatTime(segment.start_ms)}</time>
+                <div className="live-segment-copy">
+                  <p lang={snapshot.config?.source_language}>{segment.original}</p>
+                  {segment.translation ? (
+                    <p className="segment-translation" lang={snapshot.config?.target_language}>
+                      {segment.translation}
+                    </p>
+                  ) : (
+                    <span className="translation-pending">Translating…</span>
+                  )}
+                </div>
+              </article>
+            ))}
+            {(pendingOriginal || pendingTranslation) && (
+              <article className="live-segment live-segment--editable">
+                <span className="live-marker">Live</span>
+                <div className="live-segment-copy">
+                  {pendingOriginal && (
+                    <p lang={snapshot.config?.source_language}>{pendingOriginal}</p>
+                  )}
+                  {pendingTranslation && (
+                    <p className="segment-translation" lang={snapshot.config?.target_language}>
+                      {pendingTranslation}
+                    </p>
+                  )}
+                </div>
+              </article>
+            )}
+          </div>
+          {!following && (
+            <button className="back-to-live" type="button" onClick={scrollToLive}>
+              <ArrowDown size={14} weight="bold" aria-hidden="true" />
+              Back to live
+            </button>
+          )}
         </div>
       )}
     </section>

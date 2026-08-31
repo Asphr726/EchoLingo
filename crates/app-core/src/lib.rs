@@ -140,6 +140,7 @@ pub struct LiveTranscript {
     pub translation_editable: String,
     pub source_revision_id: u64,
     pub translation_revision_id: u64,
+    pub translation_source_revision_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -356,7 +357,11 @@ impl AppCore {
         }
     }
 
-    pub fn update_segment_translation(&mut self, ordinal: u32, translation: String) {
+    pub fn update_segment_translation(
+        &mut self,
+        ordinal: u32,
+        translation: String,
+    ) -> Option<SegmentSummary> {
         if let Some(segment) = self
             .snapshot
             .previous_segments
@@ -364,7 +369,9 @@ impl AppCore {
             .find(|segment| segment.ordinal == ordinal)
         {
             segment.translation = translation;
+            return Some(segment.clone());
         }
+        None
     }
 
     fn check_revision(&self, expected: u64) -> Result<(), SessionError> {
@@ -531,5 +538,27 @@ mod tests {
                 .phase,
             SessionPhase::Paused
         );
+    }
+
+    #[test]
+    fn segment_translation_returns_the_updated_bilingual_projection() {
+        let mut core = AppCore::default();
+        let id = Uuid::new_v4();
+        core.commit_segment(SegmentSummary {
+            id,
+            ordinal: 7,
+            start_ms: 1_000.0,
+            end_ms: 2_000.0,
+            original: "Good morning.".into(),
+            translation: String::new(),
+        });
+
+        let segment = core
+            .update_segment_translation(7, "早上好。".into())
+            .expect("known source revision");
+
+        assert_eq!(segment.id, id);
+        assert_eq!(segment.translation, "早上好。");
+        assert_eq!(core.snapshot().previous_segments, vec![segment]);
     }
 }

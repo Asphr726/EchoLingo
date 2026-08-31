@@ -86,6 +86,7 @@ export interface SessionSnapshot {
     translation_editable: string;
     source_revision_id: number;
     translation_revision_id: number;
+    translation_source_revision_id: number;
   };
   previous_segments: SegmentSummary[];
   metrics: LiveMetrics;
@@ -214,6 +215,7 @@ export const emptySnapshot: SessionSnapshot = {
     translation_editable: "",
     source_revision_id: 0,
     translation_revision_id: 0,
+    translation_source_revision_id: 0,
   },
   previous_segments: [],
   metrics: {

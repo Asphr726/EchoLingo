@@ -81,6 +81,9 @@ export function applyUiEvent(snapshot: SessionSnapshot, event: UiEventEnvelope):
     const live = { ...snapshot.live, source_revision_id: revision };
     if (kind === "partial") {
       live.original_unstable = String(payload.unstable_text ?? text);
+      if (live.translation_source_revision_id !== revision) {
+        live.translation_editable = "";
+      }
     } else {
       live.original_committed = committed || text;
       live.original_unstable = "";
@@ -93,11 +96,24 @@ export function applyUiEvent(snapshot: SessionSnapshot, event: UiEventEnvelope):
       translation_revision_id: Number(
         payload.revision_id ?? snapshot.live.translation_revision_id,
       ),
+      translation_source_revision_id: Number(
+        payload.source_revision_id ?? snapshot.live.translation_source_revision_id,
+      ),
       translation_committed:
         String(payload.committed_text ?? "") || snapshot.live.translation_committed,
       translation_editable: String(payload.editable_text ?? payload.text ?? ""),
     };
     return { ...snapshot, live };
+  }
+  if (event.kind === "segment_committed") {
+    const segment = event.payload as SessionSnapshot["previous_segments"][number];
+    const index = snapshot.previous_segments.findIndex(
+      (current) => current.ordinal === segment.ordinal,
+    );
+    const previous_segments = [...snapshot.previous_segments];
+    if (index >= 0) previous_segments[index] = segment;
+    else previous_segments.push(segment);
+    return { ...snapshot, previous_segments: previous_segments.slice(-200) };
   }
   if (event.kind === "error") {
     return {

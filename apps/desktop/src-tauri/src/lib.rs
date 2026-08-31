@@ -911,6 +911,7 @@ fn forward_sidecar_events(app: AppHandle) {
         while let Ok(event) = receiver.recv().await {
             let state = app.state::<RuntimeState>();
             let persist_event = event.clone();
+            let mut segment_update: Option<SegmentSummary> = None;
             let (kind, payload) = match event {
                 SidecarEvent::Transcript(payload) => {
                     if let Ok(mut core) = state.core.lock() {
@@ -926,6 +927,11 @@ fn forward_sidecar_events(app: AppHandle) {
                                 .as_str()
                                 .unwrap_or(&text)
                                 .to_string();
+                            if live.translation_source_revision_id
+                                != payload["revision_id"].as_u64().unwrap_or(0)
+                            {
+                                live.translation_editable.clear();
+                            }
                         } else {
                             live.original_committed = if committed.is_empty() {
                                 text
@@ -950,7 +956,7 @@ fn forward_sidecar_events(app: AppHandle) {
                             let start_ms = payload["start_ms"]
                                 .as_f64()
                                 .unwrap_or((end_ms - 1_000.0).max(0.0));
-                            core.commit_segment(SegmentSummary {
+                            let segment = SegmentSummary {
                                 id: payload["event_id"]
                                     .as_str()
                                     .and_then(|value| value.parse().ok())
@@ -968,7 +974,9 @@ fn forward_sidecar_events(app: AppHandle) {
                                         .to_string()
                                 },
                                 translation: String::new(),
-                            });
+                            };
+                            core.commit_segment(segment.clone());
+                            segment_update = Some(segment);
                         }
                     }
                     (UiEventKind::TranscriptRevision, payload)
@@ -985,16 +993,18 @@ fn forward_sidecar_events(app: AppHandle) {
                         live.translation_revision_id = payload["revision_id"]
                             .as_u64()
                             .unwrap_or(live.translation_revision_id);
+                        live.translation_source_revision_id = payload["source_revision_id"]
+                            .as_u64()
+                            .unwrap_or(live.translation_source_revision_id);
                         core.update_live_transcript(live);
                         if let Some(source_revision) = payload["source_revision_id"].as_u64() {
-                            let text = payload["committed_text"]
+                            let text = payload["text"]
                                 .as_str()
-                                .filter(|value| !value.is_empty())
                                 .or_else(|| payload["editable_text"].as_str())
-                                .or_else(|| payload["text"].as_str())
                                 .unwrap_or_default()
                                 .to_string();
-                            core.update_segment_translation(source_revision as u32, text);
+                            segment_update =
+                                core.update_segment_translation(source_revision as u32, text);
                         }
                     }
                     (UiEventKind::TranslationRevision, payload)
@@ -1048,6 +1058,16 @@ fn forward_sidecar_events(app: AppHandle) {
                 .and_then(|value| value.parse().ok())
                 .or(active_session_id);
             let _ = state.emit_event(&app, event_session_id, kind, payload);
+            if let Some(segment) = segment_update {
+                if let Ok(payload) = serde_json::to_value(segment) {
+                    let _ = state.emit_event(
+                        &app,
+                        event_session_id,
+                        UiEventKind::SegmentCommitted,
+                        payload,
+                    );
+                }
+            }
             if let Some(session_id) = event_session_id {
                 if let Err(error) = persist_sidecar_event(&state, session_id, &persist_event).await
                 {
