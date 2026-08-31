@@ -35,6 +35,7 @@ class TranslationDecision:
     source_revision_id: int
     source_text: str
     committed_source: str
+    source_committed: bool
     final: bool
     reason: str
 
@@ -79,10 +80,12 @@ class AdaptiveRetranslationPolicy:
             return None
         now = event.emitted_at_monotonic_ns or time.monotonic_ns()
         if event.kind in {TranscriptKind.STABLE, TranscriptKind.FINAL}:
-            committed = event.committed_text or event.text
-            committed = self._accept_committed(committed)
+            incoming_committed = (event.committed_text or event.text).strip()
+            committed = self._accept_committed(incoming_committed)
+            if incoming_committed != committed:
+                return None
             source = (event.text if event.kind == TranscriptKind.FINAL else committed).strip()
-            if not source or (source == self._last_requested and event.kind != TranscriptKind.FINAL):
+            if not source:
                 return None
             self._last_requested = source
             self._last_request_ns = now
@@ -90,6 +93,7 @@ class AdaptiveRetranslationPolicy:
                 event.revision_id,
                 source[-self.maximum_editable_chars :],
                 committed,
+                True,
                 event.kind == TranscriptKind.FINAL,
                 event.kind.value,
             )
@@ -124,10 +128,12 @@ class AdaptiveRetranslationPolicy:
             return None
         self._last_requested = partial
         self._last_request_ns = now
+        editable_source = (event.unstable_text or event.text).strip()
         return TranslationDecision(
             event.revision_id,
-            partial[-self.maximum_editable_chars :],
+            editable_source[-self.maximum_editable_chars :],
             self.committed_source,
+            False,
             False,
             reason,
         )
@@ -166,12 +172,12 @@ class StreamingTranslationCoordinator:
             if decision is None:
                 return
             complete_source = decision.committed_source or decision.source_text
-            if complete_source.startswith(decision.source_text):
-                editable_source = decision.source_text
-            else:
+            if decision.source_committed:
                 editable_source = complete_source[self._committed_source_chars :].strip()
-                if not editable_source:
-                    editable_source = decision.source_text
+            else:
+                editable_source = decision.source_text.strip()
+            if not editable_source:
+                return
             request = TranslationRequest(
                 request_id=str(uuid.uuid4()),
                 source_revision_id=decision.source_revision_id,
@@ -192,7 +198,7 @@ class StreamingTranslationCoordinator:
                 state = self.target.observe(
                     translated.text,
                     source_revision_id=decision.source_revision_id,
-                    source_final=decision.final,
+                    source_committed=decision.source_committed,
                     provider_final=translated.kind == TranslationKind.FINAL,
                     now_ns=translated.emitted_at_monotonic_ns,
                 )

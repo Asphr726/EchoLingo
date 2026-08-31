@@ -71,13 +71,13 @@ def test_semantic_boundary_and_final_always_trigger() -> None:
 def test_target_commit_requires_final_source_or_stable_repetition() -> None:
     policy = TargetCommitPolicy(stable_ms=500)
     first = policy.observe(
-        "译文", source_revision_id=1, source_final=False, provider_final=True, now_ns=0
+        "译文", source_revision_id=1, source_committed=False, provider_final=True, now_ns=0
     )
     assert not first.committed_now and first.editable_text == "译文"
     repeated = policy.observe(
         "译文",
         source_revision_id=1,
-        source_final=False,
+        source_committed=False,
         provider_final=True,
         now_ns=600_000_000,
     )
@@ -85,14 +85,14 @@ def test_target_commit_requires_final_source_or_stable_repetition() -> None:
     final = policy.observe(
         "下一句",
         source_revision_id=2,
-        source_final=True,
+        source_committed=True,
         provider_final=True,
         now_ns=700_000_000,
     )
     assert final.committed_text == "译文 下一句"
 
 
-async def test_streaming_coordinator_keeps_editable_and_committed_target_separate() -> None:
+async def test_streaming_coordinator_commits_target_at_stable_source_boundary() -> None:
     backend = MockTranslationBackend(lambda source: f"ZH:{source}")
     coordinator = StreamingTranslationCoordinator(
         backend, source_lang="en", target_lang="zh"
@@ -102,14 +102,36 @@ async def test_streaming_coordinator_keeps_editable_and_committed_target_separat
         TranscriptKind.STABLE, "lecture", 1, 0, committed="lecture"
     )
     stable_outputs = [item async for item in coordinator.handle(stable_event)]
-    assert stable_outputs[-1].kind == TranslationKind.STABLE
-    assert stable_outputs[-1].committed_text == ""
-    assert stable_outputs[-1].editable_text == "ZH:lecture"
+    assert stable_outputs[-1].kind == TranslationKind.FINAL
+    assert stable_outputs[-1].committed_text == "ZH:lecture"
+    assert stable_outputs[-1].editable_text == ""
 
     final_event = transcript(
         TranscriptKind.FINAL, "lecture", 2, 1_000, committed="lecture"
     )
     final_outputs = [item async for item in coordinator.handle(final_event)]
-    assert final_outputs[-1].kind == TranslationKind.FINAL
-    assert final_outputs[-1].committed_text == "ZH:lecture"
+    assert final_outputs == []
     assert coordinator.context.snapshot()[-1].source == "lecture"
+
+
+async def test_streaming_coordinator_translates_only_new_stable_source() -> None:
+    backend = MockTranslationBackend(lambda source: f"ZH:{source}")
+    coordinator = StreamingTranslationCoordinator(
+        backend, source_lang="en", target_lang="zh"
+    )
+    await coordinator.start()
+
+    first = transcript(TranscriptKind.STABLE, "first", 1, 0, committed="first")
+    second = transcript(
+        TranscriptKind.STABLE,
+        "second",
+        2,
+        1_000,
+        committed="first second",
+    )
+    first_outputs = [item async for item in coordinator.handle(first)]
+    second_outputs = [item async for item in coordinator.handle(second)]
+
+    assert first_outputs[-1].committed_text == "ZH:first"
+    assert second_outputs[-1].committed_text == "ZH:first ZH:second"
+    assert coordinator.context.snapshot()[-1].source == "second"

@@ -58,5 +58,51 @@ def test_wlk_assigns_unique_revisions_to_multiple_stable_lines() -> None:
     assert [event.revision_id for event in events] == [1, 2]
 
 
+def test_wlk_maps_text_appended_to_an_existing_stable_line() -> None:
+    """WLK grows its last full-state line instead of appending a new line."""
+    mapper = WlkEventMapper("session", "en", "qwen", "streaming")
+    first = mapper.map_message(
+        {
+            "lines": [
+                {
+                    "text": "The first committed sentence.",
+                    "start": 0,
+                    "end": 2,
+                }
+            ],
+            "buffer_transcription": "The editable tail",
+        },
+        2_500,
+    )
+    assert [event.kind for event in first] == [
+        TranscriptKind.STABLE,
+        TranscriptKind.PARTIAL,
+    ]
+
+    grown = mapper.map_message(
+        {
+            "lines": [
+                {
+                    "text": "The first committed sentence. The second committed sentence.",
+                    "start": 0,
+                    "end": 5,
+                }
+            ],
+            "buffer_transcription": "A new editable tail",
+        },
+        5_500,
+    )
+
+    assert [event.kind for event in grown] == [
+        TranscriptKind.STABLE,
+        TranscriptKind.PARTIAL,
+    ]
+    assert grown[0].text == "The second committed sentence."
+    assert grown[0].committed_text == (
+        "The first committed sentence. The second committed sentence."
+    )
+    assert grown[1].committed_text == grown[0].committed_text
+
+
 def test_parse_wlk_timestamp() -> None:
     assert parse_timestamp_ms("1:02:03.5") == 3_723_500

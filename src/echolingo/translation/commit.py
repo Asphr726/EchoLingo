@@ -27,7 +27,7 @@ class TargetCommitPolicy:
         candidate: str,
         *,
         source_revision_id: int,
-        source_final: bool,
+        source_committed: bool,
         provider_final: bool,
         now_ns: int | None = None,
     ) -> TargetState:
@@ -45,7 +45,7 @@ class TargetCommitPolicy:
             candidate
             and provider_final
             and source_revision_id > self._last_committed_source_revision
-            and (source_final or stable_for_ms >= self.stable_ms)
+            and (source_committed or stable_for_ms >= self.stable_ms)
         )
         if may_commit:
             separator = "" if not self.committed_text else " "
@@ -55,4 +55,3 @@ class TargetCommitPolicy:
             return TargetState(self.committed_text, "", True)
         self.editable_text = candidate
         return TargetState(self.committed_text, self.editable_text, False)
-

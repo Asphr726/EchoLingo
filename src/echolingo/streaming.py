@@ -70,7 +70,8 @@ class WlkEventMapper:
         self.language = language
         self.backend = backend
         self.streaming_mode = streaming_mode
-        self._committed_count = 0
+        self._committed_lines: list[str] = []
+        self._committed_line_ends_ms: list[float | None] = []
         self._committed_text = ""
         self._partial = ""
         self._revision = 0
@@ -94,19 +95,47 @@ class WlkEventMapper:
             return events
 
         lines = [line for line in message.get("lines", []) if line.get("text")]
-        for line in lines[self._committed_count :]:
+        for index, line in enumerate(lines):
             text = str(line["text"]).strip()
-            self._committed_text = f"{self._committed_text} {text}".strip()
-            event = self._event(TranscriptKind.STABLE, text, now, audio_cursor_ms)
+            previous_text = (
+                self._committed_lines[index]
+                if index < len(self._committed_lines)
+                else ""
+            )
+            if text == previous_text:
+                continue
+            if previous_text and not text.startswith(previous_text):
+                # Canonical stable text is append-only. Ignore an incompatible
+                # upstream rewrite rather than rolling back text already shown
+                # to the user.
+                continue
+            delta = text[len(previous_text) :].strip()
+            if not delta:
+                continue
+
+            previous_end_ms = (
+                self._committed_line_ends_ms[index]
+                if index < len(self._committed_line_ends_ms)
+                else None
+            )
+            end_ms = parse_timestamp_ms(line.get("end"))
+            if index < len(self._committed_lines):
+                self._committed_lines[index] = text
+                self._committed_line_ends_ms[index] = end_ms
+            else:
+                self._committed_lines.append(text)
+                self._committed_line_ends_ms.append(end_ms)
+
+            self._committed_text = f"{self._committed_text} {delta}".strip()
+            event = self._event(TranscriptKind.STABLE, delta, now, audio_cursor_ms)
             event.committed_text = self._committed_text
-            event.start_ms = parse_timestamp_ms(line.get("start"))
-            event.end_ms = parse_timestamp_ms(line.get("end"))
+            event.start_ms = previous_end_ms or parse_timestamp_ms(line.get("start"))
+            event.end_ms = end_ms
             event.timestamp_quality = TimestampQuality.INTERPOLATED
             if event.end_ms is not None and self._audio_origin_ns is not None:
                 audio_end_ns = self._audio_origin_ns + int(event.end_ms * 1_000_000)
                 event.commit_latency_ms = max(0.0, (now - audio_end_ns) / 1_000_000.0)
             events.append(event)
-        self._committed_count = len(lines)
 
         partial = str(message.get("buffer_transcription") or "").strip()
         if partial != self._partial:
