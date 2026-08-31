@@ -6,6 +6,7 @@ import type {
   AudioTestResult,
   CaptionPreferences,
   CloudCredentialStatus,
+  CloudProbeResult,
   ModelProgress,
   ModelStatus,
   SessionDetail,
@@ -127,6 +128,8 @@ export const api = {
     }),
   clearCloudCredentials: () =>
     command<CloudCredentialStatus>("clear_cloud_credentials"),
+  probeQwenCloud: (includeTranslation: boolean) =>
+    command<CloudProbeResult>("probe_qwen_cloud", { includeTranslation }),
   models: () => command<ModelStatus[]>("list_models"),
   installModel: (modelId: string) =>
     command<ModelStatus>("install_model", { modelId }),

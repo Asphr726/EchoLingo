@@ -8,7 +8,7 @@ import pytest
 from echolingo.backends.asr.cloud_qwen import CloudQwenAsrBackend
 from echolingo.backends.translation.cloud_qwen_mt import CloudQwenMtBackend
 from echolingo.backends.translation.local_hymt import LocalHyMtBackend
-from echolingo.errors import PolicyDeniedError
+from echolingo.errors import AuthenticationError, PolicyDeniedError
 from echolingo.models import (
     AsrAudioChunk,
     AsrSessionConfig,
@@ -148,6 +148,42 @@ async def test_cloud_qwen_asr_reconnects_and_replays_local_ring() -> None:
     await backend.close()
     assert backend.reconnect_count == 1
     assert any(event.text == "recovered" for event in events)
+
+
+async def test_cloud_qwen_probe_connects_without_uploading_audio() -> None:
+    websocket = FakeWebSocket()
+
+    async def factory(url, headers):
+        return websocket
+
+    backend = CloudQwenAsrBackend(
+        api_key="secret",
+        workspace_id="workspace",
+        websocket_factory=factory,
+    )
+    latency = await backend.probe_connection()
+
+    assert latency >= 0
+    assert websocket.closed
+    assert websocket.sent == []
+    assert backend.cloud_audio_uploaded_ms == 0
+
+
+def test_cloud_qwen_403_explains_workspace_and_region_without_echoing_url() -> None:
+    class Response:
+        status_code = 403
+
+    error = RuntimeError("server rejected wss://private-workspace.example?token=secret")
+    error.response = Response()  # type: ignore[attr-defined]
+
+    normalized = CloudQwenAsrBackend.connection_error(error, region="singapore")
+
+    assert isinstance(normalized, AuthenticationError)
+    assert "HTTP 403" in str(normalized)
+    assert "Singapore" in str(normalized)
+    assert "workspace" in str(normalized).lower()
+    assert "private-workspace" not in str(normalized)
+    assert "secret" not in str(normalized)
 
 
 def translation_request() -> TranslationRequest:

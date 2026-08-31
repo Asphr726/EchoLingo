@@ -25,10 +25,22 @@ pub struct Hello {
 pub enum SidecarCommand {
     Hello(Hello),
     PlanSession(Value),
+    ProbeCloud {
+        request_id: Uuid,
+        include_translation: bool,
+    },
     StartSession(Value),
-    Pause { session_id: Uuid, epoch: u32 },
-    Resume { session_id: Uuid, epoch: u32 },
-    FinishSession { session_id: Uuid },
+    Pause {
+        session_id: Uuid,
+        epoch: u32,
+    },
+    Resume {
+        session_id: Uuid,
+        epoch: u32,
+    },
+    FinishSession {
+        session_id: Uuid,
+    },
     Shutdown,
 }
 
@@ -46,6 +58,10 @@ pub enum SidecarEvent {
         session_id: Uuid,
         route: Value,
         services_to_start: Vec<String>,
+    },
+    CloudProbeResult {
+        request_id: Uuid,
+        result: Value,
     },
     Transcript(Value),
     Translation(Value),
@@ -196,5 +212,13 @@ mod tests {
         assert!(serde_json::to_string(&event)
             .unwrap()
             .contains("session_state"));
+        let probe_id = Uuid::nil();
+        let probe = serde_json::to_value(SidecarCommand::ProbeCloud {
+            request_id: probe_id,
+            include_translation: true,
+        })
+        .unwrap();
+        assert_eq!(probe["type"], "probe_cloud");
+        assert_eq!(probe["payload"]["request_id"], probe_id.to_string());
     }
 }

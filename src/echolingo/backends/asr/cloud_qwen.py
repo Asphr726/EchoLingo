@@ -129,16 +129,52 @@ class CloudQwenAsrBackend:
             open_timeout=10,
         )
 
-    async def _connect(self) -> None:
+    @staticmethod
+    def connection_error(error: Exception, *, region: str) -> Exception:
+        status = getattr(error, "status_code", None)
+        response = getattr(error, "response", None)
+        status = status or getattr(response, "status_code", None)
+        region_name = "Singapore" if region == "singapore" else "Beijing"
+        if status == 401:
+            return AuthenticationError(
+                "Qwen Cloud rejected the API key (HTTP 401). Verify the key is active "
+                f"and belongs to the {region_name} Model Studio region."
+            )
+        if status == 403:
+            return AuthenticationError(
+                "Qwen Realtime ASR access was denied (HTTP 403). Verify that the API key "
+                f"and workspace ID belong to the same {region_name} workspace and that "
+                "Qwen realtime ASR is enabled for it."
+            )
+        if isinstance(error, (TimeoutError, asyncio.TimeoutError)):
+            return ConnectionError(
+                "Qwen Cloud connection timed out. Check network access and try again."
+            )
+        return ConnectionError(
+            "Qwen Cloud could not be reached. Check the network, region, and workspace ID."
+        )
+
+    async def _open_with_diagnostics(self):
         try:
-            self._websocket = await self._open()
+            return await self._open()
         except Exception as error:
-            status = getattr(error, "status_code", None)
-            response = getattr(error, "response", None)
-            status = status or getattr(response, "status_code", None)
-            if status in {401, 403}:
-                raise AuthenticationError("Cloud Qwen ASR authentication failed") from error
-            raise
+            raise self.connection_error(error, region=self.region) from error
+
+    async def probe_connection(self) -> float:
+        """Validate the authenticated WebSocket handshake without uploading audio."""
+        if not self.api_key or not self.workspace_id:
+            raise AuthenticationError(
+                "Qwen Cloud requires both an API key and workspace ID."
+            )
+        started_ns = time.monotonic_ns()
+        websocket = await self._open_with_diagnostics()
+        try:
+            return (time.monotonic_ns() - started_ns) / 1_000_000.0
+        finally:
+            await websocket.close()
+
+    async def _connect(self) -> None:
+        self._websocket = await self._open_with_diagnostics()
         transcription: dict[str, object] = {}
         if self.config.language != "auto":
             transcription["language"] = self.config.language

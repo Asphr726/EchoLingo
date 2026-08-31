@@ -8,6 +8,7 @@ from typing import Any
 
 from websockets.asyncio.server import ServerConnection, serve
 
+from .cloud_probe import probe_qwen_cloud
 from .protocol import PROTOCOL_VERSION, ProtocolError, decode_audio_packet
 from .session import DesktopInferenceSession
 
@@ -93,6 +94,16 @@ class SidecarConnection:
                 raise ProtocolError("cannot plan while a sidecar session is active")
             await self.websocket.send(
                 _event("route_plan", DesktopInferenceSession.plan(payload))
+            )
+        elif command_type == "probe_cloud":
+            if self.session is not None:
+                raise ProtocolError("cannot probe cloud while a session is active")
+            result = await probe_qwen_cloud(bool(payload.get("include_translation", False)))
+            await self.websocket.send(
+                _event(
+                    "cloud_probe_result",
+                    {"request_id": payload["request_id"], "result": result},
+                )
             )
         elif command_type == "pause":
             self._require_session().paused = True

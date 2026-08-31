@@ -2,7 +2,7 @@ import { CheckCircle, ClosedCaptioning, CloudArrowUp, Key, LockKey, SlidersHoriz
 import { type ReactNode, useEffect, useState } from "react";
 import { api, subscribeModelProgress } from "../lib/bridge";
 import { useApp } from "../state/AppContext";
-import type { CaptionDisplay, CloudCredentialStatus, InferenceMode, ModelProgress, ModelStatus, StartSessionRequest } from "../types";
+import type { CaptionDisplay, CloudCredentialStatus, CloudProbeResult, InferenceMode, ModelProgress, ModelStatus, StartSessionRequest } from "../types";
 
 const sections = [
   "General",
@@ -24,6 +24,7 @@ export function SettingsView() {
   const [workspaceId, setWorkspaceId] = useState("");
   const [credentialPending, setCredentialPending] = useState(false);
   const [credentialError, setCredentialError] = useState<string | null>(null);
+  const [cloudProbe, setCloudProbe] = useState<CloudProbeResult | null>(null);
   const [models, setModels] = useState<ModelStatus[]>([]);
   const [modelProgress, setModelProgress] = useState<Record<string, ModelProgress>>({});
   const [modelPending, setModelPending] = useState<string | null>(null);
@@ -82,8 +83,24 @@ export function SettingsView() {
     setCredentialError(null);
     try {
       setCredentialStatus(await api.setCloudCredentials(apiKey, workspaceId));
+      setCloudProbe(null);
       setApiKey("");
       setWorkspaceId("");
+    } catch (error) {
+      setCredentialError(String(error));
+    } finally {
+      setCredentialPending(false);
+    }
+  };
+
+  const testCloud = async () => {
+    setCredentialPending(true);
+    setCredentialError(null);
+    setCloudProbe(null);
+    try {
+      setCloudProbe(
+        await api.probeQwenCloud(draft.privacy.transcript_upload_allowed),
+      );
     } catch (error) {
       setCredentialError(String(error));
     } finally {
@@ -96,6 +113,7 @@ export function SettingsView() {
     setCredentialError(null);
     try {
       setCredentialStatus(await api.clearCloudCredentials());
+      setCloudProbe(null);
     } catch (error) {
       setCredentialError(String(error));
     } finally {
@@ -262,7 +280,22 @@ export function SettingsView() {
               <Control label="DashScope workspace ID">
                 <input type="password" autoComplete="off" value={workspaceId} placeholder={credentialStatus?.workspace_id_available ? "Saved — enter to replace" : "Enter workspace ID"} onChange={(event) => setWorkspaceId(event.target.value)} />
               </Control>
+              <p className="settings-helper">
+                Use an international Model Studio API key and workspace ID from the same Singapore region. The connection test opens an authenticated ASR WebSocket but uploads no audio.
+              </p>
               {credentialError && <p className="settings-error" role="alert">{credentialError}</p>}
+              {cloudProbe && (
+                <div className={cloudProbe.ok ? "cloud-probe cloud-probe--ok" : "cloud-probe cloud-probe--error"} role="status">
+                  <strong>{cloudProbe.ok ? "Qwen Cloud connection works" : "Qwen Cloud needs attention"}</strong>
+                  <span>
+                    ASR: {cloudProbe.asr.status}
+                    {cloudProbe.asr.handshake_latency_ms != null ? ` · ${cloudProbe.asr.handshake_latency_ms.toFixed(0)} ms handshake` : ""}
+                    {` · Translation: ${cloudProbe.translation.status}`}
+                  </span>
+                  {cloudProbe.message && <small>{cloudProbe.message}</small>}
+                  <small>Audio uploaded: no{draft.privacy.transcript_upload_allowed ? " · A fixed test sentence was sent to Qwen-MT." : " · Enable transcript upload to include Qwen-MT in this test."}</small>
+                </div>
+              )}
               <div className="settings-inline">
                 <button className="button button--primary" type="button" disabled={credentialPending || apiKey.trim().length < 8 || workspaceId.trim().length < 3} onClick={() => void saveCredentials()}>
                   <Key size={18} weight="regular" aria-hidden="true" />
@@ -270,6 +303,9 @@ export function SettingsView() {
                 </button>
                 <button className="button" type="button" disabled={credentialPending || credentialStatus?.source !== "macos_keychain"} onClick={() => void clearCredentials()}>
                   Remove
+                </button>
+                <button className="button" type="button" disabled={credentialPending || !credentialStatus?.api_key_available || !credentialStatus.workspace_id_available} onClick={() => void testCloud()}>
+                  {credentialPending ? "Working…" : "Test connection"}
                 </button>
               </div>
             </SettingsGroup>

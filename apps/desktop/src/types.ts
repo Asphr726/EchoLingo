@@ -131,6 +131,24 @@ export interface CloudCredentialStatus {
   source: "macos_keychain" | "environment" | "none";
 }
 
+export interface CloudProbeResult {
+  ok: boolean;
+  region: string;
+  audio_uploaded: boolean;
+  code?: string;
+  message?: string;
+  asr: {
+    status: string;
+    model?: string;
+    handshake_latency_ms?: number;
+  };
+  translation: {
+    status: string;
+    model?: string;
+    latency_ms?: number;
+  };
+}
+
 export type ModelInstallState = "not_downloaded" | "installing" | "ready" | "corrupt";
 
 export interface ModelStatus {

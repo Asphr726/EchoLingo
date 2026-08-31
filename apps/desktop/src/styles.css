@@ -372,6 +372,12 @@ select:hover, input[type="text"]:hover, textarea:hover { border-color: #b6b8ae; 
 .credential-status > div { display: grid; gap: 3px; }
 .credential-status strong { font-size: 11px; }
 .credential-status small { color: var(--muted); font-size: 9px; line-height: 1.45; }
+.cloud-probe { display: grid; max-width: 570px; gap: 4px; padding: 12px 14px; border-left: 3px solid #778078; background: #f2f3ef; color: #4f534d; }
+.cloud-probe--ok { border-left-color: var(--accent); background: #edf3ed; color: var(--accent-deep); }
+.cloud-probe--error { border-left-color: var(--danger); background: #f7eeee; color: #7b3f3b; }
+.cloud-probe strong { font-size: 11px; }
+.cloud-probe span, .cloud-probe small { font-size: 9px; line-height: 1.5; }
+.cloud-probe small { color: inherit; opacity: .78; }
 .settings-error { max-width: 570px; margin: 0; color: #91483c; font-size: 10px; line-height: 1.5; }
 .settings-inline { gap: 8px; }
 .model-list { display: grid; max-width: 620px; border-top: 1px solid var(--line); }

@@ -609,6 +609,60 @@ fn credential_status(state: State<'_, RuntimeState>) -> Result<CloudCredentialSt
 }
 
 #[tauri::command]
+async fn probe_qwen_cloud(
+    state: State<'_, RuntimeState>,
+    include_translation: bool,
+) -> Result<Value, String> {
+    let phase = state.snapshot()?.phase;
+    if !matches!(phase, SessionPhase::Idle | SessionPhase::Completed) {
+        return Err("Stop the current session before testing cloud credentials".into());
+    }
+    let status = state.credentials.status()?;
+    if !status.api_key_available || !status.workspace_id_available {
+        return Err("Save both the DashScope API key and workspace ID first".into());
+    }
+
+    state.supervisor.shutdown().await;
+    state
+        .supervisor
+        .configure_secret_environment(state.credentials.sidecar_environment()?)
+        .await;
+    state
+        .supervisor
+        .ensure_started()
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut events = state.supervisor.subscribe();
+    let request_id = uuid::Uuid::new_v4();
+    state
+        .supervisor
+        .send_command(SidecarCommand::ProbeCloud {
+            request_id,
+            include_translation,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(20), async move {
+        loop {
+            match events.recv().await.map_err(|error| error.to_string())? {
+                SidecarEvent::CloudProbeResult {
+                    request_id: response_id,
+                    result,
+                } if response_id == request_id => return Ok(result),
+                SidecarEvent::Error { message, .. } => return Err(message),
+                _ => {}
+            }
+        }
+    })
+    .await;
+    // A probe sidecar was launched with credentials only. Stop it so the next
+    // real session starts with its complete model/runtime capability environment.
+    state.supervisor.shutdown().await;
+    response.map_err(|_| "Qwen Cloud validation timed out".to_string())?
+}
+
+#[tauri::command]
 async fn set_cloud_credentials(
     state: State<'_, RuntimeState>,
     input: CloudCredentialInput,
@@ -1047,6 +1101,7 @@ fn forward_sidecar_events(app: AppHandle) {
                 SidecarEvent::Ready { route, .. } => (UiEventKind::RouteDecision, route),
                 SidecarEvent::HelloAccepted { .. }
                 | SidecarEvent::RoutePlan { .. }
+                | SidecarEvent::CloudProbeResult { .. }
                 | SidecarEvent::SessionFinished { .. } => continue,
             };
             let active_session_id = state
@@ -1821,6 +1876,7 @@ pub fn run() {
             request_audio_permission,
             test_audio_input,
             credential_status,
+            probe_qwen_cloud,
             set_cloud_credentials,
             clear_cloud_credentials,
             list_models,

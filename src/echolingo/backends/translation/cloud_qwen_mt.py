@@ -117,10 +117,18 @@ class CloudQwenMtBackend:
             payload["stream_options"] = {"include_usage": True}
         return payload
 
-    @staticmethod
-    def _raise_status(response: httpx.Response) -> None:
-        if response.status_code in {401, 403}:
-            raise AuthenticationError("Cloud Qwen-MT authentication failed")
+    def _raise_status(self, response: httpx.Response) -> None:
+        region_name = "Singapore" if self.region == "singapore" else "Beijing"
+        if response.status_code == 401:
+            raise AuthenticationError(
+                "Qwen-MT rejected the API key (HTTP 401). Verify that the key is active "
+                f"in the {region_name} Model Studio region."
+            )
+        if response.status_code == 403:
+            raise AuthenticationError(
+                "Qwen-MT access was denied (HTTP 403). Verify that the API key and "
+                f"workspace ID belong to the same {region_name} workspace."
+            )
         if response.status_code == 429:
             raise RateLimitError("Cloud Qwen-MT rate limit exceeded")
         response.raise_for_status()

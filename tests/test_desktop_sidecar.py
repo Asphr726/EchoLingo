@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import struct
 
 import numpy as np
@@ -197,3 +198,33 @@ async def test_sidecar_websocket_requires_versioned_authenticated_hello() -> Non
     assert '"type": "hello_accepted"' in websocket.sent[-1]
     await connection._command({"type": "shutdown"})
     assert websocket.closed
+
+
+async def test_sidecar_cloud_probe_is_available_without_a_session(monkeypatch) -> None:
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        async def send(self, value: str) -> None:
+            self.sent.append(value)
+
+    async def probe(include_translation: bool):
+        assert include_translation is True
+        return {"ok": True, "audio_uploaded": False}
+
+    monkeypatch.setattr("echolingo.service.server.probe_qwen_cloud", probe)
+    websocket = FakeWebSocket()
+    connection = SidecarConnection(websocket, "secret")
+    connection.authenticated = True
+
+    await connection._command(
+        {
+            "type": "probe_cloud",
+            "payload": {"request_id": "probe-1", "include_translation": True},
+        }
+    )
+
+    event = json.loads(websocket.sent[-1])
+    assert event["type"] == "cloud_probe_result"
+    assert event["payload"]["request_id"] == "probe-1"
+    assert event["payload"]["result"]["audio_uploaded"] is False
