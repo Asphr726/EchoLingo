@@ -76,6 +76,7 @@ class WlkEventMapper:
         self._partial = ""
         self._revision = 0
         self._speech_onset_ns: int | None = None
+        self._reported_first_token_latency = False
         self._audio_origin_ns: int | None = None
         self._clock_ns = clock_ns
 
@@ -145,8 +146,12 @@ class WlkEventMapper:
                 event.committed_text = self._committed_text
                 event.unstable_text = partial
                 event.stability = 0.0
-                if self._speech_onset_ns is not None:
+                if (
+                    self._speech_onset_ns is not None
+                    and not self._reported_first_token_latency
+                ):
                     event.first_token_latency_ms = (now - self._speech_onset_ns) / 1_000_000.0
+                    self._reported_first_token_latency = True
                 events.append(event)
         return events
 

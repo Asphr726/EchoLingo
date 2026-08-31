@@ -43,6 +43,23 @@ def test_wlk_full_state_maps_partial_revisions_and_new_stable_lines() -> None:
     assert repeated == []
 
 
+def test_wlk_reports_first_token_latency_only_once() -> None:
+    now_ns = 1_000_000_000
+    mapper = WlkEventMapper(
+        "session", "en", "qwen", "bounded_recompute", clock_ns=lambda: now_ns
+    )
+    mapper.note_speech_onset(500_000_000)
+
+    first = mapper.map_message({"lines": [], "buffer_transcription": "hello"}, 500)
+    assert first[0].first_token_latency_ms == 500
+
+    now_ns = 2_000_000_000
+    second = mapper.map_message(
+        {"lines": [], "buffer_transcription": "hello world"}, 1_500
+    )
+    assert second[0].first_token_latency_ms is None
+
+
 def test_wlk_assigns_unique_revisions_to_multiple_stable_lines() -> None:
     mapper = WlkEventMapper("session", "en", "qwen", "streaming")
     events = mapper.map_message(

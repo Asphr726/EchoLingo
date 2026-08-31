@@ -17,7 +17,7 @@ use inference_ipc::{
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use runtime_manager::{
     LocalRuntimeLayout, LocalRuntimeManager, ModelManager, ModelProgress, ModelStatus,
-    RuntimeCommand,
+    QwenStreamingProfile, RuntimeCommand,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -436,6 +436,7 @@ fn local_runtime_layout(
         } else {
             "auto".into()
         },
+        qwen_streaming: QwenStreamingProfile::from_environment(),
         local_api_key: format!(
             "{}{}",
             uuid::Uuid::new_v4().simple(),

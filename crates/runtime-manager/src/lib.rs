@@ -113,6 +113,65 @@ pub struct RuntimeCommand {
     pub environment: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct QwenStreamingProfile {
+    pub chunk_seconds: f32,
+    pub stable_iterations: u8,
+    pub hold_back_words: u16,
+    pub left_context_seconds: f32,
+    pub right_context_ms: u32,
+    pub segment_max_steps: u32,
+}
+
+impl Default for QwenStreamingProfile {
+    fn default() -> Self {
+        Self {
+            chunk_seconds: 1.0,
+            stable_iterations: 1,
+            hold_back_words: 4,
+            left_context_seconds: 12.0,
+            right_context_ms: 640,
+            segment_max_steps: 200,
+        }
+    }
+}
+
+impl QwenStreamingProfile {
+    pub fn from_environment() -> Self {
+        let mut value = Self::default();
+        value.chunk_seconds = environment_number(
+            "ECHOLINGO_QWEN_STREAMING_CHUNK_SEC",
+            value.chunk_seconds,
+            0.5,
+            4.0,
+        );
+        value.stable_iterations = environment_number(
+            "ECHOLINGO_QWEN_STREAMING_STABLE_ITERATIONS",
+            value.stable_iterations,
+            1,
+            4,
+        );
+        value.hold_back_words = environment_number(
+            "ECHOLINGO_QWEN_STREAMING_HOLD_BACK_WORDS",
+            value.hold_back_words,
+            0,
+            20,
+        );
+        value
+    }
+}
+
+fn environment_number<T>(name: &str, default: T, minimum: T, maximum: T) -> T
+where
+    T: std::str::FromStr + PartialOrd + Copy,
+{
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse::<T>().ok())
+        .filter(|candidate| *candidate >= minimum && *candidate <= maximum)
+        .unwrap_or(default)
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalRuntimeLayout {
     pub qwen_command: RuntimeCommand,
@@ -120,6 +179,7 @@ pub struct LocalRuntimeLayout {
     pub model_root: PathBuf,
     pub log_root: PathBuf,
     pub qwen_device: String,
+    pub qwen_streaming: QwenStreamingProfile,
     pub local_api_key: String,
     pub qwen_port: u16,
     pub hymt_port: u16,
@@ -255,6 +315,18 @@ impl LocalRuntimeManager {
                     "".into(),
                     "--qwen3-streaming-device".into(),
                     self.layout.qwen_device.clone(),
+                    "--qwen3-streaming-chunk-sec".into(),
+                    self.layout.qwen_streaming.chunk_seconds.to_string(),
+                    "--qwen3-streaming-stable-iterations".into(),
+                    self.layout.qwen_streaming.stable_iterations.to_string(),
+                    "--qwen3-streaming-hold-back-words".into(),
+                    self.layout.qwen_streaming.hold_back_words.to_string(),
+                    "--qwen3-streaming-left-context-sec".into(),
+                    self.layout.qwen_streaming.left_context_seconds.to_string(),
+                    "--qwen3-streaming-right-context-ms".into(),
+                    self.layout.qwen_streaming.right_context_ms.to_string(),
+                    "--qwen3-streaming-segment-max-steps".into(),
+                    self.layout.qwen_streaming.segment_max_steps.to_string(),
                     "--log-level".into(),
                     "INFO".into(),
                 ]);
@@ -847,6 +919,7 @@ mod tests {
             model_root: root.join("models"),
             log_root: root.join("logs"),
             qwen_device: "mps".into(),
+            qwen_streaming: QwenStreamingProfile::default(),
             local_api_key: "test-local-token".into(),
             qwen_port: 38_123,
             hymt_port: 38_124,
@@ -916,6 +989,18 @@ mod tests {
             .args
             .windows(2)
             .any(|pair| pair[0] == "--lan" && pair[1] == "en"));
+        assert!(command
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "--qwen3-streaming-chunk-sec" && pair[1] == "1"));
+        assert!(command
+            .args
+            .windows(2)
+            .any(|pair| { pair[0] == "--qwen3-streaming-stable-iterations" && pair[1] == "1" }));
+        assert!(command
+            .args
+            .windows(2)
+            .any(|pair| { pair[0] == "--qwen3-streaming-hold-back-words" && pair[1] == "4" }));
         assert!(command
             .args
             .windows(2)
