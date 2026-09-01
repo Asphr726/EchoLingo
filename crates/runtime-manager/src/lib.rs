@@ -360,8 +360,6 @@ impl LocalRuntimeManager {
                     "1".into(),
                     "--n-gpu-layers".into(),
                     "99".into(),
-                    "--api-key".into(),
-                    self.layout.local_api_key.clone(),
                 ];
                 let executable = if let Some(wrapper) = &self.layout.worker_wrapper {
                     args.insert(0, executable.to_string_lossy().into_owned());
@@ -373,7 +371,10 @@ impl LocalRuntimeManager {
                 Ok(RuntimeCommand {
                     executable,
                     args,
-                    environment: HashMap::new(),
+                    environment: HashMap::from([(
+                        "LLAMA_API_KEY".into(),
+                        self.layout.local_api_key.clone(),
+                    )]),
                 })
             }
             other => Err(LocalRuntimeError::UnknownService(other.into())),
@@ -1042,6 +1043,11 @@ mod tests {
         assert_eq!(command.executable, wrapper);
         assert_eq!(command.args[0], "watch-process");
         assert_eq!(command.args[1], llama.to_string_lossy());
+        assert!(!command.args.iter().any(|argument| argument == "--api-key"));
+        assert_eq!(
+            command.environment.get("LLAMA_API_KEY").map(String::as_str),
+            Some("test-local-token")
+        );
     }
 
     #[test]
