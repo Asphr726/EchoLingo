@@ -393,6 +393,7 @@ fn local_runtime_layout(
         .ok()
         .and_then(|path| path.parent().map(|parent| parent.join("echolingo-sidecar")))
         .filter(|path| path.is_file());
+    let worker_wrapper = bundled_sidecar.clone();
     let qwen_command = if let Some(executable) =
         std::env::var_os("ECHOLINGO_QWEN_ASR_COMMAND").map(PathBuf::from)
     {
@@ -429,6 +430,7 @@ fn local_runtime_layout(
     LocalRuntimeLayout {
         qwen_command,
         llama_server,
+        worker_wrapper,
         model_root,
         log_root: app_data_directory.join("logs"),
         qwen_device: if cfg!(all(target_os = "macos", target_arch = "aarch64")) {

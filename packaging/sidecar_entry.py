@@ -41,6 +41,11 @@ def _install_qwen_import_shims() -> None:
 
 
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "watch-process":
+        from echolingo.service.process_watchdog import run_child_until_parent_exit
+
+        return run_child_until_parent_exit(sys.argv[2:])
+
     from echolingo.service.parent_watchdog import start_parent_watchdog_from_environment
 
     start_parent_watchdog_from_environment()

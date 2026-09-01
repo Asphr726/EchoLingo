@@ -176,6 +176,7 @@ where
 pub struct LocalRuntimeLayout {
     pub qwen_command: RuntimeCommand,
     pub llama_server: Option<PathBuf>,
+    pub worker_wrapper: Option<PathBuf>,
     pub model_root: PathBuf,
     pub log_root: PathBuf,
     pub qwen_device: String,
@@ -344,26 +345,34 @@ impl LocalRuntimeManager {
                 if !model.is_file() {
                     return Err(LocalRuntimeError::ModelUnavailable("hymt2-1.8b".into()));
                 }
+                let mut args = vec![
+                    "--model".into(),
+                    model.to_string_lossy().into_owned(),
+                    "--host".into(),
+                    "127.0.0.1".into(),
+                    "--port".into(),
+                    self.layout.hymt_port.to_string(),
+                    "--alias".into(),
+                    "tencent/Hy-MT2-1.8B".into(),
+                    "--ctx-size".into(),
+                    "4096".into(),
+                    "--parallel".into(),
+                    "1".into(),
+                    "--n-gpu-layers".into(),
+                    "99".into(),
+                    "--api-key".into(),
+                    self.layout.local_api_key.clone(),
+                ];
+                let executable = if let Some(wrapper) = &self.layout.worker_wrapper {
+                    args.insert(0, executable.to_string_lossy().into_owned());
+                    args.insert(0, "watch-process".into());
+                    wrapper.clone()
+                } else {
+                    executable
+                };
                 Ok(RuntimeCommand {
                     executable,
-                    args: vec![
-                        "--model".into(),
-                        model.to_string_lossy().into_owned(),
-                        "--host".into(),
-                        "127.0.0.1".into(),
-                        "--port".into(),
-                        self.layout.hymt_port.to_string(),
-                        "--alias".into(),
-                        "tencent/Hy-MT2-1.8B".into(),
-                        "--ctx-size".into(),
-                        "4096".into(),
-                        "--parallel".into(),
-                        "1".into(),
-                        "--n-gpu-layers".into(),
-                        "99".into(),
-                        "--api-key".into(),
-                        self.layout.local_api_key.clone(),
-                    ],
+                    args,
                     environment: HashMap::new(),
                 })
             }
@@ -921,6 +930,7 @@ mod tests {
             log_root: root.join("logs"),
             qwen_device: "mps".into(),
             qwen_streaming: QwenStreamingProfile::default(),
+            worker_wrapper: None,
             local_api_key: "test-local-token".into(),
             qwen_port: 38_123,
             hymt_port: 38_124,
@@ -1007,6 +1017,31 @@ mod tests {
             .windows(2)
             .any(|pair| pair[0] == "--port" && pair[1] == "38123"));
         assert!(!command.args.iter().any(|argument| argument == "--language"));
+    }
+
+    #[test]
+    fn packaged_hymt_runs_inside_the_owner_watchdog_wrapper() {
+        let directory = tempfile::tempdir().unwrap();
+        let wrapper = directory.path().join("echolingo-sidecar");
+        let llama = directory.path().join("llama-server");
+        std::fs::write(&wrapper, b"wrapper").unwrap();
+        std::fs::write(&llama, b"llama").unwrap();
+        let model = directory
+            .path()
+            .join("models/hymt2-1.8b/Hy-MT2-1.8B-Q4_K_M.gguf");
+        std::fs::create_dir_all(model.parent().unwrap()).unwrap();
+        std::fs::write(&model, b"model").unwrap();
+        let mut layout = runtime_layout(directory.path(), wrapper.clone());
+        layout.llama_server = Some(llama.clone());
+        layout.worker_wrapper = Some(wrapper.clone());
+
+        let command = LocalRuntimeManager::new(layout)
+            .command_for("hymt")
+            .unwrap();
+
+        assert_eq!(command.executable, wrapper);
+        assert_eq!(command.args[0], "watch-process");
+        assert_eq!(command.args[1], llama.to_string_lossy());
     }
 
     #[test]
