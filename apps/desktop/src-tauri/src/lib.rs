@@ -416,7 +416,9 @@ fn local_runtime_layout(
                 "--no-capture-output".into(),
                 "-n".into(),
                 "echolingo-spike1".into(),
-                "whisperlivekit-server".into(),
+                "python".into(),
+                "-m".into(),
+                "echolingo.service.qwen_server".into(),
             ],
             environment: HashMap::new(),
         }

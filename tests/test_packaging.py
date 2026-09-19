@@ -22,7 +22,11 @@ def test_macos_entitlements_allow_frozen_sidecar_native_libraries() -> None:
 def test_packaged_entrypoint_exposes_qwen_runtime_mode() -> None:
     source = (ROOT / "packaging/sidecar_entry.py").read_text()
     assert 'sys.argv[1] == "qwen-asr-server"' in source
-    assert "whisperlivekit.basic_server" in source
+    # Both the packaged and the Conda launch path go through the same module so
+    # the decode policy and warmup cannot drift between layouts.
+    assert "echolingo.service.qwen_server" in source
+    server = (ROOT / "src/echolingo/service/qwen_server.py").read_text()
+    assert "whisperlivekit.basic_server" in server
 
 
 def test_sidecar_build_preserves_nagisa_legacy_import_path() -> None:

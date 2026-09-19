@@ -50,12 +50,10 @@ def main() -> int:
 
     start_parent_watchdog_from_environment()
     if len(sys.argv) > 1 and sys.argv[1] == "qwen-asr-server":
-        del sys.argv[1]
         _install_qwen_import_shims()
-        from whisperlivekit.basic_server import main as qwen_server_main
+        from echolingo.service.qwen_server import main as qwen_server_main
 
-        result = qwen_server_main()
-        return int(result or 0)
+        return qwen_server_main(sys.argv[2:])
 
     from echolingo.service.server import main as sidecar_main
 
