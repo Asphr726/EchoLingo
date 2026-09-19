@@ -48,6 +48,7 @@ class FarFieldPipeline:
         self.sink = sink
         self.resampler = StreamingResampler(input_rate_hz, 16_000)
         self.noise_floor = NoiseFloorTracker()
+        self._last_enhanced_rms = -120.0
         self.captured_audio_ms = 0.0
         self.asr_audio_ms = 0.0
         self._previous_speech = False
@@ -68,8 +69,15 @@ class FarFieldPipeline:
         speech = self.policy.observe(vad_probability, frame.duration_ms)
 
         input_rms = rms_dbfs(frame.samples)
-        enhanced_rms = rms_dbfs(enhanced)
-        noise_floor = self.noise_floor.update(enhanced_rms, vad_probability)
+        if enhanced.size:
+            # The WebRTC frontend re-blocks native frames into 10 ms units, so a
+            # short frame can legitimately produce no output yet.
+            enhanced_rms = rms_dbfs(enhanced)
+            noise_floor = self.noise_floor.update(enhanced_rms, vad_probability)
+            self._last_enhanced_rms = enhanced_rms
+        else:
+            enhanced_rms = self._last_enhanced_rms
+            noise_floor = self.noise_floor.value_dbfs
         self.captured_audio_ms += frame.duration_ms
         self.asr_audio_ms += asr_samples.size * 1000.0 / 16_000
         lag = getattr(self.asr, "lag_ms", None)
@@ -105,6 +113,16 @@ class FarFieldPipeline:
         )
         self._previous_speech = speech
         return ProcessedFrame(frame, enhanced, asr_samples, metrics)
+
+    def _flush_frontend_tail(self) -> np.ndarray:
+        """Drain the frontend's sub-block remainder and the resampler tail."""
+        flush = getattr(self.processor, "flush", None)
+        remainder = flush() if flush is not None else np.empty((0,), dtype=np.float32)
+        tail = self.resampler.process(
+            downmix(remainder) if remainder.size else np.empty((0,), dtype=np.float32),
+            end_of_input=True,
+        )
+        return tail
 
     async def _consume_events(self) -> None:
         try:
@@ -162,7 +180,7 @@ class FarFieldPipeline:
                 )
                 if duration_limit_s is not None and self.captured_audio_ms >= duration_limit_s * 1000:
                     break
-            tail = self.resampler.process(np.empty((0,), dtype=np.float32), end_of_input=True)
+            tail = self._flush_frontend_tail()
             if tail.size:
                 self.asr_audio_ms += tail.size * 1000.0 / 16_000
                 await self.asr.push_audio(
@@ -260,9 +278,7 @@ class StreamingPipelineSession:
     async def finish(self) -> None:
         if not self._started or self._finished:
             return
-        tail = self.pipeline.resampler.process(
-            np.empty((0,), dtype=np.float32), end_of_input=True
-        )
+        tail = self.pipeline._flush_frontend_tail()
         if tail.size:
             self.pipeline.asr_audio_ms += tail.size * 1000.0 / 16_000
             await self.pipeline.asr.push_audio(

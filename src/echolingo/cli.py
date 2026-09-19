@@ -129,7 +129,9 @@ def _route(config):
 async def _run_source(source, args) -> Path:
     config = _resolve_config(args)
     _, route = _route(config)
-    processor = make_processor(config.frontend.profile, source.sample_rate_hz, source.channels)
+    processor = make_processor(
+        config.frontend.profile, source.sample_rate_hz, source.channels, config.frontend
+    )
     model_path = args.silero_model if args.silero_model.exists() else None
     vad = make_vad(config.vad.backend, model_path)
     policy = LectureSpeechPolicy(

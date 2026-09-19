@@ -196,7 +196,9 @@ class DesktopInferenceSession:
         if input_rate_hz not in {16_000, 32_000, 48_000}:
             frontend_rate_hz = 48_000
             input_rate_adapter = InputRateAdapter(input_rate_hz, channels)
-        processor = make_processor(config.frontend.profile, frontend_rate_hz, channels)
+        processor = make_processor(
+            config.frontend.profile, frontend_rate_hz, channels, config.frontend
+        )
         silero_path = runtime_resource_path("models/silero_vad.onnx")
         vad = make_vad(config.vad.backend, silero_path if silero_path.exists() else None)
         speech_policy = LectureSpeechPolicy(
