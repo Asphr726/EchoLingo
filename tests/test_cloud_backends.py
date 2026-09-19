@@ -257,9 +257,134 @@ async def test_cloud_backends_refuse_upload_without_explicit_consent() -> None:
     await mt.close()
 
 
-def test_local_hymt_prompt_contains_context_domain_and_terms() -> None:
+def test_local_hymt_uses_official_templates_with_source_only_background() -> None:
     backend = LocalHyMtBackend()
     prompt = backend.build_prompt(translation_request())
-    assert "lecture transcription" in prompt
-    assert "EchoLingo => 回声语" in prompt
-    assert "previous => 之前" in prompt
+    assert prompt.startswith("参考下面的翻译：\nEchoLingo 翻译成 回声语")
+    assert "【背景信息】\nprevious\n" in prompt
+    assert "将以下文本翻译为 中文，注意只需要输出翻译后的结果，不要额外解释" in prompt
+    assert prompt.endswith("【待翻译文本】\nhello world")
+    # Target-language text from earlier segments is never placed in the prompt:
+    # the 1.8B model copies it back as the "translation".
+    assert "之前" not in prompt
+    assert "=>" not in prompt
+
+    plain = translation_request()
+    plain.context = ()
+    plain.terms = ()
+    assert backend.build_prompt(plain) == (
+        "将以下文本翻译为 中文，注意只需要输出翻译后的结果，不要额外解释：\n\nhello world"
+    )
+
+    english = translation_request()
+    english.context = ()
+    english.terms = ()
+    english.target_lang = "ja"
+    assert backend.build_prompt(english) == (
+        "Translate the following text into Japanese. Note that you should only output "
+        "the translated result without any additional explanation:\n\nhello world"
+    )
+
+    payload = backend._payload(plain, True)
+    assert payload["messages"][0]["role"] == "user" and len(payload["messages"]) == 1
+    assert payload["max_tokens"] == max(24, 2 * len("hello world") + 16)
+    assert payload["temperature"] == 0.1 and payload["top_p"] == 0.6 and payload["top_k"] == 20
+    assert payload["repeat_penalty"] == 1.05 and payload["cache_prompt"] is True
+    assert payload["stream_options"] == {"include_usage": True}
+    long_commit = translation_request()
+    long_commit.source_text = "x" * 500
+    long_commit.source_committed = True
+    assert backend._payload(long_commit, True)["max_tokens"] == 400
+    long_partial = translation_request()
+    long_partial.source_text = "x" * 500
+    assert backend._payload(long_partial, True)["max_tokens"] == 320
+
+
+def _sse(*chunks: str, finish: str | None = "stop") -> str:
+    lines = [
+        json.dumps({"choices": [{"delta": {"content": chunk}, "finish_reason": None}]})
+        for chunk in chunks
+    ]
+    lines.append(json.dumps({"choices": [{"delta": {}, "finish_reason": finish}], "usage": {"prompt_tokens": 40, "completion_tokens": len(chunks)}}))
+    return "".join(f"data: {line}\n\n" for line in lines) + "data: [DONE]\n\n"
+
+
+async def test_local_hymt_streams_and_truncates_runaway_repetition() -> None:
+    seen = {"lines_consumed": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = _sse("能够实现。", *(["红色，蓝色，绿色，"] * 30), finish="length")
+        return httpx.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"})
+
+    backend = LocalHyMtBackend(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    request = translation_request()
+    request.source_text = "It just goes possible. Red, blue, green."
+    request.source_committed = True
+    events = [event async for event in backend.translate_incremental(request)]
+    await backend.close()
+    final = events[-1]
+    assert final.kind == TranslationKind.FINAL and final.truncated
+    assert final.finish_reason == "repetition"
+    assert final.text.count("红色") <= 2
+    assert final.source_committed is True
+    assert events[0].first_delta_latency_ms is not None
+    assert len(events) < 30
+
+
+async def test_local_hymt_strips_instruction_echo_and_reports_usage() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["max_tokens"] >= 24
+        body = _sse("好的，这是翻译结果：", "你好", "，世界。")
+        return httpx.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"})
+
+    backend = LocalHyMtBackend(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    events = [event async for event in backend.translate_incremental(translation_request())]
+    await backend.close()
+    assert events[-1].text == "你好，世界。"
+    assert events[-1].finish_reason == "stop" and not events[-1].truncated
+    assert events[-1].prompt_tokens == 40 and events[-1].completion_tokens == 3
+
+
+async def test_local_hymt_maps_http_400_to_retryable_error() -> None:
+    from echolingo.translation.policy import TranslationRequestError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": {"message": "request (4124 tokens) exceeds the available context size"}})
+
+    backend = LocalHyMtBackend(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    with pytest.raises(TranslationRequestError) as error:
+        [event async for event in backend.translate_incremental(translation_request())]
+    await backend.close()
+    assert error.value.error_code == "context_overflow"
+    assert error.value.retry_without_context is True
+
+
+async def test_local_hymt_times_out_with_a_truncated_final() -> None:
+    async def slow_stream():
+        yield 'data: {"choices":[{"delta":{"content":"你"},"finish_reason":null}]}\n\n'.encode()
+        await asyncio.sleep(1.0)
+        yield b"data: [DONE]\n\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=_AsyncByteStream(slow_stream()), headers={"content-type": "text/event-stream"})
+
+    backend = LocalHyMtBackend(
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)), partial_timeout_s=0.1
+    )
+    events = [event async for event in backend.translate_incremental(translation_request())]
+    await backend.close()
+    assert events[-1].finish_reason == "timeout" and events[-1].truncated
+    assert events[-1].text == "你"
+
+
+class _AsyncByteStream(httpx.AsyncByteStream):
+    def __init__(self, generator) -> None:
+        self._generator = generator
+
+    async def __aiter__(self):
+        async for chunk in self._generator:
+            yield chunk
+
+    async def aclose(self) -> None:
+        await self._generator.aclose()

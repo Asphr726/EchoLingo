@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -269,6 +270,12 @@ class StreamingTranslationCoordinator:
 
     async def start(self) -> None:
         await self.backend.set_glossary(self.glossary)
+        probe = getattr(self.backend, "describe_runtime", None)
+        if probe is not None:
+            try:
+                await asyncio.wait_for(probe(), timeout=3.0)
+            except Exception as error:  # pragma: no cover - diagnostics only
+                logger.info("translation runtime probe skipped: %s", error)
 
     def decide(
         self, event: CanonicalTranscriptEvent, *, now_ns: int | None = None

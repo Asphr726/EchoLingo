@@ -378,6 +378,12 @@ impl LocalRuntimeManager {
                     "1".into(),
                     "--n-gpu-layers".into(),
                     "99".into(),
+                    // The GGUF carries the Hy-MT chat template; apply it explicitly
+                    // and cap generation server-side so a runaway request can never
+                    // fill the context again.
+                    "--jinja".into(),
+                    "--n-predict".into(),
+                    "400".into(),
                 ];
                 let executable = if let Some(wrapper) = &self.layout.worker_wrapper {
                     args.insert(0, executable.to_string_lossy().into_owned());
@@ -1062,6 +1068,11 @@ mod tests {
         assert_eq!(command.args[0], "watch-process");
         assert_eq!(command.args[1], llama.to_string_lossy());
         assert!(!command.args.iter().any(|argument| argument == "--api-key"));
+        assert!(command.args.iter().any(|argument| argument == "--jinja"));
+        assert!(command
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "--n-predict" && pair[1] == "400"));
         assert_eq!(
             command.environment.get("LLAMA_API_KEY").map(String::as_str),
             Some("test-local-token")
