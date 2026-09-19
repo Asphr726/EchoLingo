@@ -90,11 +90,15 @@ async def test_cloud_qwen_asr_maps_provider_events_and_uses_lecture_vad() -> Non
     await backend.close()
 
     assert [event.kind for event in events] == [
-        TranscriptKind.STABLE,
         TranscriptKind.PARTIAL,
+        TranscriptKind.STABLE,
         TranscriptKind.FINAL,
     ]
+    assert events[0].stable_text == "hello" and events[0].unstable_text == "world"
+    assert events[0].text == "hello world"
+    assert events[1].text == "hello world"
     assert events[-1].text == "hello world"
+    assert events[-1].committed_text == "hello world"
     assert events[0].first_token_latency_ms is not None
     assert "ap-southeast-1" in captured["url"]
     session = websocket.sent[0]["session"]

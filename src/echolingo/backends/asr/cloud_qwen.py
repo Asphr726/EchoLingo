@@ -22,6 +22,7 @@ from ...models import (
     TranscriptKind,
 )
 from ...networking import AudioRingBuffer, RetryPolicy
+from ...streaming import SentenceUnitSegmenter, join_text
 from ._queue import AsrEventQueue
 from .reconcile import TranscriptReconciler
 
@@ -88,6 +89,9 @@ class CloudQwenAsrBackend:
         self._reconciler = TranscriptReconciler()
         self._provider_confirmed = ""
         self._provider_stash = ""
+        self._segmenter: SentenceUnitSegmenter | None = None
+        self._closed_text = ""
+        self._last_unit_end_ms = 0.0
         self._revision = 0
         self._epoch = 0
         self._last_speech_end_ms = 0.0
@@ -207,6 +211,7 @@ class CloudQwenAsrBackend:
                 "DASHSCOPE_API_KEY and DASHSCOPE_WORKSPACE_ID are required"
             )
         self.config = config
+        self._segmenter = SentenceUnitSegmenter(config.language)
         self._session_started_ns = time.monotonic_ns()
         await self._connect()
         self._receiver = asyncio.create_task(self._receive_loop())
@@ -347,52 +352,80 @@ class CloudQwenAsrBackend:
             confirmed = str(payload.get("text") or "").strip()
             stash = str(payload.get("stash") or "").strip()
             if confirmed != self._provider_confirmed:
-                self._revision += 1
                 self._provider_confirmed = confirmed
-                committed, changed = self._reconciler.merge_confirmed(confirmed)
-                if changed:
-                    await self._events.put(
-                        self._canonical(
-                            TranscriptKind.STABLE,
-                            committed,
-                            message,
-                            committed=committed,
-                            unstable=stash,
-                        )
-                    )
+                await self._commit_confirmed(confirmed, message)
             if stash != self._provider_stash:
-                self._revision += 1
                 self._provider_stash = stash
-                preview = self._reconciler.preview(confirmed, stash)
-                if stash:
-                    await self._events.put(
-                        self._canonical(
-                            TranscriptKind.PARTIAL,
-                            preview,
-                            message,
-                            committed=self._reconciler.committed,
-                            unstable=stash,
-                        )
-                    )
+                await self._emit_partial(stash, message)
             return
         if event_type == "conversation.item.input_audio_transcription.completed":
             self._note_delivery(message)
             payload = message.get("transcript") or message
             final_text = str(payload.get("text") or payload.get("transcript") or "").strip()
-            committed, _ = self._reconciler.merge_confirmed(final_text)
+            await self._commit_confirmed(final_text, message)
+            self._provider_stash = ""
+            if self._segmenter is not None:
+                await self._emit_units([self._segmenter.flush()], message)
             self._revision += 1
             await self._events.put(
                 self._canonical(
                     TranscriptKind.FINAL,
-                    committed,
+                    self._closed_text,
                     message,
-                    committed=committed,
+                    committed=self._closed_text,
                 )
             )
             if self._last_speech_end_ms:
                 self.ring.discard_before(
                     max(0.0, self._last_speech_end_ms - self.replay_overlap_ms)
                 )
+
+    async def _commit_confirmed(self, confirmed: str, message: dict) -> None:
+        """Merge provider-confirmed text and release any completed sentence units."""
+        previous = self._reconciler.committed
+        committed, changed = self._reconciler.merge_confirmed(confirmed)
+        if not changed or self._segmenter is None:
+            return
+        delta = committed[len(previous):] if committed.startswith(previous) else committed
+        units = self._segmenter.append(
+            delta, start_ms=self._last_unit_end_ms, end_ms=self.ring.latest_end_ms
+        )
+        await self._emit_units(units, message)
+
+    async def _emit_units(self, units, message: dict) -> None:
+        for unit in units:
+            if unit is None or not unit.text:
+                continue
+            self._closed_text = join_text(self.config.language, self._closed_text, unit.text)
+            self._revision += 1
+            event = self._canonical(
+                TranscriptKind.STABLE,
+                unit.text,
+                message,
+                committed=self._closed_text,
+                unstable=self._provider_stash,
+            )
+            event.start_ms = unit.start_ms
+            event.end_ms = unit.end_ms
+            if unit.end_ms is not None:
+                self._last_unit_end_ms = unit.end_ms
+            await self._events.put(event)
+
+    async def _emit_partial(self, stash: str, message: dict) -> None:
+        open_text = self._segmenter.open_text if self._segmenter is not None else ""
+        display = join_text(self.config.language, open_text, stash)
+        if not display:
+            return
+        self._revision += 1
+        event = self._canonical(
+            TranscriptKind.PARTIAL,
+            display,
+            message,
+            committed=self._closed_text,
+            unstable=stash,
+        )
+        event.stable_text = open_text
+        await self._events.put(event)
 
     async def _reconnect(self, cause: Exception) -> bool:
         self._connected.clear()

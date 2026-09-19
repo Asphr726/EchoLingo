@@ -171,6 +171,9 @@ class TranscriptEvent:
     schema_version: int = 2
     committed_text: str = ""
     unstable_text: str = ""
+    # Text the recognizer has committed but that has not yet closed into a
+    # sentence unit (only meaningful on PARTIAL events).
+    stable_text: str = ""
     start_ms: float | None = None
     end_ms: float | None = None
     words: list[WordTiming] = field(default_factory=list)

@@ -132,11 +132,11 @@ class LocalQwenAsrBackend:
             await asyncio.wait_for(self._finished.wait(), timeout=self.finish_timeout_s)
         except TimeoutError:
             pass
-        final = self._mapper.final_event(self._audio_cursor_ms)
-        final.locality = BackendLocality.LOCAL
-        final.provider = self.descriptor.provider
-        final.model = self.model
-        await self._events.put(final)
+        for event in self._mapper.flush_events(self._audio_cursor_ms):
+            event.locality = BackendLocality.LOCAL
+            event.provider = self.descriptor.provider
+            event.model = self.model
+            await self._events.put(event)
         await self._events.end()
 
     async def close(self) -> None:

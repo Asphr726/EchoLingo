@@ -157,6 +157,24 @@ impl QwenStreamingProfile {
             0,
             20,
         );
+        value.left_context_seconds = environment_number(
+            "ECHOLINGO_QWEN_STREAMING_LEFT_CONTEXT_SEC",
+            value.left_context_seconds,
+            4.0,
+            30.0,
+        );
+        value.right_context_ms = environment_number(
+            "ECHOLINGO_QWEN_STREAMING_RIGHT_CONTEXT_MS",
+            value.right_context_ms,
+            0,
+            2_000,
+        );
+        value.segment_max_steps = environment_number(
+            "ECHOLINGO_QWEN_STREAMING_SEGMENT_MAX_STEPS",
+            value.segment_max_steps,
+            50,
+            400,
+        );
         value
     }
 }
