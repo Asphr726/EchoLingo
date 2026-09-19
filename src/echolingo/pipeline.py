@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from dataclasses import dataclass
@@ -9,6 +10,9 @@ import numpy as np
 
 from .models import AsrAudioChunk, AsrSessionConfig, AudioFrame, AudioMetrics, ProcessedFrame
 from .resample import StreamingResampler, downmix
+from .translation.scheduler import TranslationScheduler
+
+logger = logging.getLogger(__name__)
 
 
 def rms_dbfs(samples: np.ndarray) -> float:
@@ -34,9 +38,6 @@ class NoiseFloorTracker:
         return self.value_dbfs
 
 
-_TRANSLATION_END = object()
-
-
 class FarFieldPipeline:
     def __init__(
         self, processor, vad, policy, asr, sink, input_rate_hz: int, translation=None
@@ -53,7 +54,11 @@ class FarFieldPipeline:
         self.asr_audio_ms = 0.0
         self._previous_speech = False
         self.translation = translation
-        self._translation_queue: asyncio.Queue[object] = asyncio.Queue()
+        self.translation_scheduler = (
+            TranslationScheduler(translation, sink.write_translation)
+            if translation is not None
+            else None
+        )
 
     def process_frame(
         self, frame: AudioFrame, queue_depth: int = 0, dropped_frames: int = 0
@@ -81,6 +86,9 @@ class FarFieldPipeline:
         self.captured_audio_ms += frame.duration_ms
         self.asr_audio_ms += asr_samples.size * 1000.0 / 16_000
         lag = getattr(self.asr, "lag_ms", None)
+        translation_metrics = (
+            self.translation_scheduler.snapshot() if self.translation_scheduler else None
+        )
         metrics = AudioMetrics(
             sequence=frame.sequence,
             captured_audio_ms=self.captured_audio_ms,
@@ -111,6 +119,15 @@ class FarFieldPipeline:
                 getattr(self.asr, "cloud_audio_uploaded_ms", 0.0)
             ),
         )
+        if translation_metrics is not None:
+            metrics.translation_queue_depth = translation_metrics.queue_depth
+            metrics.translation_backlog_ms = translation_metrics.backlog_ms
+            metrics.translation_inflight_ms = translation_metrics.inflight_ms
+            metrics.translation_latency_ms = translation_metrics.last_latency_ms
+            metrics.translation_first_delta_ms = translation_metrics.last_first_delta_ms
+            metrics.translation_dropped_partials = translation_metrics.dropped_partials
+            metrics.translation_cancelled_requests = translation_metrics.cancelled_requests
+            metrics.translation_errors = translation_metrics.errors
         self._previous_speech = speech
         return ProcessedFrame(frame, enhanced, asr_samples, metrics)
 
@@ -128,19 +145,29 @@ class FarFieldPipeline:
         try:
             async for event in self.asr.events():
                 self.sink.write_transcript(event)
-                if self.translation is not None:
-                    await self._translation_queue.put(event)
+                if self.translation_scheduler is not None:
+                    self.translation_scheduler.submit(event)
         finally:
-            if self.translation is not None:
-                await self._translation_queue.put(_TRANSLATION_END)
+            if self.translation_scheduler is not None:
+                self.translation_scheduler.end_of_input()
 
     async def _consume_translations(self) -> None:
-        while True:
-            event = await self._translation_queue.get()
-            if event is _TRANSLATION_END:
-                return
-            async for translated in self.translation.handle(event):
-                self.sink.write_translation(translated)
+        if self.translation_scheduler is not None:
+            await self.translation_scheduler.run()
+
+    async def _await_translation_consumer(self, task: asyncio.Task[None] | None) -> None:
+        """Drain the scheduler at Stop without letting a translation failure escape."""
+        if task is None:
+            return
+        budget = (self.translation_scheduler.drain_timeout_s if self.translation_scheduler else 0.0) + 2.0
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=budget)
+        except TimeoutError:
+            logger.warning("translation drain exceeded %.1f s; cancelling remaining work", budget)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        except Exception:
+            logger.exception("translation consumer ended with an error")
 
     async def run(self, source, duration_limit_s: float | None = None) -> None:
         consumer: asyncio.Task[None] | None = None
@@ -195,8 +222,7 @@ class FarFieldPipeline:
             await self.asr.finish_session()
             if consumer is not None:
                 await consumer
-            if translation_consumer is not None:
-                await translation_consumer
+            await self._await_translation_consumer(translation_consumer)
         finally:
             if consumer is not None and not consumer.done():
                 consumer.cancel()
@@ -293,8 +319,7 @@ class StreamingPipelineSession:
         await self.pipeline.asr.finish_session()
         if self._consumer is not None:
             await self._consumer
-        if self._translation_consumer is not None:
-            await self._translation_consumer
+        await self.pipeline._await_translation_consumer(self._translation_consumer)
         self._finished = True
         await self.close()
 

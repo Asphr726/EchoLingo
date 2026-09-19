@@ -101,6 +101,14 @@ class AudioMetrics:
     buffered_audio_ms: float = 0.0
     dropped_audio_ms: float = 0.0
     cloud_audio_uploaded_ms: float = 0.0
+    translation_queue_depth: int = 0
+    translation_backlog_ms: float = 0.0
+    translation_inflight_ms: float | None = None
+    translation_latency_ms: float | None = None
+    translation_first_delta_ms: float | None = None
+    translation_dropped_partials: int = 0
+    translation_cancelled_requests: int = 0
+    translation_errors: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -236,6 +244,12 @@ class TranslationRequest:
     editable_window_end: int | None = None
     latency_budget_ms: float = 800.0
     final: bool = False
+    # True when the source span is canonical stable text whose translation will
+    # be committed; False for a provisional retranslation of the unstable tail.
+    source_committed: bool = False
+    attempt: int = 1
+    # Wall-clock budget for one provider request; backends abort past it.
+    timeout_s: float | None = None
 
 
 @dataclass(slots=True)
@@ -258,6 +272,11 @@ class CanonicalTranslationEvent:
     completion_tokens: int | None = None
     error_code: str | None = None
     recoverable: bool | None = None
+    # Set by the coordinator: whether this event belongs to a committed source
+    # span (row translation) or to the provisional live tail.
+    source_committed: bool = False
+    truncated: bool = False
+    finish_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)

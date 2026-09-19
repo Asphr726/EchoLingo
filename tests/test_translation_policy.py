@@ -39,20 +39,31 @@ def transcript(
     )
 
 
-def test_adaptive_policy_waits_for_stable_prefix_and_never_rolls_back_source() -> None:
-    policy = AdaptiveRetranslationPolicy()
-    assert policy.observe(transcript(TranscriptKind.PARTIAL, "abcdefgh", 1, 0)) is None
-    assert policy.observe(transcript(TranscriptKind.PARTIAL, "abcdefghX", 2, 100)) is None
-    decision = policy.observe(transcript(TranscriptKind.PARTIAL, "abcdefghY", 3, 450))
-    assert decision is not None
-    assert decision.reason == "stable_prefix"
+def test_adaptive_policy_paces_partials_by_dequeue_clock_and_never_rolls_back() -> None:
+    policy = AdaptiveRetranslationPolicy(stable_prefix_ms=300, latency_budget_ms=800)
+    ms = 1_000_000
+    assert policy.observe(transcript(TranscriptKind.PARTIAL, "abcdefgh", 1, 0), now_ns=0) is None
+    # Re-observing the same text must not reset the stability timer.
+    assert policy.observe(transcript(TranscriptKind.PARTIAL, "abcdefgh", 1, 0), now_ns=100 * ms) is None
+    assert policy.retry_after_ms(now_ns=100 * ms) == 200.0
+    decision = policy.observe(transcript(TranscriptKind.PARTIAL, "abcdefgh", 2, 0), now_ns=320 * ms)
+    assert decision is not None and decision.reason == "stable_prefix"
+    assert not decision.source_committed and decision.source_text == "abcdefgh"
+    # Identical text after a request never produces another request.
+    assert policy.observe(transcript(TranscriptKind.PARTIAL, "abcdefgh", 3, 0), now_ns=900 * ms) is None
+    assert policy.retry_after_ms(now_ns=900 * ms) is None
+    # A tiny change waits for the latency budget measured from the last request.
+    assert policy.observe(transcript(TranscriptKind.PARTIAL, "abcdefghX", 4, 0), now_ns=1_000 * ms) is None
+    budget = policy.observe(transcript(TranscriptKind.PARTIAL, "abcdefghX", 4, 0), now_ns=1_150 * ms)
+    assert budget is not None and budget.reason == "latency_budget"
 
     stable = policy.observe(
-        transcript(TranscriptKind.STABLE, "hello world", 4, 500, committed="hello world")
+        transcript(TranscriptKind.STABLE, "hello world", 5, 0, committed="hello world"),
+        now_ns=1_200 * ms,
     )
-    assert stable is not None
+    assert stable is not None and stable.source_committed and stable.source_text == "hello world"
     rollback = policy.observe(
-        transcript(TranscriptKind.STABLE, "hello", 5, 600, committed="hello")
+        transcript(TranscriptKind.STABLE, "hello", 5, 0, committed="hello"), now_ns=1_300 * ms
     )
     assert rollback is None
     assert policy.committed_source == "hello world"
@@ -68,7 +79,7 @@ def test_semantic_boundary_and_final_always_trigger() -> None:
     assert final is not None and final.final
 
 
-def test_target_commit_requires_final_source_or_stable_repetition() -> None:
+def test_target_commit_only_follows_committed_source_spans() -> None:
     policy = TargetCommitPolicy(stable_ms=500)
     first = policy.observe(
         "译文", source_revision_id=1, source_committed=False, provider_final=True, now_ns=0
@@ -81,15 +92,22 @@ def test_target_commit_requires_final_source_or_stable_repetition() -> None:
         provider_final=True,
         now_ns=600_000_000,
     )
-    assert repeated.committed_now and repeated.committed_text == "译文"
-    final = policy.observe(
-        "下一句",
-        source_revision_id=2,
-        source_committed=True,
-        provider_final=True,
-        now_ns=700_000_000,
+    # Provisional text never commits, however long it stays identical.
+    assert not repeated.committed_now and repeated.committed_text == ""
+    policy.discard_provisional()
+    assert policy.editable_text == ""
+    streaming = policy.observe(
+        "下一", source_revision_id=2, source_committed=True, provider_final=False
     )
-    assert final.committed_text == "译文 下一句"
+    assert streaming.editable_text == "" and not streaming.committed_now
+    final = policy.observe(
+        "下一句", source_revision_id=2, source_committed=True, provider_final=True
+    )
+    assert final.committed_now and final.committed_text == "下一句"
+    stale = policy.commit("重复", source_revision_id=2)
+    assert not stale.committed_now and policy.committed_text == "下一句"
+    later = policy.commit("再一句", source_revision_id=3)
+    assert later.committed_text == "下一句 再一句"
 
 
 async def test_streaming_coordinator_commits_target_at_stable_source_boundary() -> None:
