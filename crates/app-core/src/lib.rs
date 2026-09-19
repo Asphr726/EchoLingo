@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -129,12 +130,22 @@ pub struct LiveMetrics {
     pub reconnect_count: u32,
     pub buffered_audio_ms: f32,
     pub dropped_audio_ms: f32,
+    pub translation_queue_depth: u32,
+    pub translation_backlog_ms: f32,
+    pub translation_first_delta_ms: Option<f32>,
+    pub translation_dropped_partials: u32,
+    pub translation_cancelled_requests: u32,
+    pub translation_errors: u32,
 }
 
+/// Three tiers of live text, mirroring the streaming policy: committed rows
+/// live in `previous_segments`; `open_text` is recognizer-committed text that
+/// has not closed into a row yet; `original_unstable` is the revisable tail.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct LiveTranscript {
     pub original_committed: String,
+    pub open_text: String,
     pub original_unstable: String,
     pub translation_committed: String,
     pub translation_editable: String,
@@ -151,6 +162,19 @@ pub struct SegmentSummary {
     pub end_ms: f64,
     pub original: String,
     pub translation: String,
+    /// pending | streaming | done | unavailable
+    #[serde(default = "default_translation_status")]
+    pub translation_status: String,
+}
+
+fn default_translation_status() -> String {
+    "pending".into()
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TranscriptProjection {
+    pub segment: Option<SegmentSummary>,
+    pub live_changed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -362,16 +386,187 @@ impl AppCore {
         ordinal: u32,
         translation: String,
     ) -> Option<SegmentSummary> {
+        self.update_segment_translation_status(ordinal, translation, "done")
+    }
+
+    pub fn update_segment_translation_status(
+        &mut self,
+        ordinal: u32,
+        translation: String,
+        status: &str,
+    ) -> Option<SegmentSummary> {
         if let Some(segment) = self
             .snapshot
             .previous_segments
             .iter_mut()
             .find(|segment| segment.ordinal == ordinal)
         {
-            segment.translation = translation;
+            if !translation.is_empty() || status == "unavailable" {
+                segment.translation = translation;
+            }
+            segment.translation_status = status.to_string();
             return Some(segment.clone());
         }
         None
+    }
+
+    /// Project a canonical transcript event onto live text and rows.
+    ///
+    /// * `partial` updates the open (recognizer-committed) and unstable tiers.
+    /// * `stable` closes a sentence unit into a row and clears the live tiers.
+    /// * `final` only carries text that never closed into a unit.
+    /// * `alignment_update` and `error` never touch live text; they belong to
+    ///   persistence and diagnostics respectively.
+    pub fn apply_transcript_event(&mut self, payload: &Value) -> TranscriptProjection {
+        let kind = payload["kind"].as_str().unwrap_or_default();
+        if kind == "alignment_update" || kind == "error" {
+            return TranscriptProjection::default();
+        }
+        let text = payload["text"].as_str().unwrap_or_default().to_string();
+        let committed = payload["committed_text"].as_str().unwrap_or_default().to_string();
+        let revision = payload["revision_id"].as_u64();
+        let mut live = self.snapshot.live.clone();
+        let mut segment = None;
+        if let Some(value) = payload["first_token_latency_ms"].as_f64() {
+            self.snapshot.metrics.asr_first_partial_latency_ms = Some(value as f32);
+        }
+        match kind {
+            "partial" => {
+                live.original_unstable = payload["unstable_text"]
+                    .as_str()
+                    .unwrap_or(&text)
+                    .to_string();
+                live.open_text = payload["stable_text"].as_str().unwrap_or_default().to_string();
+            }
+            "stable" => {
+                if !committed.is_empty() {
+                    live.original_committed = committed;
+                }
+                live.open_text.clear();
+                live.original_unstable.clear();
+                live.translation_editable.clear();
+                if let Some(value) = payload["commit_latency_ms"].as_f64() {
+                    self.snapshot.metrics.asr_commit_latency_ms = Some(value as f32);
+                }
+                if !text.trim().is_empty() {
+                    let ordinal = revision.unwrap_or(0) as u32;
+                    let end_ms = payload["end_ms"]
+                        .as_f64()
+                        .or_else(|| payload["audio_cursor_ms"].as_f64())
+                        .unwrap_or(0.0);
+                    let start_ms = payload["start_ms"]
+                        .as_f64()
+                        .unwrap_or((end_ms - 1_000.0).max(0.0));
+                    let summary = SegmentSummary {
+                        id: payload["event_id"]
+                            .as_str()
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or_else(Uuid::new_v4),
+                        ordinal,
+                        start_ms,
+                        end_ms: end_ms.max(start_ms),
+                        original: text,
+                        translation: String::new(),
+                        translation_status: "pending".into(),
+                    };
+                    self.commit_segment(summary.clone());
+                    segment = Some(summary);
+                }
+            }
+            _ => {
+                // final
+                if !committed.is_empty() {
+                    live.original_committed = committed.clone();
+                }
+                live.open_text.clear();
+                live.original_unstable.clear();
+                live.translation_editable.clear();
+                if self.snapshot.previous_segments.is_empty() {
+                    let original = if committed.is_empty() { text } else { committed };
+                    if !original.trim().is_empty() {
+                        let end_ms = payload["audio_cursor_ms"].as_f64().unwrap_or(0.0);
+                        let summary = SegmentSummary {
+                            id: payload["event_id"]
+                                .as_str()
+                                .and_then(|value| value.parse().ok())
+                                .unwrap_or_else(Uuid::new_v4),
+                            ordinal: revision.unwrap_or(0) as u32,
+                            start_ms: 0.0,
+                            end_ms,
+                            original,
+                            translation: String::new(),
+                            translation_status: "pending".into(),
+                        };
+                        self.commit_segment(summary.clone());
+                        segment = Some(summary);
+                    }
+                }
+            }
+        }
+        if let Some(revision) = revision {
+            live.source_revision_id = revision;
+        }
+        let live_changed = live != self.snapshot.live;
+        self.snapshot.live = live;
+        TranscriptProjection {
+            segment,
+            live_changed,
+        }
+    }
+
+    /// Project a canonical translation event.
+    ///
+    /// Events for a committed source span (`source_committed`) only ever update
+    /// the row with that ordinal; events for the provisional tail only ever
+    /// update the live editable translation, and only while unstable or open
+    /// source text is still on screen. Errors never blank a row.
+    pub fn apply_translation_event(&mut self, payload: &Value) -> Option<SegmentSummary> {
+        let kind = payload["kind"].as_str().unwrap_or("partial");
+        let text = payload["text"].as_str().unwrap_or_default().to_string();
+        let editable = payload["editable_text"].as_str().unwrap_or_default().to_string();
+        let committed = payload["committed_text"].as_str().unwrap_or_default().to_string();
+        let source_committed = payload["source_committed"].as_bool().unwrap_or(false);
+        let source_revision = payload["source_revision_id"].as_u64();
+        let mut live = self.snapshot.live.clone();
+        if let Some(revision) = payload["revision_id"].as_u64() {
+            live.translation_revision_id = revision;
+        }
+        if let Some(revision) = source_revision {
+            live.translation_source_revision_id = revision;
+        }
+        let mut segment = None;
+        if source_committed {
+            if !committed.is_empty() && kind == "final" {
+                live.translation_committed = committed;
+            }
+            if let Some(ordinal) = source_revision {
+                let status = match kind {
+                    "final" => "done",
+                    "error" => "unavailable",
+                    _ => "streaming",
+                };
+                let row_text = if kind == "error" { String::new() } else { text.clone() };
+                segment = self.update_segment_translation_status(ordinal as u32, row_text, status);
+            }
+            if kind == "final" {
+                if let Some(total) = payload["total_latency_ms"].as_f64() {
+                    self.snapshot.metrics.translation_latency_ms = Some(total as f32);
+                    if let Some(commit) = self.snapshot.metrics.asr_commit_latency_ms {
+                        self.snapshot.metrics.end_to_end_latency_ms = Some(commit + total as f32);
+                    }
+                }
+            }
+        } else if kind != "error" {
+            let has_live_source =
+                !live.original_unstable.is_empty() || !live.open_text.is_empty();
+            live.translation_editable = if has_live_source {
+                if editable.is_empty() { text } else { editable }
+            } else {
+                String::new()
+            };
+        }
+        self.snapshot.live = live;
+        segment
     }
 
     fn check_revision(&self, expected: u64) -> Result<(), SessionError> {
@@ -516,6 +711,7 @@ mod tests {
             end_ms: 500.0,
             original: "stable words".into(),
             translation: String::new(),
+            translation_status: "pending".into(),
         });
         assert_eq!(core.snapshot().state_revision, revision);
         assert_eq!(core.pause(revision).unwrap().phase, SessionPhase::Paused);
@@ -551,6 +747,7 @@ mod tests {
             end_ms: 2_000.0,
             original: "Good morning.".into(),
             translation: String::new(),
+            translation_status: "pending".into(),
         });
 
         let segment = core
@@ -560,5 +757,97 @@ mod tests {
         assert_eq!(segment.id, id);
         assert_eq!(segment.translation, "早上好。");
         assert_eq!(core.snapshot().previous_segments, vec![segment]);
+    }
+
+    fn transcript(kind: &str, revision: u64, text: &str, stable: &str, unstable: &str) -> Value {
+        serde_json::json!({
+            "kind": kind,
+            "revision_id": revision,
+            "event_id": Uuid::new_v4().to_string(),
+            "text": text,
+            "committed_text": if kind == "stable" || kind == "final" { text } else { "" },
+            "stable_text": stable,
+            "unstable_text": unstable,
+            "start_ms": 1000.0,
+            "end_ms": 2500.0,
+            "audio_cursor_ms": 2600.0,
+            "commit_latency_ms": 3200.0,
+        })
+    }
+
+    fn translation(kind: &str, source_revision: u64, committed: bool, text: &str) -> Value {
+        serde_json::json!({
+            "kind": kind,
+            "revision_id": 3,
+            "source_revision_id": source_revision,
+            "source_committed": committed,
+            "text": text,
+            "editable_text": if committed { "" } else { text },
+            "committed_text": if committed && kind == "final" { text } else { "" },
+            "total_latency_ms": 700.0,
+        })
+    }
+
+    #[test]
+    fn transcript_projection_keeps_three_text_tiers_and_makes_rows_from_units() {
+        let mut core = AppCore::default();
+        let partial = core.apply_transcript_event(&transcript("partial", 1, "we propose a new", "we propose", "a new"));
+        assert!(partial.live_changed && partial.segment.is_none());
+        assert_eq!(core.snapshot().live.open_text, "we propose");
+        assert_eq!(core.snapshot().live.original_unstable, "a new");
+
+        let stable = core.apply_transcript_event(&transcript("stable", 2, "We propose a new framework.", "", ""));
+        let row = stable.segment.expect("unit becomes a row");
+        assert_eq!(row.ordinal, 2);
+        assert_eq!(row.original, "We propose a new framework.");
+        assert_eq!(row.translation_status, "pending");
+        assert_eq!((row.start_ms, row.end_ms), (1000.0, 2500.0));
+        let live = core.snapshot().live;
+        assert!(live.open_text.is_empty() && live.original_unstable.is_empty());
+        assert_eq!(live.source_revision_id, 2);
+        assert_eq!(core.snapshot().metrics.asr_commit_latency_ms, Some(3200.0));
+
+        // Alignment and error events never touch live text or rows.
+        core.apply_transcript_event(&transcript("partial", 3, "tail", "", "tail"));
+        let alignment = core.apply_transcript_event(&transcript("alignment_update", 2, "old text", "", ""));
+        assert!(!alignment.live_changed && alignment.segment.is_none());
+        assert_eq!(core.snapshot().live.original_unstable, "tail");
+        assert_eq!(core.snapshot().previous_segments.len(), 1);
+    }
+
+    #[test]
+    fn translation_projection_pairs_committed_spans_with_rows_only() {
+        let mut core = AppCore::default();
+        core.apply_transcript_event(&transcript("stable", 2, "We propose a new framework.", "", ""));
+        core.apply_transcript_event(&transcript("partial", 3, "it uses", "", "it uses"));
+
+        // Streaming deltas for the committed row update that row, not the live tail.
+        let streaming = core.apply_translation_event(&translation("partial", 2, true, "我们提出")).unwrap();
+        assert_eq!(streaming.translation_status, "streaming");
+        assert_eq!(streaming.translation, "我们提出");
+        assert_eq!(core.snapshot().live.translation_editable, "");
+
+        let done = core.apply_translation_event(&translation("final", 2, true, "我们提出了一个新的框架。")).unwrap();
+        assert_eq!(done.translation_status, "done");
+        assert_eq!(core.snapshot().live.translation_committed, "我们提出了一个新的框架。");
+        assert_eq!(core.snapshot().metrics.translation_latency_ms, Some(700.0));
+
+        // Provisional text only ever reaches the live tail.
+        assert!(core.apply_translation_event(&translation("partial", 3, false, "它使用")).is_none());
+        assert_eq!(core.snapshot().live.translation_editable, "它使用");
+        assert_eq!(core.snapshot().previous_segments[0].translation, "我们提出了一个新的框架。");
+
+        // Errors mark the row unavailable without blanking committed text elsewhere.
+        core.apply_transcript_event(&transcript("stable", 4, "Second unit.", "", ""));
+        let failed = core.apply_translation_event(&translation("error", 4, true, "timeout")).unwrap();
+        assert_eq!(failed.translation_status, "unavailable");
+        assert_eq!(failed.translation, "");
+        assert_eq!(core.snapshot().previous_segments[0].translation, "我们提出了一个新的框架。");
+
+        // A late provisional event with no live source text is dropped.
+        assert!(core.apply_translation_event(&translation("partial", 5, false, "迟到")).is_none());
+        assert_eq!(core.snapshot().live.translation_editable, "");
+        // Unknown ordinals are ignored rather than mis-attached.
+        assert!(core.apply_translation_event(&translation("final", 99, true, "孤儿")).is_none());
     }
 }

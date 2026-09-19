@@ -884,6 +884,9 @@ async fn persist_sidecar_event(
             let revision = payload["revision_id"].as_i64().unwrap_or(0);
             let kind = payload["kind"].as_str().unwrap_or("partial");
             let text = payload["text"].as_str().unwrap_or_default();
+            if kind == "error" {
+                return Ok(());
+            }
             let persist_revision = state
                 .persistence_throttle
                 .lock()
@@ -908,10 +911,13 @@ async fn persist_sidecar_event(
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-            store
-                .update_translation(session_id, source_revision, revision, text, kind == "final")
-                .await
-                .map_err(|error| error.to_string())?;
+            let source_committed = payload["source_committed"].as_bool().unwrap_or(false);
+            if source_committed && kind == "final" && !text.is_empty() {
+                store
+                    .update_translation(session_id, source_revision, revision, text, true)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
         }
         SidecarEvent::Metrics(payload) => {
             let captured_audio_ms = payload["captured_audio_ms"].as_f64().unwrap_or(0.0);
@@ -963,108 +969,71 @@ async fn persist_sidecar_event(
     Ok(())
 }
 
+/// Minimum spacing between UI emits of streaming translation deltas for one
+/// request. Core state is always updated; only the webview fan-out is paced.
+const TRANSLATION_DELTA_UI_INTERVAL: std::time::Duration = std::time::Duration::from_millis(66);
+
 fn forward_sidecar_events(app: AppHandle) {
     let mut receiver = app.state::<RuntimeState>().supervisor.subscribe();
+    // Persistence runs on its own task so SQLite latency never delays the
+    // canonical UI event stream. The channel is bounded; the forwarder awaits
+    // when it fills, which only happens if storage is far behind.
+    let (persist_tx, mut persist_rx) =
+        tokio::sync::mpsc::channel::<(uuid::Uuid, SidecarEvent)>(4_096);
+    let persist_app = app.clone();
     tauri::async_runtime::spawn(async move {
-        while let Ok(event) = receiver.recv().await {
+        while let Some((session_id, event)) = persist_rx.recv().await {
+            let state = persist_app.state::<RuntimeState>();
+            if let Err(error) = persist_sidecar_event(&state, session_id, &event).await {
+                let _ = state.emit_event(
+                    &persist_app,
+                    Some(session_id),
+                    UiEventKind::Error,
+                    json!({"code": "storage_error", "message": error, "recoverable": true}),
+                );
+            }
+        }
+    });
+    tauri::async_runtime::spawn(async move {
+        let mut last_delta_emit: HashMap<String, std::time::Instant> = HashMap::new();
+        loop {
+            let event = match receiver.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    eprintln!("sidecar event forwarder lagged; skipped {skipped} events");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
             let state = app.state::<RuntimeState>();
             let persist_event = event.clone();
             let mut segment_update: Option<SegmentSummary> = None;
+            let mut suppress_ui = false;
             let (kind, payload) = match event {
                 SidecarEvent::Transcript(payload) => {
                     if let Ok(mut core) = state.core.lock() {
-                        let mut live = core.snapshot().live;
-                        let event_kind = payload["kind"].as_str().unwrap_or_default();
-                        let text = payload["text"].as_str().unwrap_or_default().to_string();
-                        let committed = payload["committed_text"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_string();
-                        if event_kind == "partial" {
-                            live.original_unstable = payload["unstable_text"]
-                                .as_str()
-                                .unwrap_or(&text)
-                                .to_string();
-                        } else {
-                            live.original_committed = if committed.is_empty() {
-                                text
-                            } else {
-                                committed
-                            };
-                            live.original_unstable.clear();
-                            live.translation_editable.clear();
-                        }
-                        live.source_revision_id = payload["revision_id"]
-                            .as_u64()
-                            .unwrap_or(live.source_revision_id);
-                        core.update_live_transcript(live);
-                        let should_commit_segment = event_kind == "stable"
-                            || (event_kind == "final"
-                                && core.snapshot().previous_segments.is_empty());
-                        if should_commit_segment {
-                            let revision = payload["revision_id"].as_u64().unwrap_or(0) as u32;
-                            let end_ms = payload["end_ms"]
-                                .as_f64()
-                                .or_else(|| payload["audio_cursor_ms"].as_f64())
-                                .unwrap_or(0.0);
-                            let start_ms = payload["start_ms"]
-                                .as_f64()
-                                .unwrap_or((end_ms - 1_000.0).max(0.0));
-                            let segment = SegmentSummary {
-                                id: payload["event_id"]
-                                    .as_str()
-                                    .and_then(|value| value.parse().ok())
-                                    .unwrap_or_else(uuid::Uuid::new_v4),
-                                ordinal: revision,
-                                start_ms,
-                                end_ms,
-                                original: if event_kind == "stable" {
-                                    payload["text"].as_str().unwrap_or_default().to_string()
-                                } else {
-                                    payload["committed_text"]
-                                        .as_str()
-                                        .filter(|value| !value.is_empty())
-                                        .unwrap_or(payload["text"].as_str().unwrap_or_default())
-                                        .to_string()
-                                },
-                                translation: String::new(),
-                            };
-                            core.commit_segment(segment.clone());
-                            segment_update = Some(segment);
-                        }
+                        let projection = core.apply_transcript_event(&payload);
+                        segment_update = projection.segment;
                     }
                     (UiEventKind::TranscriptRevision, payload)
                 }
                 SidecarEvent::Translation(payload) => {
                     if let Ok(mut core) = state.core.lock() {
-                        let mut live = core.snapshot().live;
-                        let committed = payload["committed_text"].as_str().unwrap_or_default();
-                        let editable = payload["editable_text"].as_str().unwrap_or_default();
-                        if !committed.is_empty() {
-                            live.translation_committed = committed.into();
-                        }
-                        let source_revision = payload["source_revision_id"].as_u64();
-                        live.translation_editable = if !live.original_unstable.is_empty()
-                            || source_revision.unwrap_or(0) >= live.source_revision_id
-                        {
-                            editable.into()
-                        } else {
-                            String::new()
-                        };
-                        live.translation_revision_id = payload["revision_id"]
-                            .as_u64()
-                            .unwrap_or(live.translation_revision_id);
-                        live.translation_source_revision_id =
-                            source_revision.unwrap_or(live.translation_source_revision_id);
-                        core.update_live_transcript(live);
-                        if let Some(source_revision) = payload["source_revision_id"].as_u64() {
-                            let text = payload["text"]
-                                .as_str()
-                                .or_else(|| payload["editable_text"].as_str())
-                                .unwrap_or_default()
-                                .to_string();
-                            segment_update =
-                                core.update_segment_translation(source_revision as u32, text);
+                        segment_update = core.apply_translation_event(&payload);
+                    }
+                    if payload["kind"].as_str() == Some("partial") {
+                        let request = payload["request_id"].as_str().unwrap_or_default().to_string();
+                        let now = std::time::Instant::now();
+                        match last_delta_emit.get(&request) {
+                            Some(previous) if now.duration_since(*previous) < TRANSLATION_DELTA_UI_INTERVAL => {
+                                suppress_ui = true;
+                            }
+                            _ => {
+                                last_delta_emit.insert(request, now);
+                                if last_delta_emit.len() > 64 {
+                                    last_delta_emit.retain(|_, at| now.duration_since(*at) < std::time::Duration::from_secs(30));
+                                }
+                            }
                         }
                     }
                     (UiEventKind::TranslationRevision, payload)
@@ -1072,13 +1041,27 @@ fn forward_sidecar_events(app: AppHandle) {
                 SidecarEvent::Metrics(payload) => {
                     if let Ok(metrics) = serde_json::from_value::<LiveMetrics>(payload.clone()) {
                         if let Ok(mut core) = state.core.lock() {
-                            core.update_metrics(metrics);
+                            // Latencies derived from transcript/translation
+                            // events live in core; keep them across samples.
+                            let current = core.snapshot().metrics;
+                            core.update_metrics(LiveMetrics {
+                                asr_first_partial_latency_ms: current.asr_first_partial_latency_ms,
+                                asr_commit_latency_ms: current.asr_commit_latency_ms,
+                                end_to_end_latency_ms: current.end_to_end_latency_ms,
+                                translation_latency_ms: metrics
+                                    .translation_latency_ms
+                                    .or(current.translation_latency_ms),
+                                ..metrics
+                            });
                         }
                     }
                     (UiEventKind::Metrics, payload)
                 }
                 SidecarEvent::SegmentCommitted(payload) => (UiEventKind::SegmentCommitted, payload),
                 SidecarEvent::AlignmentUpdate(payload) => {
+                    // Alignment refines persisted timings only; it is not a
+                    // live transcript revision and must never touch live text.
+                    suppress_ui = true;
                     (UiEventKind::TranscriptRevision, payload)
                 }
                 SidecarEvent::BackendHealth(payload) => (UiEventKind::BackendHealth, payload),
@@ -1118,7 +1101,9 @@ fn forward_sidecar_events(app: AppHandle) {
                 .as_str()
                 .and_then(|value| value.parse().ok())
                 .or(active_session_id);
-            let _ = state.emit_event(&app, event_session_id, kind, payload);
+            if !suppress_ui {
+                let _ = state.emit_event(&app, event_session_id, kind, payload);
+            }
             if let Some(segment) = segment_update {
                 if let Ok(payload) = serde_json::to_value(segment) {
                     let _ = state.emit_event(
@@ -1130,14 +1115,8 @@ fn forward_sidecar_events(app: AppHandle) {
                 }
             }
             if let Some(session_id) = event_session_id {
-                if let Err(error) = persist_sidecar_event(&state, session_id, &persist_event).await
-                {
-                    let _ = state.emit_event(
-                        &app,
-                        Some(session_id),
-                        UiEventKind::Error,
-                        json!({"code": "storage_error", "message": error, "recoverable": true}),
-                    );
+                if persist_tx.send((session_id, persist_event)).await.is_err() {
+                    break;
                 }
             }
         }
