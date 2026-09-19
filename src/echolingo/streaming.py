@@ -110,7 +110,10 @@ class UnitClosureRules:
     sentence_min_chars: int = 12
     clause_min_chars: int = 80
     max_chars: int = 160
-    max_duration_ms: float = 7_000.0
+    max_duration_ms: float = 8_000.0
+    # When a cap forces closure, prefer the last clause boundary at or beyond
+    # this many characters over cutting mid-phrase.
+    cap_clause_min_chars: int = 20
 
 
 @dataclass(slots=True)
@@ -190,10 +193,11 @@ class SentenceUnitSegmenter:
         over_time = duration_ms is not None and duration_ms >= rules.max_duration_ms
         if len(text) >= rules.clause_min_chars:
             clause = self._clause_boundary(text, rules.clause_min_chars)
-            if clause is not None and (over_length or over_time or clause == len(text)):
+            if clause is not None and clause == len(text):
                 return clause
         if over_length or over_time:
-            return len(text)
+            clause = self._clause_boundary(text, rules.cap_clause_min_chars)
+            return clause if clause is not None else len(text)
         return None
 
     def _open_duration_ms(self) -> float | None:

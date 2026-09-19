@@ -205,6 +205,10 @@ class FarFieldPipeline:
                         speech_detected=processed.metrics.speech_detected,
                     )
                 )
+                # A synchronous source (replay) never blocks on the socket, so
+                # yield explicitly or the ASR receiver and translation tasks
+                # starve until the whole file has been pushed.
+                await asyncio.sleep(0)
                 if duration_limit_s is not None and self.captured_audio_ms >= duration_limit_s * 1000:
                     break
             tail = self._flush_frontend_tail()

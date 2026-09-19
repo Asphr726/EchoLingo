@@ -57,6 +57,13 @@ def test_segmenter_falls_back_to_clause_length_and_duration_caps() -> None:
     units = slow.append("still talking", start_ms=1_000, end_ms=5_500)
     assert [unit.text for unit in units] == ["no punctuation here still talking"]
 
+    # A cap prefers the last clause boundary over a mid-phrase cut.
+    capped = SentenceUnitSegmenter("en", UnitClosureRules(max_duration_ms=5_000))
+    assert capped.append("of blue, and then purples, and it takes", start_ms=0, end_ms=2_000) == []
+    units = capped.append("back the", start_ms=2_000, end_ms=5_500)
+    assert [unit.text for unit in units] == ["of blue, and then purples,"]
+    assert capped.open_text == "and it takes back the"
+
 
 def test_segmenter_joins_cjk_without_spaces() -> None:
     segmenter = SentenceUnitSegmenter("zh")
