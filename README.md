@@ -38,7 +38,14 @@ echolingo --config configs/lecture.toml doctor --json
 ws://127.0.0.1:8000/asr` to connect to a separately launched
 WhisperLiveKit server configured for 16 kHz PCM input. EchoLingo disables
 speech gating in its own pipeline; the WLK server must likewise be started
-with VAC/VAD/pause gating disabled.
+with VAC/VAD/pause gating disabled. Launch that server through
+`python -m echolingo.service.qwen_server …` (the Desktop does the same) so
+the lecture decode policy and streaming warmup are applied.
+
+`scripts/replay_desktop_session.py lecture.wav --minutes 10` replays a
+recording through a real inference sidecar exactly as the Desktop does
+(512-sample native frames, real local models) and prints the latency,
+pairing and error summary used in `docs/phase4-release.md`.
 
 Run artifacts are written under `runs/spike1/<timestamp>/`: resolved config,
 JSONL metrics/transcript/translation events, environment metadata, and

@@ -22,7 +22,7 @@ from ...models import (
     TranscriptKind,
 )
 from ...networking import AudioRingBuffer, RetryPolicy
-from ...streaming import SentenceUnitSegmenter, join_text
+from ...streaming import SentenceUnitSegmenter, join_text, sanitize_committed_text
 from ._queue import AsrEventQueue
 from .reconcile import TranscriptReconciler
 
@@ -387,6 +387,9 @@ class CloudQwenAsrBackend:
         if not changed or self._segmenter is None:
             return
         delta = committed[len(previous):] if committed.startswith(previous) else committed
+        delta = sanitize_committed_text(delta, self.config.language)
+        if not delta.strip():
+            return
         units = self._segmenter.append(
             delta, start_ms=self._last_unit_end_ms, end_ms=self.ring.latest_end_ms
         )

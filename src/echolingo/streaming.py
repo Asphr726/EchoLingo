@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -71,8 +73,9 @@ def longest_common_prefix_length(left: str, right: str) -> int:
 UNSPACED_LANGUAGES = frozenset({"zh", "ja"})
 
 # Character-level local agreement for scripts the upstream streamer cannot
-# commit word by word (it splits on whitespace, so a CJK segment is one "word").
-CHARACTER_HOLD_BACK = {"zh": 6, "ja": 6, "ko": 8}
+# commit word by word (it splits on whitespace, so a zh/ja segment is one
+# "word"). Korean is space-delimited, so upstream word commits already work.
+CHARACTER_HOLD_BACK = {"zh": 8, "ja": 8}
 
 SENTENCE_END_CHARS = frozenset(".?!。？！…")
 CLAUSE_END_CHARS = frozenset(",;:，；：、")
@@ -81,6 +84,47 @@ _NO_SPACE_BEFORE = SENTENCE_END_CHARS | CLAUSE_END_CHARS | _CLOSING_CHARS
 _ABBREVIATIONS = frozenset(
     {"mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc", "e.g", "i.e", "no", "fig", "eq"}
 )
+
+
+_SYMBOL_RUN_RE = re.compile(r"(?:([^\w\s])\s*)(?:\1\s*){2,}")
+_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
+_LATIN_RE = re.compile(r"[A-Za-z\u00c0-\u024f]")
+HALLUCINATION_MIN_CHARS = 12
+
+
+_LATIN_RUN_RE = re.compile(r"[A-Za-z\u00c0-\u024f][A-Za-z\u00c0-\u024f0-9 ,.'’\-:;!?\"()]*")
+_CJK_RUN_RE = re.compile(
+    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]"
+    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af0-9 ，。、！？：；「」『』（）]*"
+)
+
+
+def sanitize_committed_text(text: str, language: str) -> str:
+    """Drop recognizer hallucinations before they become committed text.
+
+    The 0.6B model occasionally emits symbol runs ("# # # #") or a fluent
+    sentence in the wrong script (an English boilerplate line inside a
+    Japanese lecture). Both are worthless to display or translate and would
+    otherwise be locked in as append-only committed text. Short foreign
+    fragments (names, acronyms, "RGB") are kept.
+    """
+    cleaned = _SYMBOL_RUN_RE.sub(" ", text)
+    if cleaned != text:
+        logger.info("dropping symbol run from committed text (%d chars)", len(text) - len(cleaned))
+    foreign_run = _LATIN_RUN_RE if language in {"zh", "ja", "ko"} else _CJK_RUN_RE
+    foreign_letters = _LATIN_RE if language in {"zh", "ja", "ko"} else _CJK_RE
+
+    def replace(match: re.Match[str]) -> str:
+        span = match.group(0)
+        if len(foreign_letters.findall(span)) >= HALLUCINATION_MIN_CHARS:
+            logger.info("dropping %d chars outside the %s script: %r", len(span), language, span[:60])
+            return " "
+        return span
+
+    cleaned = foreign_run.sub(replace, cleaned)
+    if not cleaned.strip():
+        return " " if text[:1].isspace() else ""
+    return cleaned
 
 
 def text_joiner(language: str) -> str:
@@ -303,11 +347,15 @@ class WlkEventMapper:
         self._buffer = ""
         self._previous_buffer = ""
         self._buffer_promoted = ""
-        self._character_hold_back = (
-            CHARACTER_HOLD_BACK.get(language, 0)
-            if character_hold_back is None
-            else character_hold_back
-        )
+        if character_hold_back is None:
+            character_hold_back = CHARACTER_HOLD_BACK.get(language, 0)
+            override = os.environ.get("ECHOLINGO_CHARACTER_HOLD_BACK")
+            if override and character_hold_back > 0:
+                try:
+                    character_hold_back = max(0, int(override))
+                except ValueError:
+                    pass
+        self._character_hold_back = character_hold_back
         self._revision = 0
         self._speech_onset_ns: int | None = None
         self._reported_first_token_latency = False
@@ -372,7 +420,7 @@ class WlkEventMapper:
                 self._line_ends_ms[index] = end_ms
             if not delta.strip():
                 continue
-            delta = self._reconcile_promoted(delta)
+            delta = sanitize_committed_text(self._reconcile_promoted(delta), self.language)
             self._buffer_promoted = ""
             self._previous_buffer = ""
             if delta.strip():
@@ -402,6 +450,7 @@ class WlkEventMapper:
         self._buffer = ""
         self._buffer_promoted = ""
         self._previous_buffer = ""
+        remainder = sanitize_committed_text(remainder, self.language)
         if remainder.strip():
             units = self.segmenter.append(
                 remainder, start_ms=self._last_unit_end_ms, end_ms=audio_cursor_ms
@@ -439,14 +488,31 @@ class WlkEventMapper:
                 - longest_common_prefix_length(self._buffer_promoted, buffer),
             )
         candidate = max(0, agreed - self._character_hold_back)
+        # Only whole sentences are promoted: a finished sentence inside the
+        # agreed prefix is far less likely to be rewritten than a clause the
+        # recognizer is still shaping, and units close on the same marks.
+        candidate = self._last_sentence_end(buffer, candidate)
         if candidate <= len(self._buffer_promoted):
             return []
         promoted = buffer[len(self._buffer_promoted):candidate]
         self._buffer_promoted = buffer[:candidate]
+        promoted = sanitize_committed_text(promoted, self.language)
+        if not promoted.strip():
+            return []
         units = self.segmenter.append(
             promoted, start_ms=self._last_unit_end_ms, end_ms=audio_cursor_ms
         )
         return self._close_units(units, now, audio_cursor_ms)
+
+    @staticmethod
+    def _last_sentence_end(text: str, limit: int) -> int:
+        for index in range(min(limit, len(text)) - 1, -1, -1):
+            if text[index] in SENTENCE_END_CHARS:
+                end = index + 1
+                while end < len(text) and end < limit and text[end] in _CLOSING_CHARS:
+                    end += 1
+                return end
+        return 0
 
     def _reconcile_promoted(self, delta: str) -> str:
         """Drop the part of an upstream commit already promoted from the buffer."""

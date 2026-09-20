@@ -5,6 +5,7 @@ from echolingo.streaming import (
     UnitClosureRules,
     WlkEventMapper,
     parse_timestamp_ms,
+    sanitize_committed_text,
 )
 
 
@@ -218,39 +219,31 @@ def test_wlk_reanchors_after_an_incompatible_rewrite() -> None:
     assert rewritten[0].committed_text == "we went to the store. Then we went home."
 
 
-def test_wlk_promotes_agreed_cjk_prefix_before_upstream_commits() -> None:
-    """Upstream cannot commit CJK mid-segment; a stable character prefix can."""
+def test_wlk_promotes_agreed_cjk_sentences_before_upstream_commits() -> None:
+    """Upstream cannot commit CJK mid-segment; a finished, agreed sentence can."""
     mapper = WlkEventMapper("session", "zh", "qwen", "streaming")
-    first = mapper.map_message({"lines": [], "buffer_transcription": "我们提出了一个新的"}, 1_000)
+    first = mapper.map_message({"lines": [], "buffer_transcription": "我们提出了一个新的框架。它使用"}, 1_000)
     assert [event.kind for event in first] == [TranscriptKind.PARTIAL]
     assert first[0].stable_text == ""
 
+    # Agreement covers the whole previous buffer (15 chars) but the sentence
+    # end sits inside the 8-char hold-back, so nothing is promoted yet.
     second = mapper.map_message(
-        {"lines": [], "buffer_transcription": "我们提出了一个新的框架。它使用视觉"}, 2_000
+        {"lines": [], "buffer_transcription": "我们提出了一个新的框架。它使用视觉触觉反馈"}, 2_000
     )
-    # Agreement covers 9 chars, hold-back 6 -> "我们提" promoted but not closed.
     assert [event.kind for event in second] == [TranscriptKind.PARTIAL]
-    assert second[0].stable_text == "我们提"
-    assert second[0].unstable_text == "出了一个新的框架。它使用视觉"
-    assert second[0].text == "我们提出了一个新的框架。它使用视觉"
+    assert second[0].stable_text == ""
+    assert second[0].unstable_text == "我们提出了一个新的框架。它使用视觉触觉反馈"
 
     third = mapper.map_message(
-        {"lines": [], "buffer_transcription": "我们提出了一个新的框架。它使用视觉触觉反馈来"}, 3_000
+        {"lines": [], "buffer_transcription": "我们提出了一个新的框架。它使用视觉触觉反馈来操作物体"}, 3_000
     )
-    # Agreement 17 chars -> 11 promoted; the sentence mark itself is still held back.
-    assert [event.kind for event in third] == [TranscriptKind.PARTIAL]
-    assert third[0].stable_text == "我们提出了一个新的框架"
-    assert third[0].unstable_text == "。它使用视觉触觉反馈来"
-    assert third[0].text == "我们提出了一个新的框架。它使用视觉触觉反馈来"
-
-    fourth = mapper.map_message(
-        {"lines": [], "buffer_transcription": "我们提出了一个新的框架。它使用视觉触觉反馈来操作物体。然后"}, 4_000
-    )
-    assert [event.kind for event in fourth] == [TranscriptKind.STABLE, TranscriptKind.PARTIAL]
-    assert fourth[0].text == "我们提出了一个新的框架。"
-    assert fourth[0].committed_text == "我们提出了一个新的框架。"
-    assert fourth[1].stable_text == "它使用视"
-    assert fourth[1].unstable_text == "觉触觉反馈来操作物体。然后"
+    # Agreement 21 chars - 8 hold-back = 13 -> the finished sentence closes as a unit.
+    assert [event.kind for event in third] == [TranscriptKind.STABLE, TranscriptKind.PARTIAL]
+    assert third[0].text == "我们提出了一个新的框架。"
+    assert third[0].committed_text == "我们提出了一个新的框架。"
+    assert third[1].stable_text == ""
+    assert third[1].unstable_text == "它使用视觉触觉反馈来操作物体"
 
     # The upstream segment roll finally commits the whole hypothesis; only the
     # remainder beyond the promoted prefix is appended.
@@ -269,3 +262,33 @@ def test_wlk_promotes_agreed_cjk_prefix_before_upstream_commits() -> None:
 
 def test_parse_wlk_timestamp() -> None:
     assert parse_timestamp_ms("1:02:03.5") == 3_723_500
+
+
+def test_sanitize_drops_symbol_runs_and_wrong_script_hallucinations() -> None:
+    assert sanitize_committed_text("今年は # # # # # # # の中", "ja") == "今年は  の中"
+    english = "Human Rights Watch is a non-profit organization that works to protect people."
+    assert sanitize_committed_text(english, "ja") == ""
+    assert sanitize_committed_text(" " + english, "ja") == " "
+    assert sanitize_committed_text("今年は戦後八十年です。" + english + "と楽", "ja").replace(" ", "") == "今年は戦後八十年です。と楽"
+    assert sanitize_committed_text("これまでの日本の歩みを振り返り", "ja") == "これまでの日本の歩みを振り返り"
+    # Short foreign fragments (names, acronyms) are kept.
+    assert sanitize_committed_text("RGBの値", "ja") == "RGBの値"
+    assert sanitize_committed_text("我们使用 CCD 传感器。", "zh") == "我们使用 CCD 传感器。"
+    assert sanitize_committed_text("这是一个完全错误的中文幻觉句子。", "en") == ""
+    assert sanitize_committed_text("Look at that line.", "en") == "Look at that line."
+
+
+def test_wlk_mapper_never_commits_wrong_script_hallucination() -> None:
+    mapper = WlkEventMapper("session", "ja", "qwen", "streaming", character_hold_back=0)
+    events = mapper.map_message(
+        {
+            "lines": [{"text": "今年は戦後八十年です。Human Rights Watch is a non-profit organization that works.", "start": 0, "end": 6}],
+            "buffer_transcription": "",
+        },
+        6_000,
+    )
+    assert [event.kind for event in events] == [TranscriptKind.PARTIAL]
+    assert events[0].stable_text == "今年は戦後八十年です。"
+    flushed = mapper.flush_events(6_000)
+    assert [event.text for event in flushed if event.kind == TranscriptKind.STABLE] == ["今年は戦後八十年です。"]
+    assert "Human" not in flushed[-1].text
