@@ -57,6 +57,9 @@ def main() -> int:
         nagisa_paths[0],
         "--collect-submodules",
         "whisperlivekit.qwen3_streaming",
+        # Provider adapters are imported lazily by the registry factories.
+        "--collect-submodules",
+        "echolingo.backends",
         "--add-data",
         f"{root / 'models' / 'silero_vad.onnx'}:models",
         "--distpath",
