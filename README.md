@@ -51,9 +51,17 @@ Run artifacts are written under `runs/spike1/<timestamp>/`: resolved config,
 JSONL metrics/transcript/translation events, environment metadata, and
 optionally raw and enhanced WAV audio.
 
-Cloud credentials are read only from `DASHSCOPE_API_KEY` and
-`DASHSCOPE_WORKSPACE_ID`. Cloud ASR additionally requires explicit
-`privacy.audio_upload_allowed=true`; Cloud translation requires
+Cloud providers are pluggable: Qwen Cloud (DashScope, Singapore or Beijing),
+OpenAI Realtime, Deepgram, AssemblyAI and Gladia for recognition; Qwen-MT,
+OpenAI-compatible chat models (OpenAI, DeepSeek, Gemini, Groq, OpenRouter,
+SiliconFlow, custom endpoints), DeepL, Google Cloud Translation and Azure
+Translator for translation. `src/echolingo/backends/registry.py` lists them
+(`python -m echolingo.backends.registry`); setup notes live in
+[docs/cloud-setup.md](docs/cloud-setup.md). The desktop app stores keys in the
+OS keychain; on the command line the registry's environment variables
+(`DASHSCOPE_API_KEY`, `OPENAI_API_KEY`, `DEEPGRAM_API_KEY`, `DEEPL_API_KEY`,
+...) are development fallbacks. Cloud ASR additionally requires explicit
+`privacy.audio_upload_allowed=true`; cloud translation requires
 `privacy.transcript_upload_allowed=true`. Credential values are never written
 to resolved configuration or logs.
 
