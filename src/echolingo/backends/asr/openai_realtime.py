@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 import uuid
 from base64 import b64encode
 from dataclasses import dataclass
@@ -206,6 +207,59 @@ class OpenAiRealtimeAsrBackend(CloudStreamingAsrBase):
         return ConnectionError(
             f"OpenAI Realtime could not be reached ({type(error).__name__}). "
             "Check the network and any proxy settings."
+        )
+
+    probe_first_message_timeout_s = 8.0
+
+    async def probe_connection(self) -> float:
+        """Handshake plus the first server event, without sending anything.
+
+        OpenAI accepts the WebSocket upgrade even for an invalid key and only
+        then sends an ``error`` event (``invalid_api_key``), so a handshake-only
+        probe would report success; ``session.created`` is the real proof.
+        """
+        if not self.credentials_present():
+            raise AuthenticationError(self.missing_credentials_message())
+        started_ns = time.monotonic_ns()
+        websocket = await self._open_with_diagnostics()
+        try:
+            try:
+                raw = await asyncio.wait_for(
+                    websocket.recv(), timeout=self.probe_first_message_timeout_s
+                )
+            except (TimeoutError, asyncio.TimeoutError):
+                # Older gateways stay silent until the first client message; the
+                # authenticated upgrade is then the best evidence available.
+                return (time.monotonic_ns() - started_ns) / 1_000_000.0
+            self._raise_for_probe_message(raw)
+            return (time.monotonic_ns() - started_ns) / 1_000_000.0
+        finally:
+            await websocket.close()
+
+    def _raise_for_probe_message(self, raw: str | bytes) -> None:
+        if not isinstance(raw, str):
+            return
+        try:
+            message = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(message, dict) or message.get("type") != "error":
+            return
+        error = message.get("error")
+        error = error if isinstance(error, dict) else {}
+        code = str(error.get("code") or error.get("type") or "error")
+        if code in {"invalid_api_key", "invalid_request_error"} and "key" in str(error.get("message", "")).lower():
+            raise AuthenticationError(
+                "OpenAI rejected the API key (invalid_api_key). "
+                "Verify the key is active and the project has Realtime API access."
+            )
+        if code in {"insufficient_quota", "rate_limit_exceeded"}:
+            raise RateLimitError(
+                f"OpenAI reported {code}. Check the project's usage limits and billing."
+            )
+        raise ConnectionError(
+            f"OpenAI Realtime rejected the session ({self._redact(code)}). "
+            "Check the model setting and the key's project access."
         )
 
     # -------------------------------------------------------------- protocol

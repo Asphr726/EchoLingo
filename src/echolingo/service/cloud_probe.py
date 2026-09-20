@@ -17,6 +17,7 @@ from typing import Any
 from ..backends import registry
 from ..config import load_config
 from ..errors import AuthenticationError, BackendError
+from ..translation.policy import TranslationRequestError
 
 log = logging.getLogger("echolingo.cloud_probe")
 
@@ -83,13 +84,16 @@ async def probe_qwen_cloud(include_translation: bool, **_: Any) -> dict[str, Any
 def _error_code(error: Exception) -> str:
     if isinstance(error, BackendError):
         return error.code
+    if isinstance(error, TranslationRequestError):
+        return error.error_code
     if isinstance(error, (TimeoutError, ConnectionError, OSError)):
         return "network_error"
     return "cloud_probe_failed"
 
 
 def _safe_message(display_name: str, error: Exception) -> str:
-    if isinstance(error, (AuthenticationError, BackendError, ConnectionError)):
+    if isinstance(error, (AuthenticationError, BackendError, ConnectionError, TranslationRequestError)):
+        # Adapter-raised errors carry sanitized, provider-neutral text.
         return str(error)
     if isinstance(error, (TimeoutError, OSError)):
         return f"{display_name} could not be reached. Check the network and try again."

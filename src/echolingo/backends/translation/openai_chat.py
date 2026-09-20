@@ -239,6 +239,13 @@ class OpenAiChatTranslation(OpenAiCompatibleChatTranslation):
                 body = (await response.aread()).decode("utf-8", "replace")[:300]
             except Exception:  # pragma: no cover - diagnostics only
                 body = ""
+            lowered = body.lower()
+            if "api key" in lowered and ("valid" in lowered or "invalid" in lowered):
+                # Gemini's OpenAI endpoint answers 400 (not 401) for a bad key.
+                raise AuthenticationError(
+                    f"{self.display_name} rejected the API key (HTTP 400). "
+                    "Verify that the key is active and the model is enabled for it."
+                )
             if "stream_options" in body:
                 hint = (
                     " Use the custom endpoint preset for this server."

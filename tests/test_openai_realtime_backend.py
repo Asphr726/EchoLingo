@@ -672,3 +672,65 @@ async def test_reconnect_budget_exhaustion_reports_recoverable_network_error() -
     assert [event.kind for event in events] == [TranscriptKind.ERROR]
     assert events[0].error_code == "network_error" and events[0].recoverable is True
     assert KEY not in events[0].text and "wss://" not in events[0].text
+
+
+async def test_probe_reads_the_first_event_to_detect_an_invalid_key() -> None:
+    import asyncio as _asyncio
+    import json as _json
+
+    from echolingo.backends.asr.openai_realtime import OpenAiRealtimeAsrBackend
+    from echolingo.errors import AuthenticationError
+
+    class Socket:
+        def __init__(self, first):
+            self.first = first
+            self.sent = []
+            self.closed = False
+
+        async def send(self, raw):
+            self.sent.append(raw)
+
+        async def recv(self):
+            if self.first is None:
+                await _asyncio.sleep(10)
+            return self.first
+
+        async def close(self):
+            self.closed = True
+
+    def backend(first):
+        socket = Socket(first)
+
+        async def factory(url, headers):
+            return socket
+
+        instance = OpenAiRealtimeAsrBackend(
+            api_key="sk-" + "y" * 40,
+            model="gpt-4o-transcribe",
+            language="en",
+            audio_upload_allowed=False,
+            vad_threshold=0.5,
+            prefix_padding_ms=300,
+            silence_duration_ms=800,
+            noise_reduction="far_field",
+            send_batch_ms=100,
+            ring_capacity_ms=30_000,
+            replay_overlap_ms=500,
+            reconnect_budget_s=1.0,
+            websocket_factory=factory,
+        )
+        instance.probe_first_message_timeout_s = 0.05
+        return instance, socket
+
+    denied = _json.dumps({"type": "error", "error": {"type": "invalid_request_error", "code": "invalid_api_key", "message": "Incorrect API key provided: sk-yyyy***yyyy."}})
+    instance, socket = backend(denied)
+    with pytest.raises(AuthenticationError) as info:
+        await instance.probe_connection()
+    assert "yyyy" not in str(info.value) and socket.closed and socket.sent == []
+
+    instance, socket = backend(_json.dumps({"type": "transcription_session.created", "session": {}}))
+    assert await instance.probe_connection() >= 0
+    assert socket.sent == []
+
+    instance, socket = backend(None)  # silent gateway: the upgrade counts
+    assert await instance.probe_connection() >= 0

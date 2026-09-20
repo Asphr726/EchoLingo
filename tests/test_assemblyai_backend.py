@@ -741,3 +741,27 @@ def test_registry_factory_builds_adapter_from_config(monkeypatch) -> None:
     assert adapter.model == spec.model_for(config) == "universal-streaming"
     without_key = spec.factory(config, {})
     assert without_key.credentials_present() is False
+
+
+async def test_probe_reads_begin_or_error_frame_without_sending_audio() -> None:
+    from echolingo.errors import AuthenticationError
+
+    async def run(first):
+        socket = FakeSocket()
+        if first is not None:
+            await socket.incoming.put(json.dumps(first))
+
+        async def factory(url, headers):
+            return socket
+
+        adapter = backend(websocket_factory=factory, audio_upload_allowed=False)
+        adapter.probe_first_message_timeout_s = 0.05
+        latency = await adapter.probe_connection()
+        assert socket.sent == [] and socket.closed
+        return latency
+
+    assert await run({"type": "Begin", "id": "abc", "expires_at": 1}) >= 0
+    assert await run(None) >= 0  # silent gateway: the authenticated upgrade counts
+    with pytest.raises(AuthenticationError) as info:
+        await run({"type": "Error", "error_code": 1008, "error": "Unauthorized Connection: Invalid API key"})
+    assert KEY not in str(info.value)

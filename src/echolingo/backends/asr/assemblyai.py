@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import os
 from urllib.parse import urlencode
 
@@ -350,6 +351,43 @@ class AssemblyAiAsrBackend(CloudStreamingAsrBase):
             error_message=f"AssemblyAI: {detail}",
             recoverable=recoverable,
         )
+
+    probe_first_message_timeout_s = 8.0
+
+    async def probe_connection(self) -> float:
+        """Handshake plus the ``Begin`` frame, without sending any audio.
+
+        AssemblyAI completes the WebSocket upgrade for an invalid key and only
+        then sends ``{"type": "Error", "error_code": 1008, ...}``, so the
+        handshake alone is not proof of a valid key.
+        """
+        if not self.credentials_present():
+            raise AuthenticationError(self.missing_credentials_message())
+        started_ns = time.monotonic_ns()
+        websocket = await self._open_with_diagnostics()
+        try:
+            try:
+                raw = await asyncio.wait_for(
+                    websocket.recv(), timeout=self.probe_first_message_timeout_s
+                )
+            except (TimeoutError, asyncio.TimeoutError):
+                return (time.monotonic_ns() - started_ns) / 1_000_000.0
+            except Exception as error:  # closed with a status code before Begin
+                raise self.map_connection_error(error) from error
+            delta = self.parse_message(raw)
+            if delta is not None and delta.kind == "error":
+                lowered = f"{delta.error_code} {delta.error_message}".lower()
+                if "unauthorized" in lowered or "api key" in lowered or "1008" in lowered:
+                    raise AuthenticationError(
+                        "AssemblyAI rejected the API key (Unauthorized). Verify the key in "
+                        "the AssemblyAI dashboard."
+                    )
+                raise ConnectionError(
+                    f"AssemblyAI refused the streaming session ({delta.error_code})."
+                )
+            return (time.monotonic_ns() - started_ns) / 1_000_000.0
+        finally:
+            await websocket.close()
 
     def parse_message(self, raw: str | bytes) -> ProviderTranscriptDelta | None:
         if not isinstance(raw, str):
