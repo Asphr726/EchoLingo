@@ -286,7 +286,7 @@ class AzureTranslator(RestTranslationBase):
         self._warn_glossary(request)
         trace_id = str(uuid.uuid4())
         self.last_trace_id = trace_id
-        budget_s = self.request_timeout(request)
+        budget_s = self.request_budget_s(request)
         try:
             # httpx timeouts are per phase; the scheduler's budget is wall-clock.
             response = await asyncio.wait_for(
@@ -295,7 +295,7 @@ class AzureTranslator(RestTranslationBase):
                     params=self.build_params(request),
                     headers=self.headers(trace_id),
                     json=self.build_body(request),
-                    timeout=budget_s,
+                    timeout=self.request_timeout(request),
                 ),
                 timeout=budget_s,
             )

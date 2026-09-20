@@ -252,11 +252,11 @@ class GoogleTranslateV2(RestTranslationBase):
             ) from error
         data = body.get("data") if isinstance(body, dict) else None
         translations = data.get("translations") if isinstance(data, dict) else None
-        if not translations or not isinstance(translations[0], dict):
+        first = translations[0] if isinstance(translations, list) and translations else None
+        if not isinstance(first, dict):
             raise TranslationRequestError(
                 "empty_response", "Google Cloud Translation returned no translation"
             )
-        first = translations[0]
         detected = first.get("detectedSourceLanguage")
         if detected:
             self.last_detected_source_language = str(detected)

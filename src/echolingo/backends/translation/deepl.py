@@ -305,12 +305,15 @@ class DeepLTranslation(RestTranslationBase):
                 "invalid_response", "DeepL returned a non-JSON response"
             ) from error
         translations = body.get("translations") if isinstance(body, dict) else None
-        if not translations or not isinstance(translations[0], dict):
+        first = translations[0] if isinstance(translations, list) and translations else None
+        if not isinstance(first, dict):
             raise TranslationRequestError("empty_response", "DeepL returned no translation")
-        first = translations[0]
+        text = first.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise TranslationRequestError("empty_response", "DeepL returned an empty translation")
         detected = first.get("detected_source_language")
         if detected:
             self.last_detected_source_language = str(detected)
         used = str(first.get("model_type_used") or "").strip().lower()
-        model = f"deepl-{used}" if used else self.model
-        return str(first.get("text") or ""), model
+        model = f"deepl-{used}" if used in MODEL_TYPES else self.model
+        return text, model

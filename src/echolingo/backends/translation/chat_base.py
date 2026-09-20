@@ -144,8 +144,9 @@ class OpenAiCompatibleChatTranslation:
                 f"{self.display_name} reported HTTP 404 for model {self.model_for(request)!r}.",
             )
         retry_without_context = status < 500 and bool(request.context)
+        overflow = status < 500 and "context" in body.lower()
         raise TranslationRequestError(
-            "context_overflow" if "context" in body.lower() else f"http_{status}",
+            "context_overflow" if overflow else f"http_{status}",
             f"{self.display_name} returned HTTP {status}",
             retry_without_context=retry_without_context,
         )
@@ -231,15 +232,21 @@ class OpenAiCompatibleChatTranslation:
                                 chunk = json.loads(raw)
                             except json.JSONDecodeError:
                                 continue
-                            usage = chunk.get("usage") or usage
-                            choices = chunk.get("choices") or []
-                            if not choices:
+                            if not isinstance(chunk, dict):
+                                continue
+                            if isinstance(chunk.get("usage"), dict):
+                                usage = chunk["usage"]
+                            choices = chunk.get("choices")
+                            if not isinstance(choices, list) or not choices:
                                 continue
                             choice = choices[0]
+                            if not isinstance(choice, dict):
+                                continue
                             if choice.get("finish_reason"):
                                 finish_reason = str(choice["finish_reason"])
-                            content = str((choice.get("delta") or {}).get("content") or "")
-                            if not content:
+                            delta_value = choice.get("delta")
+                            content = delta_value.get("content") if isinstance(delta_value, dict) else None
+                            if not isinstance(content, str) or not content:
                                 continue
                             if first_delta is None:
                                 first_delta = (time.monotonic_ns() - started) / 1_000_000.0
@@ -299,9 +306,17 @@ class OpenAiCompatibleChatTranslation:
         )
         await self.raise_status(response, request)
         body = response.json()
-        choice = (body.get("choices") or [{}])[0]
-        text = str((choice.get("message") or {}).get("content") or "")
-        text = self.postprocess(text, request)
+        choices = body.get("choices") if isinstance(body, dict) else None
+        choice = choices[0] if isinstance(choices, list) and choices else {}
+        if not isinstance(choice, dict):
+            choice = {}
+        message = choice.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, str) or not content.strip():
+            raise TranslationRequestError(
+                "empty_response", f"{self.display_name} returned no translation text"
+            )
+        text = self.postprocess(content, request)
         return self._event(
             request,
             TranslationKind.FINAL,
@@ -309,7 +324,7 @@ class OpenAiCompatibleChatTranslation:
             1,
             model,
             started,
-            usage=body.get("usage"),
+            usage=body.get("usage") if isinstance(body.get("usage"), dict) else None,
             finish_reason=str(choice.get("finish_reason") or "stop"),
         )
 

@@ -120,10 +120,18 @@ class RestTranslationBase:
             finish_reason=finish_reason,
         )
 
-    def request_timeout(self, request: TranslationRequest) -> float:
+    def request_budget_s(self, request: TranslationRequest) -> float:
+        """Wall-clock budget for one request (seconds)."""
         if request.timeout_s is not None:
             return max(0.5, min(self.timeout_s, request.timeout_s))
         return self.timeout_s
+
+    def request_timeout(self, request: TranslationRequest) -> httpx.Timeout:
+        """httpx per-phase timeouts: the budget for read/write/pool, while the
+        connect phase keeps a floor so a short budget cannot break the TLS
+        handshake on a slow link."""
+        budget = self.request_budget_s(request)
+        return httpx.Timeout(budget, connect=min(10.0, max(budget, 2.0)))
 
     async def retranslate_window(self, request: TranslationRequest) -> CanonicalTranslationEvent:
         self.authorize()

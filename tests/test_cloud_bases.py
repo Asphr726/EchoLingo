@@ -277,3 +277,121 @@ async def test_rest_base_yields_single_final_and_maps_quota_errors() -> None:
     backend = FixedRest(api_key="k-1234567890", transcript_upload_allowed=True, client=httpx.AsyncClient(transport=httpx.MockTransport(quota)))
     with pytest.raises(RateLimitError):
         await backend.retranslate_window(request())
+
+
+async def test_chat_base_ignores_malformed_stream_chunks() -> None:
+    body = "\n\n".join(
+        [
+            "data: []",
+            'data: "hi"',
+            'data: {"choices": "nope"}',
+            'data: {"choices": [5]}',
+            'data: {"choices": [{"delta": {"content": ["a"]}}]}',
+            'data: {"choices": [{"delta": {"content": "好"}}]}',
+            "data: [DONE]",
+        ]
+    )
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=body)
+
+    backend = EchoChat(base_url="https://api.example.invalid/v1", model="m", api_key="k-1234567890", transcript_upload_allowed=True, client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    events = [event async for event in backend.translate_incremental(request())]
+    assert [event.text for event in events] == ["好", "好"]
+
+    def empty(http_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": ""}}]})
+
+    from echolingo.translation.policy import TranslationRequestError
+
+    backend = EchoChat(base_url="https://api.example.invalid/v1", model="m", api_key="k-1234567890", transcript_upload_allowed=True, client=httpx.AsyncClient(transport=httpx.MockTransport(empty)))
+    with pytest.raises(TranslationRequestError) as info:
+        await backend.retranslate_window(request())
+    assert info.value.error_code == "empty_response"
+
+    def server_error(http_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="context service unavailable")
+
+    backend = EchoChat(base_url="https://api.example.invalid/v1", model="m", api_key="k-1234567890", transcript_upload_allowed=True, client=httpx.AsyncClient(transport=httpx.MockTransport(server_error)))
+    with pytest.raises(TranslationRequestError) as info:
+        await backend.retranslate_window(request())
+    assert info.value.error_code == "http_500"
+
+
+class ChunkAsr(CloudStreamingAsrBase):
+    name = provider_id = "chunky"
+    display_name = "Chunky"
+    finish_on_final = True
+    finish_timeout_s = 1.0
+
+    def build_url(self) -> str:
+        return "wss://example.invalid/chunks"
+
+    def finish_messages(self):
+        return [json.dumps({"type": "close"})]
+
+    def parse_message(self, raw):
+        message = json.loads(raw)
+        if message["type"] == "chunk":
+            return ProviderTranscriptDelta("text", confirmed=message["text"], unstable="", chunk_id=message["id"])
+        if message["type"] == "utterance_end":
+            return ProviderTranscriptDelta("final")
+        return ProviderTranscriptDelta("ignore")
+
+
+async def test_chunk_ids_keep_repeated_utterances_and_drop_duplicate_deliveries() -> None:
+    socket = FakeSocket()
+
+    async def factory(url, headers):
+        return socket
+
+    backend = ChunkAsr(api_key="key-1234567890", model="m", audio_upload_allowed=True, websocket_factory=factory)
+    await backend.start_session(AsrSessionConfig("s", "en"))
+    for sequence in range(10):
+        await backend.push_audio(chunk(sequence))
+    await socket.incoming.put(json.dumps({"type": "chunk", "id": "1", "text": "Thank you."}))
+    await socket.incoming.put(json.dumps({"type": "chunk", "id": "2", "text": "Thank you."}))
+    await socket.incoming.put(json.dumps({"type": "chunk", "id": "2", "text": "Thank you."}))
+    await socket.incoming.put(json.dumps({"type": "utterance_end"}))
+    await asyncio.sleep(0.05)
+    await backend.finish_session()
+    events = [event async for event in backend.events()]
+    await backend.close()
+    # The segmenter may group the two short sentences into one unit; what
+    # matters is that both survive and the duplicate delivery (id 2) does not.
+    assert events[-1].committed_text == "Thank you. Thank you."
+
+
+async def test_chunks_right_after_reconnect_are_overlap_merged() -> None:
+    sockets = [FakeSocket(), FakeSocket()]
+    calls = 0
+
+    async def factory(url, headers):
+        nonlocal calls
+        socket = sockets[calls]
+        calls += 1
+        return socket
+
+    backend = ChunkAsr(api_key="key-1234567890", model="m", audio_upload_allowed=True, websocket_factory=factory)
+    backend.retry = RetryPolicy(initial_s=0.001, maximum_s=0.002, budget_s=0.2)
+    await backend.start_session(AsrSessionConfig("s", "en"))
+    for sequence in range(10):
+        await backend.push_audio(chunk(sequence))
+    await sockets[0].incoming.put(json.dumps({"type": "chunk", "id": "a", "text": "Welcome to the lecture."}))
+    await asyncio.sleep(0.02)
+    await sockets[0].incoming.put(ConnectionError("gone"))
+
+    async def reconnected():
+        while calls < 2:
+            await asyncio.sleep(0.001)
+
+    await asyncio.wait_for(reconnected(), 1)
+    # The replayed audio re-produces the tail of the previous chunk under a new id.
+    await sockets[1].incoming.put(json.dumps({"type": "chunk", "id": "b", "text": "the lecture."}))
+    await sockets[1].incoming.put(json.dumps({"type": "chunk", "id": "c", "text": "Today we start."}))
+    await sockets[1].incoming.put(json.dumps({"type": "utterance_end"}))
+    await asyncio.sleep(0.05)
+    await backend.finish_session()
+    events = [event async for event in backend.events()]
+    await backend.close()
+    assert events[-1].committed_text == "Welcome to the lecture. Today we start."

@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import re
 import os
 import time
 from typing import Any
@@ -77,6 +79,13 @@ _IGNORED_MESSAGE_TYPES = frozenset(
         "chapterization",
     }
 )
+
+
+_RECOVERABLE_PATTERN = re.compile(r"rate[ _-]?limit|\btimeout\b|\btimed out\b|\b429\b|\b503\b|overloaded")
+
+
+def _is_recoverable(lowered: str) -> bool:
+    return _RECOVERABLE_PATTERN.search(lowered) is not None
 
 
 class GladiaSessionError(Exception):
@@ -232,7 +241,8 @@ class GladiaAsrBackend(CloudStreamingAsrBase):
         except ValueError:
             raise GladiaSessionError(response.status_code, "unreadable response") from None
         url = payload.get("url") if isinstance(payload, dict) else None
-        if not isinstance(url, str) or not url.startswith(("wss://", "ws://")):
+        # Only a TLS session URL is accepted: audio must never leave in clear text.
+        if not isinstance(url, str) or not url.startswith("wss://"):
             raise GladiaSessionError(response.status_code, "response carried no session url")
         self._session_url = url
         self.live_session_id = str(payload.get("id") or "") or None
@@ -346,6 +356,8 @@ class GladiaAsrBackend(CloudStreamingAsrBase):
             value = float(seconds)  # type: ignore[arg-type]
         except (TypeError, ValueError):
             return None
+        if not math.isfinite(value) or value < 0.0:
+            return None
         return (self._stream_origin_ms or 0.0) + value * 1000.0
 
     def parse_message(self, raw: str | bytes) -> ProviderTranscriptDelta | None:
@@ -372,6 +384,7 @@ class GladiaAsrBackend(CloudStreamingAsrBase):
                     final_text=text,
                     speech_end_ms=self._source_ms(utterance.get("end")),
                     provider_event_id=transcript_id,
+                    chunk_id=f"{self._epoch}:{transcript_id or utterance.get('start')}",
                 )
             return ProviderTranscriptDelta("text", unstable=text, provider_event_id=transcript_id)
         if event_type == "speech_end":
@@ -395,7 +408,7 @@ class GladiaAsrBackend(CloudStreamingAsrBase):
                 "error",
                 error_code=code,
                 error_message=detail,
-                recoverable=any(token in lowered for token in ("rate", "timeout", "429", "503")),
+                recoverable=_is_recoverable(lowered),
                 provider_event_id=event_id,
             )
         if event_type in _IGNORED_MESSAGE_TYPES:

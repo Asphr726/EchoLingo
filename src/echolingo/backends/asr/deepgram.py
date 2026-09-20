@@ -329,6 +329,9 @@ class DeepgramAsrBackend(CloudStreamingAsrBase):
         if not is_final:
             self._utterance_open = True
             return ProviderTranscriptDelta("text", unstable=transcript, provider_event_id=request_id)
+        # Each is_final result covers one audio span; the span identifies the
+        # chunk so a repeated phrase is appended rather than merged away.
+        chunk_id = f"{self._epoch}:{message.get('start')}:{message.get('duration')}"
         if speech_final:
             self._utterance_open = False
             return ProviderTranscriptDelta(
@@ -336,10 +339,11 @@ class DeepgramAsrBackend(CloudStreamingAsrBase):
                 final_text=transcript,
                 speech_end_ms=self._segment_end_ms(message),
                 provider_event_id=request_id,
+                chunk_id=chunk_id,
             )
         self._utterance_open = True
         return ProviderTranscriptDelta(
-            "text", confirmed=transcript, unstable="", provider_event_id=request_id
+            "text", confirmed=transcript, unstable="", provider_event_id=request_id, chunk_id=chunk_id
         )
 
     def _segment_end_ms(self, message: dict) -> float | None:

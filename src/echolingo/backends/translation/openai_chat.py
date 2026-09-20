@@ -240,10 +240,15 @@ class OpenAiChatTranslation(OpenAiCompatibleChatTranslation):
             except Exception:  # pragma: no cover - diagnostics only
                 body = ""
             if "stream_options" in body:
+                hint = (
+                    " Use the custom endpoint preset for this server."
+                    if self.provider in STREAM_USAGE_PROVIDERS
+                    else ""
+                )
                 raise TranslationRequestError(
                     "bad_request",
                     f"{self.display_name} rejected the request (HTTP 400): the endpoint does "
-                    "not accept stream_options. Use the custom endpoint preset for this server.",
+                    f"not accept stream_options.{hint}",
                     retry_without_context=False,
                 )
         await super().raise_status(response, request)

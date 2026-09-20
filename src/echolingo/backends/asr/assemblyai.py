@@ -326,6 +326,7 @@ class AssemblyAiAsrBackend(CloudStreamingAsrBase):
             final_text=transcript,
             speech_end_ms=speech_end_ms,
             provider_event_id=event_id,
+            chunk_id=f"{self._epoch}:{turn_order}" if turn_order >= 0 else None,
         )
 
     @staticmethod

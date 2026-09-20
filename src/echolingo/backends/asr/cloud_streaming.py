@@ -64,6 +64,13 @@ class ProviderTranscriptDelta:
     (or a completed chunk); the reconciler merges it by overlap so both
     cumulative and chunked providers work. ``unstable`` replaces the whole
     unstable tail.
+
+    Chunk-style providers (Deepgram results, Gladia utterances, AssemblyAI
+    turns) set ``chunk_id`` on ``confirmed``/``final_text`` deltas: the text
+    is then appended once per id instead of being overlap-merged, so a
+    genuinely repeated utterance ("Okay. Okay.") is not dropped as a replay
+    duplicate. The first chunks after a reconnect still go through the
+    overlap merge because the ring replay re-delivers audio at least once.
     """
 
     kind: str
@@ -75,6 +82,7 @@ class ProviderTranscriptDelta:
     error_message: str = ""
     recoverable: bool = False
     provider_event_id: str | None = None
+    chunk_id: str | None = None
 
 
 def pcm16_bytes(samples: np.ndarray) -> bytes:
@@ -139,6 +147,9 @@ class CloudStreamingAsrBase:
         self._pending_samples = 0
         self._resampler: StreamingResampler | None = None
         self._reconciler = TranscriptReconciler()
+        self._seen_chunk_ids: deque[str] = deque(maxlen=256)
+        # Chunks merged by overlap right after a reconnect (replay overlap).
+        self._replay_merge_chunks = 0
         self._provider_confirmed = ""
         self._provider_stash = ""
         self._segmenter: SentenceUnitSegmenter | None = None
@@ -436,9 +447,13 @@ class CloudStreamingAsrBase:
             return
         self._note_delivery()
         if kind == "text":
-            if delta.confirmed is not None and delta.confirmed != self._provider_confirmed:
+            if delta.confirmed is not None and (
+                delta.chunk_id is not None or delta.confirmed != self._provider_confirmed
+            ):
                 self._provider_confirmed = delta.confirmed
-                await self._commit_confirmed(delta.confirmed, delta.provider_event_id)
+                await self._commit_confirmed(
+                    delta.confirmed, delta.provider_event_id, chunk_id=delta.chunk_id
+                )
             if delta.unstable is not None and delta.unstable != self._provider_stash:
                 self._provider_stash = delta.unstable
                 await self._emit_partial(delta.unstable, delta.provider_event_id)
@@ -447,7 +462,9 @@ class CloudStreamingAsrBase:
             if delta.speech_end_ms:
                 self._last_speech_end_ms = float(delta.speech_end_ms)
             if delta.final_text is not None:
-                await self._commit_confirmed(delta.final_text, delta.provider_event_id)
+                await self._commit_confirmed(
+                    delta.final_text, delta.provider_event_id, chunk_id=delta.chunk_id
+                )
             self._provider_confirmed = ""
             self._provider_stash = ""
             if self._segmenter is not None:
@@ -468,11 +485,37 @@ class CloudStreamingAsrBase:
             return
         raise ValueError(f"unknown provider delta kind: {kind}")
 
-    async def _commit_confirmed(self, confirmed: str, provider_event_id: str | None) -> None:
+    def _merge_chunk(self, text: str, chunk_id: str) -> tuple[str, bool]:
+        """Append one provider chunk exactly once (by id) without overlap merging."""
+        assert self.config is not None
+        if chunk_id in self._seen_chunk_ids:
+            return self._reconciler.committed, False
+        self._seen_chunk_ids.append(chunk_id)
+        if self._replay_merge_chunks > 0:
+            self._replay_merge_chunks -= 1
+            return self._reconciler.merge_confirmed(text)
+        text = text.strip()
+        if not text:
+            return self._reconciler.committed, False
+        merged = join_text(self.config.language, self._reconciler.committed, text)
+        changed = merged != self._reconciler.committed
+        self._reconciler.committed = merged
+        return merged, changed
+
+    async def _commit_confirmed(
+        self,
+        confirmed: str,
+        provider_event_id: str | None,
+        *,
+        chunk_id: str | None = None,
+    ) -> None:
         """Merge provider-confirmed text and release any completed sentence units."""
         assert self.config is not None
         previous = self._reconciler.committed
-        committed, changed = self._reconciler.merge_confirmed(confirmed)
+        if chunk_id is not None:
+            committed, changed = self._merge_chunk(confirmed, chunk_id)
+        else:
+            committed, changed = self._reconciler.merge_confirmed(confirmed)
         if not changed or self._segmenter is None:
             return
         delta = committed[len(previous):] if committed.startswith(previous) else committed
@@ -539,6 +582,7 @@ class CloudStreamingAsrBase:
                 self.reconnect_count += 1
                 self._provider_confirmed = ""
                 self._provider_stash = ""
+                self._replay_merge_chunks = 2
                 if self._resampler is not None:
                     self._resampler = StreamingResampler(16_000, self.provider_sample_rate_hz)
                 self.reset_connection_state()
