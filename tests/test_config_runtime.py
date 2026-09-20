@@ -185,3 +185,17 @@ def test_router_can_select_hybrid_independently() -> None:
     assert route.asr_provider == "qwen_local"
     assert route.translation_provider == "qwen_cloud"
     assert route.status == DeploymentStatus.HYBRID
+
+
+def test_qwen_region_environment_override_selects_beijing(monkeypatch) -> None:
+    from echolingo.config.loader import load_config, qwen_region_from_environment
+
+    monkeypatch.delenv("ECHOLINGO_QWEN_REGION", raising=False)
+    assert qwen_region_from_environment() == "singapore"
+    assert load_config().asr.qwen_cloud.region == "singapore"
+    monkeypatch.setenv("ECHOLINGO_QWEN_REGION", "Beijing")
+    config = load_config()
+    assert config.asr.qwen_cloud.region == "beijing"
+    assert config.translation.qwen_cloud.region == "beijing"
+    monkeypatch.setenv("ECHOLINGO_QWEN_REGION", "mars")
+    assert load_config().asr.qwen_cloud.region == "singapore"

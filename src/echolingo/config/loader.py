@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 import tomllib
 from pathlib import Path
 from typing import Any, TypeVar, get_type_hints
@@ -34,6 +35,15 @@ def _merge_dataclass(instance: T, values: dict[str, Any], path: str) -> T:
     return instance
 
 
+QWEN_REGION_ENV = "ECHOLINGO_QWEN_REGION"
+
+
+def qwen_region_from_environment(default: str = "singapore") -> str:
+    """DashScope region. Beijing is the only region with new-user free quota."""
+    value = os.environ.get(QWEN_REGION_ENV, "").strip().lower()
+    return value if value in {"singapore", "beijing"} else default
+
+
 def load_config(path: Path | None = None) -> AppConfig:
     config = AppConfig()
     if path is not None:
@@ -43,6 +53,11 @@ def load_config(path: Path | None = None) -> AppConfig:
         except (OSError, tomllib.TOMLDecodeError) as error:
             raise ConfigurationError(f"cannot load config {path}: {error}") from error
         _merge_dataclass(config, values, "")
+    if os.environ.get(QWEN_REGION_ENV):
+        config.asr.qwen_cloud.region = qwen_region_from_environment(config.asr.qwen_cloud.region)
+        config.translation.qwen_cloud.region = qwen_region_from_environment(
+            config.translation.qwen_cloud.region
+        )
     config.validate()
     return config
 

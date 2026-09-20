@@ -30,3 +30,17 @@ routes remain supported, so either provider can stay local independently.
 The connection test is a configuration check, not a latency benchmark. The
 EN/ZH/JA/KO p50/p95 cloud benchmark remains `PENDING_CREDENTIALS` until it is
 run with an authorized account and real prerecorded fixtures.
+
+
+## Region and free quota
+
+Both cloud adapters support the Singapore (`ap-southeast-1`) and Beijing
+(`cn-beijing`) Model Studio regions; the default is Singapore. Alibaba Cloud
+Model Studio grants new-user free quota only in the Beijing region, so a
+mainland account that wants to use it must set `ECHOLINGO_QWEN_REGION=beijing`
+(the value is applied to both the ASR and translation route and to the
+Settings connection probe) and use an API key and workspace ID created in that
+region. Free quota is per model, expires after 90 days, and, when the
+"stop when exhausted" switch is on, the service answers HTTP 403
+`AllocationQuota.FreeTierOnly` once it is used up; EchoLingo reports that as a
+terminal authentication error for the session.

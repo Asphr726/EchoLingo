@@ -7,6 +7,7 @@ from typing import Any
 
 from ..backends.asr.cloud_qwen import CloudQwenAsrBackend
 from ..backends.translation.cloud_qwen_mt import CloudQwenMtBackend
+from ..config.loader import qwen_region_from_environment
 from ..errors import AuthenticationError, BackendError
 from ..models import TranslationRequest
 
@@ -18,14 +19,15 @@ async def probe_qwen_cloud(
     translation_factory: Callable[..., Any] = CloudQwenMtBackend,
 ) -> dict[str, Any]:
     """Probe cloud routes without uploading audio or returning provider content."""
+    region = qwen_region_from_environment()
     result: dict[str, Any] = {
         "ok": False,
-        "region": "singapore",
+        "region": region,
         "audio_uploaded": False,
         "asr": {"status": "pending"},
         "translation": {"status": "pending" if include_translation else "skipped"},
     }
-    asr = asr_factory(audio_upload_allowed=False)
+    asr = asr_factory(audio_upload_allowed=False, region=region)
     try:
         handshake_ms = await asr.probe_connection()
         result["asr"] = {
@@ -40,7 +42,7 @@ async def probe_qwen_cloud(
         return result
 
     if include_translation:
-        translation = translation_factory(transcript_upload_allowed=True)
+        translation = translation_factory(transcript_upload_allowed=True, region=region)
         started_ns = time.monotonic_ns()
         try:
             event = await translation.retranslate_window(
