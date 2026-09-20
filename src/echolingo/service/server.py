@@ -9,12 +9,15 @@ import sys
 from typing import Any
 
 from websockets.asyncio.server import ServerConnection, serve
+from websockets.exceptions import ConnectionClosed
 
 from ..backends import registry
 from .cloud_probe import probe_cloud
 from .parent_watchdog import start_parent_watchdog_from_environment
 from .protocol import PROTOCOL_VERSION, ProtocolError, decode_audio_packet
 from .session import DesktopInferenceSession
+
+log = logging.getLogger("echolingo.sidecar")
 
 
 def _event(event_type: str, payload: Any) -> str:
@@ -39,23 +42,16 @@ class SidecarConnection:
                     await self._audio(message)
                 else:
                     await self._command(json.loads(message))
+        except ConnectionClosed:
+            # The shell's readiness probe and a normal shutdown both close
+            # without a command; nothing to report.
+            pass
         except (json.JSONDecodeError, ProtocolError, KeyError, ValueError) as error:
-            await self.websocket.send(
-                _event("error", {"code": "invalid_request", "message": str(error), "recoverable": True})
-            )
+            await self._send_error("invalid_request", str(error))
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            await self.websocket.send(
-                _event(
-                    "error",
-                    {
-                        "code": "backend_start_failed",
-                        "message": str(error),
-                        "recoverable": True,
-                    },
-                )
-            )
+            await self._send_error("backend_start_failed", str(error))
         finally:
             if self.session is not None:
                 await self.session.close()
@@ -66,6 +62,14 @@ class SidecarConnection:
             if self.sender is not None:
                 self.sender.cancel()
                 await asyncio.gather(self.sender, return_exceptions=True)
+
+    async def _send_error(self, code: str, message: str) -> None:
+        try:
+            await self.websocket.send(
+                _event("error", {"code": code, "message": message, "recoverable": True})
+            )
+        except ConnectionClosed:
+            log.warning("sidecar error not delivered (%s): %s", code, message)
 
     async def _send_events(self) -> None:
         while True:
@@ -192,6 +196,9 @@ def main(argv: list[str] | None = None) -> int:
         level=os.environ.get("ECHOLINGO_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Per-connection chatter from the WebSocket library is not useful in
+    # logs/sidecar.log; provider probes and sessions log through "echolingo.*".
+    logging.getLogger("websockets").setLevel(logging.WARNING)
     parser = argparse.ArgumentParser(prog="echolingo-sidecar")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
