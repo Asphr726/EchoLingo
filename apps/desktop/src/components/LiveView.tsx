@@ -11,8 +11,18 @@ import {
 } from "@phosphor-icons/react";
 import { memo, type ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api } from "../lib/bridge";
+import {
+  effectiveProviderId,
+  findProvider,
+  languageName,
+  needsAudioUpload as catalogNeedsAudioUpload,
+  needsTranscriptUpload as catalogNeedsTranscriptUpload,
+  providerVendor,
+  supportsLanguage,
+} from "../lib/providers";
 import { useApp, useLiveMetrics } from "../state/AppContext";
 import type { SegmentSummary, StartSessionRequest } from "../types";
+import { ProviderSelect } from "./ProviderSelect";
 
 const languages = [
   ["en", "English"],
@@ -24,6 +34,7 @@ const languages = [
 export function LiveView() {
   const {
     actionPending,
+    catalog,
     devices,
     draft,
     loading,
@@ -36,12 +47,13 @@ export function LiveView() {
   } = useApp();
   const locked = !["IDLE", "COMPLETED"].includes(snapshot.phase);
   const microphones = devices.filter((device) => device.kind === "microphone");
-  const needsAudioUpload =
-    draft.asr_provider === "qwen_cloud" ||
-    (draft.inference_mode === "cloud" && draft.asr_provider === "auto");
-  const needsTranscriptUpload =
-    draft.translation_provider === "qwen_cloud" ||
-    (draft.inference_mode === "cloud" && draft.translation_provider === "auto");
+  const needsAudioUpload = catalogNeedsAudioUpload(catalog, draft);
+  const needsTranscriptUpload = catalogNeedsTranscriptUpload(catalog, draft);
+  const selectedAsr = findProvider(catalog, "asr", effectiveProviderId(draft, "asr") ?? "auto");
+  const languageUnsupported =
+    selectedAsr && !supportsLanguage(selectedAsr, draft.source_language)
+      ? `${selectedAsr.display_name} does not support ${languageName(draft.source_language)} as the source language.`
+      : null;
   const privacyBlocked =
     (needsAudioUpload && !draft.privacy.audio_upload_allowed) ||
     (needsTranscriptUpload && !draft.privacy.transcript_upload_allowed);
@@ -202,6 +214,9 @@ export function LiveView() {
           <p className="field-error" role="alert">
             Enable the required upload permission before starting this cloud route.
           </p>
+        )}
+        {!locked && languageUnsupported && (
+          <p className="field-error" role="alert">{languageUnsupported}</p>
         )}
 
         <TranscriptStage />
@@ -431,7 +446,7 @@ function TranscriptStage() {
 }
 
 function RoutePanel() {
-  const { draft, setDraft, snapshot } = useApp();
+  const { catalog, draft, setDraft, snapshot } = useApp();
   const locked = !["IDLE", "COMPLETED"].includes(snapshot.phase);
   const route = snapshot.route;
   return (
@@ -439,36 +454,31 @@ function RoutePanel() {
       <span className="section-kicker">Inference</span>
       <div className="backend-field">
         <label htmlFor="asr-provider">ASR provider</label>
-        <select
+        <ProviderSelect
           id="asr-provider"
+          kind="asr"
+          catalog={catalog}
+          sourceLanguage={draft.source_language}
           value={draft.asr_provider}
           disabled={locked}
-          onChange={(event) => setDraft((current) => ({ ...current, asr_provider: event.target.value }))}
-        >
-          <option value="auto">Auto select</option>
-          <option value="qwen_local">Qwen3-ASR local</option>
-          <option value="qwen_cloud">Qwen realtime cloud</option>
-          <option value="simulstreaming">Whisper fallback</option>
-          <option value="mock">Mock diagnostics</option>
-        </select>
+          onChange={(value) => setDraft((current) => ({ ...current, asr_provider: value }))}
+        />
       </div>
       <div className="backend-field">
         <label htmlFor="translation-provider">Translation provider</label>
-        <select
+        <ProviderSelect
           id="translation-provider"
+          kind="translation"
+          catalog={catalog}
+          sourceLanguage={draft.source_language}
           value={draft.translation_provider}
           disabled={locked}
-          onChange={(event) => setDraft((current) => ({ ...current, translation_provider: event.target.value }))}
-        >
-          <option value="auto">Auto select</option>
-          <option value="hymt_local">Hy-MT2 local</option>
-          <option value="qwen_cloud">Qwen-MT cloud</option>
-          <option value="mock">Mock diagnostics</option>
-        </select>
+          onChange={(value) => setDraft((current) => ({ ...current, translation_provider: value }))}
+        />
       </div>
       <dl className="route-summary">
-        <div><dt>ASR</dt><dd>{route?.asr_model ?? "Selected at start"}</dd></div>
-        <div><dt>Translation</dt><dd>{route?.translation_model ?? "Selected at start"}</dd></div>
+        <div><dt>ASR</dt><dd>{route?.asr_model ?? route?.asr_display_name ?? "Selected at start"}</dd></div>
+        <div><dt>Translation</dt><dd>{route?.translation_model ?? route?.translation_display_name ?? "Selected at start"}</dd></div>
       </dl>
       <p className="route-reason">
         {route?.reason ?? "Auto will use capability calibration, model availability, privacy, and network state."}
@@ -531,7 +541,15 @@ function LatencyPanel() {
 }
 
 function PrivacyDisclosure({ needsAudio, needsTranscript }: { needsAudio: boolean; needsTranscript: boolean }) {
-  const { draft, setDraft } = useApp();
+  const { catalog, draft, setDraft } = useApp();
+  const asrVendor = providerVendor(catalog, "asr", effectiveProviderId(draft, "asr") ?? "");
+  const translationVendor = providerVendor(catalog, "translation", effectiveProviderId(draft, "translation") ?? "");
+  const audioCopy = needsAudio
+    ? `Audio is uploaded to ${asrVendor}.`
+    : "Audio stays on this device.";
+  const transcriptCopy = needsTranscript
+    ? `Transcript text is sent to ${translationVendor}.`
+    : "Transcript text stays on this device.";
   return (
     <section className="privacy-disclosure">
       <div className="privacy-heading">
@@ -539,11 +557,9 @@ function PrivacyDisclosure({ needsAudio, needsTranscript }: { needsAudio: boolea
         <strong>{needsAudio || needsTranscript ? "Cloud data boundary" : "Local data boundary"}</strong>
       </div>
       <p>
-        {needsAudio
-          ? "Processed speech audio is sent to Alibaba Cloud Qwen ASR."
-          : needsTranscript
-            ? "Audio stays on this device. Source transcript text is sent to Qwen-MT."
-            : "Audio and transcript stay on this device unless Auto is allowed to choose cloud."}
+        {needsAudio || needsTranscript
+          ? `${audioCopy} ${transcriptCopy}`
+          : "Audio and transcript stay on this device unless Auto is allowed to choose cloud."}
       </p>
       {(needsAudio || draft.inference_mode === "auto") && (
         <label className="check-row">

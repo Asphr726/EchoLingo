@@ -5,9 +5,10 @@ import type {
   AudioPermissionStatus,
   AudioTestResult,
   CaptionPreferences,
-  CloudCredentialStatus,
   CloudProbeResult,
+  CredentialGroupStatus,
   ModelProgress,
+  ProviderCatalog,
   RuntimePreferences,
   ModelStatus,
   SessionDetail,
@@ -17,6 +18,11 @@ import type {
   UiEventEnvelope,
 } from "../types";
 import { defaultCaptionPreferences, defaultSessionDefaults, emptySnapshot } from "../types";
+// The committed catalog doubles as the browser-preview fixture. In the
+// desktop runtime the shell serves the same document via `list_providers`.
+import providerCatalogJson from "../../../../configs/providers.json";
+
+const previewCatalog = providerCatalogJson as unknown as ProviderCatalog;
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
 
@@ -44,10 +50,12 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
           route: {
             asr_provider: "qwen_local",
             asr_model: "qwen3-asr-0.6b",
+            asr_display_name: "Qwen3-ASR (local)",
             asr_locality: "local",
             asr_health: "connected",
             translation_provider: "hymt_local",
             translation_model: "tencent/Hy-MT2-1.8B",
+            translation_display_name: "Hy-MT2 (local)",
             translation_locality: "local",
             translation_health: "connected",
             deployment: "local",
@@ -75,7 +83,7 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
       },
     ] satisfies AudioDevice[],
     get_caption_preferences: defaultCaptionPreferences,
-    get_runtime_preferences: { preload_local_models: true } satisfies RuntimePreferences,
+    get_runtime_preferences: { preload_local_models: true, providers: {} } satisfies RuntimePreferences,
     get_session_defaults: defaultSessionDefaults,
     history_search: previewMode() ? [previewSessionRecord()] : [],
     history_open: previewMode()
@@ -91,11 +99,11 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
           })),
         } satisfies SessionDetail)
       : undefined,
-    credential_status: {
-      api_key_available: false,
-      workspace_id_available: false,
-      source: "none",
-    } satisfies CloudCredentialStatus,
+    list_providers: previewCatalog,
+    credential_status: previewCatalog.credential_groups.map((group) =>
+      previewGroupStatus(group.id, previewMode() && group.id === "dashscope" ? "keychain" : "none"),
+    ) satisfies CredentialGroupStatus[],
+    logs_directory: "~/Library/Logs/EchoLingo",
     list_models: [
       {
         id: "qwen3-asr-0.6b",
@@ -118,8 +126,77 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
   if (name === "update_caption_preferences" || name === "update_runtime_preferences") {
     return args?.preferences as T;
   }
+  if (name === "set_credentials") {
+    const typed = (args?.fields ?? {}) as Record<string, string>;
+    return previewGroupStatus(String(args?.groupId), "keychain", Object.keys(typed)) as T;
+  }
+  if (name === "clear_credentials") {
+    return previewGroupStatus(String(args?.groupId), "none") as T;
+  }
+  if (name === "update_provider_settings") {
+    return {
+      preload_local_models: true,
+      providers: { [String(args?.groupId)]: (args?.settings ?? {}) as Record<string, string> },
+    } satisfies RuntimePreferences as T;
+  }
+  if (name === "probe_cloud" && previewMode()) {
+    return previewProbe(
+      (args?.asrProvider as string | null | undefined) ?? null,
+      (args?.translationProvider as string | null | undefined) ?? null,
+    ) as T;
+  }
   if (name in values) return values[name] as T;
   throw new Error(`${name} requires the Tauri desktop runtime`);
+}
+
+/** Credential availability for the browser preview. `only` limits the
+ *  available fields (a save of a subset); otherwise every field of the
+ *  group follows `source`. Settings report the catalog defaults. */
+function previewGroupStatus(
+  groupId: string,
+  source: CredentialGroupStatus["fields"][number]["source"],
+  only?: string[],
+): CredentialGroupStatus {
+  const group = previewCatalog.credential_groups.find((entry) => entry.id === groupId);
+  return {
+    group_id: groupId,
+    fields: (group?.fields ?? []).map((field) => {
+      const available = source !== "none" && (only === undefined || only.includes(field.key));
+      return { key: field.key, available, source: available ? source : "none" };
+    }),
+    settings: Object.fromEntries((group?.settings ?? []).map((setting) => [setting.key, setting.default])),
+  };
+}
+
+/** A successful probe for the preview; no network is touched. */
+function previewProbe(asrProvider: string | null, translationProvider: string | null): CloudProbeResult {
+  const dashscope = asrProvider === "qwen_cloud" || translationProvider === "qwen_cloud";
+  return {
+    ok: true,
+    audio_uploaded: false,
+    asr: asrProvider
+      ? {
+          status: "connected",
+          provider: asrProvider,
+          model: asrProvider === "qwen_cloud" ? "qwen3-asr-flash-realtime" : null,
+          handshake_latency_ms: 412,
+          ...(asrProvider === "qwen_cloud"
+            ? { region: "singapore", host: "dashscope-intl.aliyuncs.com", workspace_scoped: true }
+            : {}),
+        }
+      : { status: "skipped" },
+    translation: translationProvider
+      ? {
+          status: "connected",
+          provider: translationProvider,
+          model: translationProvider === "qwen_cloud" ? "qwen-mt-turbo" : null,
+          latency_ms: 288,
+        }
+      : { status: "skipped" },
+    ...(dashscope
+      ? { region: "singapore", host: "dashscope-intl.aliyuncs.com", workspace_scoped: true }
+      : {}),
+  };
 }
 
 export async function subscribeUiEvents(
@@ -321,15 +398,23 @@ export const api = {
     command<StartSessionRequest>("update_session_defaults", { defaults }),
   updateCaptionPreferences: (preferences: CaptionPreferences) =>
     command<CaptionPreferences>("update_caption_preferences", { preferences }),
-  credentialStatus: () => command<CloudCredentialStatus>("credential_status"),
-  setCloudCredentials: (apiKey: string, workspaceId: string) =>
-    command<CloudCredentialStatus>("set_cloud_credentials", {
-      input: { api_key: apiKey, workspace_id: workspaceId },
-    }),
-  clearCloudCredentials: () =>
-    command<CloudCredentialStatus>("clear_cloud_credentials"),
-  probeQwenCloud: (includeTranslation: boolean) =>
-    command<CloudProbeResult>("probe_qwen_cloud", { includeTranslation }),
+  /** Provider catalog served by the shell (`configs/providers.json`). */
+  listProviders: () => command<ProviderCatalog>("list_providers"),
+  /** Availability of every credential group; values never leave the secure store. */
+  credentialStatus: () => command<CredentialGroupStatus[]>("credential_status"),
+  /** Store only the fields the user typed; untouched fields keep their value. */
+  setCredentials: (groupId: string, fields: Record<string, string>) =>
+    command<CredentialGroupStatus>("set_credentials", { groupId, fields }),
+  clearCredentials: (groupId: string) =>
+    command<CredentialGroupStatus>("clear_credentials", { groupId }),
+  updateProviderSettings: (groupId: string, settings: Record<string, string>) =>
+    command<RuntimePreferences>("update_provider_settings", { groupId, settings }),
+  /** Recognition probes complete the handshake only and upload no audio;
+   *  a translation probe sends one fixed sentence, so callers pass it only
+   *  when transcript upload is allowed. */
+  probeCloud: (asrProvider: string | null, translationProvider: string | null) =>
+    command<CloudProbeResult>("probe_cloud", { asrProvider, translationProvider }),
+  logsDirectory: () => command<string>("logs_directory"),
   models: () => command<ModelStatus[]>("list_models"),
   installModel: (modelId: string) =>
     command<ModelStatus>("install_model", { modelId }),

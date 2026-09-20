@@ -14,6 +14,7 @@ import type {
   AudioDevice,
   CaptionPreferences,
   LiveMetrics,
+  ProviderCatalog,
   SessionSnapshot,
   StartSessionRequest,
   UiEventEnvelope,
@@ -38,6 +39,8 @@ interface AppContextValue {
   setDraft: Dispatch<SetStateAction<StartSessionRequest>>;
   devices: AudioDevice[];
   caption: CaptionPreferences;
+  /** Provider catalog from `list_providers`; null until it has loaded. */
+  catalog: ProviderCatalog | null;
   loading: boolean;
   actionPending: boolean;
   onboardingComplete: boolean;
@@ -162,6 +165,19 @@ export function applyUiEvent(snapshot: SessionSnapshot, event: UiEventEnvelope):
   return snapshot;
 }
 
+/** Session defaults persisted by an older shell may predate the cloud
+ *  preference fields; fill them from the built-in defaults so the provider
+ *  selects stay controlled. */
+export function withProviderDefaults(defaults: Partial<StartSessionRequest>): StartSessionRequest {
+  return {
+    ...defaultSessionDefaults,
+    ...defaults,
+    cloud_asr_preference: defaults.cloud_asr_preference || defaultSessionDefaults.cloud_asr_preference,
+    cloud_translation_preference:
+      defaults.cloud_translation_preference || defaultSessionDefaults.cloud_translation_preference,
+  };
+}
+
 /** Keep live text that arrived between a command's emit and its reply. */
 export function mergeCommandSnapshot(current: SessionSnapshot, next: SessionSnapshot): SessionSnapshot {
   if (
@@ -184,6 +200,7 @@ export function AppProvider({ children }: PropsWithChildren) {
   const [draft, setDraft] = useState<StartSessionRequest>(defaultDraft);
   const [devices, setDevices] = useState<AudioDevice[]>([]);
   const [caption, setCaption] = useState<CaptionPreferences>(defaultCaptionPreferences);
+  const [catalog, setCatalog] = useState<ProviderCatalog | null>(null);
   const [loading, setLoading] = useState(true);
   const [actionPending, setActionPending] = useState(false);
   const [onboardingComplete, setOnboardingComplete] = useState(true);
@@ -205,7 +222,7 @@ export function AppProvider({ children }: PropsWithChildren) {
         setMetrics(nextSnapshot.metrics);
         setOnboardingComplete(nextOnboarding);
         setDraft({
-          ...nextDefaults,
+          ...withProviderDefaults(nextDefaults),
           expected_state_revision: nextSnapshot.state_revision,
           asr_provider: smokeBackend ? "mock" : nextDefaults.asr_provider,
           translation_provider: smokeBackend ? "mock" : nextDefaults.translation_provider,
@@ -221,6 +238,13 @@ export function AppProvider({ children }: PropsWithChildren) {
       })
       .catch((failure) => active && setError(message(failure)))
       .finally(() => active && setLoading(false));
+    // The catalog is static for the life of the shell; a failure leaves the
+    // provider selects on Auto plus the persisted value rather than blocking
+    // the app.
+    api
+      .listProviders()
+      .then((nextCatalog) => active && setCatalog(nextCatalog))
+      .catch(() => undefined);
     subscribeUiEvents((event) => {
       if (event.kind === "metrics") {
         setMetrics((current) => ({ ...current, ...(event.payload as Partial<LiveMetrics>) }));
@@ -322,6 +346,7 @@ export function AppProvider({ children }: PropsWithChildren) {
       setDraft,
       devices,
       caption,
+      catalog,
       loading,
       actionPending,
       onboardingComplete,
@@ -337,6 +362,7 @@ export function AppProvider({ children }: PropsWithChildren) {
     [
       actionPending,
       caption,
+      catalog,
       devices,
       draft,
       error,

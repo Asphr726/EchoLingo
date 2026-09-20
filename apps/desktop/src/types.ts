@@ -29,16 +29,23 @@ export interface StartSessionRequest {
   inference_mode: InferenceMode;
   asr_provider: string;
   translation_provider: string;
+  /** Cloud recognizer the Auto route falls back to when the local model
+   *  misses its latency target. A provider id from the catalog. */
+  cloud_asr_preference: string;
+  /** Cloud translator used by the Auto route, as above. */
+  cloud_translation_preference: string;
   privacy: PrivacyPolicy;
 }
 
 export interface RouteStatus {
   asr_provider: string;
   asr_model: string | null;
+  asr_display_name: string | null;
   asr_locality: string;
   asr_health: string;
   translation_provider: string;
   translation_model: string | null;
+  translation_display_name: string | null;
   translation_locality: string;
   translation_health: string;
   deployment: string;
@@ -136,6 +143,9 @@ export interface AudioTestResult {
 
 export interface RuntimePreferences {
   preload_local_models: boolean;
+  /** Non-secret provider settings keyed by credential group id, then by
+   *  setting key (for example `{ dashscope: { region: "beijing" } }`). */
+  providers: Record<string, Record<string, string>>;
 }
 
 export interface CaptionPreferences {
@@ -145,28 +155,123 @@ export interface CaptionPreferences {
   opacity: number;
 }
 
-export interface CloudCredentialStatus {
-  api_key_available: boolean;
-  workspace_id_available: boolean;
-  source: "macos_keychain" | "environment" | "none";
+// ---------------------------------------------------------------------------
+// Provider catalog (mirrors configs/providers.json, exported by the Python
+// registry which is the single source of truth for provider ids and flags).
+
+export type ProviderKind = "asr" | "translation";
+export type ProviderLocality = "local" | "cloud" | "mock";
+
+export interface ProviderSpec {
+  id: string;
+  kind: ProviderKind;
+  display_name: string;
+  vendor: string;
+  description: string;
+  locality: ProviderLocality;
+  /** Credential group id, or null for local and mock providers. */
+  credential_group: string | null;
+  local_service_id: string | null;
+  /** Supported source languages; empty means no restriction. */
+  languages: string[];
+  audio_upload_required: boolean;
+  transcript_upload_required: boolean;
+  streaming_partials: boolean;
+  auto_route_eligible: boolean;
+  selectable: boolean;
 }
 
+export interface CredentialField {
+  key: string;
+  label: string;
+  env_var: string;
+  keychain_account: string;
+  secret: boolean;
+  required: boolean;
+  min_len: number;
+}
+
+export interface ProviderSetting {
+  key: string;
+  label: string;
+  env_var: string;
+  kind: "select" | "text";
+  default: string;
+  /** `[value, label]` pairs for `select` settings; empty for `text`. */
+  options: Array<[string, string]>;
+  placeholder: string;
+}
+
+export interface CredentialGroup {
+  id: string;
+  display_name: string;
+  vendor: string;
+  docs_url: string;
+  free_tier_note: string;
+  fields: CredentialField[];
+  settings: ProviderSetting[];
+}
+
+export interface ProviderCatalog {
+  schema_version: number;
+  asr: ProviderSpec[];
+  translation: ProviderSpec[];
+  credential_groups: CredentialGroup[];
+}
+
+export type CredentialSource = "keychain" | "environment" | "none";
+
+export interface CredentialFieldStatus {
+  key: string;
+  available: boolean;
+  source: CredentialSource;
+}
+
+/** Availability of one credential group. Values never leave the secure
+ *  store; only presence and origin are reported. */
+export interface CredentialGroupStatus {
+  group_id: string;
+  fields: CredentialFieldStatus[];
+  /** Effective non-secret settings (runtime preferences over defaults). */
+  settings: Record<string, string>;
+}
+
+export type CloudProbeRoleStatus =
+  | "connected"
+  | "failed"
+  | "skipped"
+  | "pending"
+  | "not_tested";
+
+export interface CloudProbeAsrResult {
+  status: CloudProbeRoleStatus;
+  provider?: string;
+  model?: string | null;
+  handshake_latency_ms?: number;
+  region?: string;
+  host?: string;
+  workspace_scoped?: boolean;
+}
+
+export interface CloudProbeTranslationResult {
+  status: CloudProbeRoleStatus;
+  provider?: string;
+  model?: string | null;
+  latency_ms?: number;
+}
+
+/** Result of `probe_cloud`. Recognition probes complete the authenticated
+ *  handshake only; `audio_uploaded` is always false. */
 export interface CloudProbeResult {
   ok: boolean;
-  region: string;
   audio_uploaded: boolean;
+  asr: CloudProbeAsrResult;
+  translation: CloudProbeTranslationResult;
   code?: string;
   message?: string;
-  asr: {
-    status: string;
-    model?: string;
-    handshake_latency_ms?: number;
-  };
-  translation: {
-    status: string;
-    model?: string;
-    latency_ms?: number;
-  };
+  region?: string;
+  host?: string;
+  workspace_scoped?: boolean;
 }
 
 export type ModelInstallState = "not_downloaded" | "installing" | "ready" | "corrupt";
@@ -284,6 +389,8 @@ export const defaultSessionDefaults: StartSessionRequest = {
   inference_mode: "auto",
   asr_provider: "auto",
   translation_provider: "auto",
+  cloud_asr_preference: "qwen_cloud",
+  cloud_translation_preference: "qwen_cloud",
   privacy: {
     audio_upload_allowed: false,
     transcript_upload_allowed: false,

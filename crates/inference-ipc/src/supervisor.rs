@@ -2,7 +2,7 @@ use crate::{Hello, SidecarCommand, SidecarEvent, PROTOCOL_VERSION};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +14,10 @@ use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
 
+/// Upper bound for one sidecar stderr log file before it rotates to `<name>.1`.
+pub const SIDECAR_LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
+const DIAGNOSTICS_RING_BYTES: usize = 16 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct SidecarLaunchConfig {
     pub project_root: PathBuf,
@@ -21,6 +25,11 @@ pub struct SidecarLaunchConfig {
     pub executable: Option<PathBuf>,
     pub configured_url: Option<String>,
     pub startup_timeout: Duration,
+    /// When set, every sidecar stderr chunk is appended to this file (parent
+    /// directories are created; the file rotates to `<name>.1` past
+    /// [`SIDECAR_LOG_ROTATE_BYTES`]) in addition to the in-memory diagnostics
+    /// ring used for startup failures. `None` keeps stderr in memory only.
+    pub log_path: Option<PathBuf>,
 }
 
 impl SidecarLaunchConfig {
@@ -31,6 +40,7 @@ impl SidecarLaunchConfig {
             executable: std::env::var_os("ECHOLINGO_SIDECAR_EXECUTABLE").map(PathBuf::from),
             configured_url: std::env::var("ECHOLINGO_SIDECAR_URL").ok(),
             startup_timeout: Duration::from_secs(15),
+            log_path: None,
         }
     }
 
@@ -75,6 +85,8 @@ pub struct InferenceSupervisor {
     child: Mutex<Option<Child>>,
     events: broadcast::Sender<SidecarEvent>,
     secret_environment: Mutex<HashMap<String, String>>,
+    /// `providers_digest` from the last accepted hello, when the sidecar sent one.
+    providers_digest: Mutex<Option<String>>,
 }
 
 impl InferenceSupervisor {
@@ -86,7 +98,14 @@ impl InferenceSupervisor {
             child: Mutex::new(None),
             events,
             secret_environment: Mutex::new(HashMap::new()),
+            providers_digest: Mutex::new(None),
         })
+    }
+
+    /// The provider-catalog digest the running sidecar reported in its hello,
+    /// for comparison with the catalog embedded in the shell.
+    pub async fn providers_digest(&self) -> Option<String> {
+        self.providers_digest.lock().await.clone()
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<SidecarEvent> {
@@ -155,19 +174,38 @@ impl InferenceSupervisor {
             }
             let mut child = command.spawn().map_err(SupervisorError::Launch)?;
             let diagnostics = Arc::new(Mutex::new(Vec::new()));
+            let log_path = self.config.log_path.clone();
             let stderr_task = child.stderr.take().map(|mut stderr| {
                 let diagnostics = diagnostics.clone();
                 tokio::spawn(async move {
                     let mut chunk = [0_u8; 2048];
+                    let mut log_failed = false;
                     while let Ok(read) = stderr.read(&mut chunk).await {
                         if read == 0 {
                             break;
                         }
-                        let mut output = diagnostics.lock().await;
-                        output.extend_from_slice(&chunk[..read]);
-                        if output.len() > 16 * 1024 {
-                            let excess = output.len() - 16 * 1024;
-                            output.drain(..excess);
+                        {
+                            let mut output = diagnostics.lock().await;
+                            output.extend_from_slice(&chunk[..read]);
+                            if output.len() > DIAGNOSTICS_RING_BYTES {
+                                let excess = output.len() - DIAGNOSTICS_RING_BYTES;
+                                output.drain(..excess);
+                            }
+                        }
+                        if let Some(path) = log_path.as_deref() {
+                            if !log_failed {
+                                if let Err(error) =
+                                    append_log_chunk(path, &chunk[..read], SIDECAR_LOG_ROTATE_BYTES)
+                                {
+                                    // Logging never interferes with the sidecar;
+                                    // report once and keep the in-memory ring.
+                                    eprintln!(
+                                        "sidecar log file unavailable ({}): {error}",
+                                        path.display()
+                                    );
+                                    log_failed = true;
+                                }
+                            }
                         }
                     }
                 })
@@ -214,15 +252,18 @@ impl InferenceSupervisor {
                 .map_err(|error| SupervisorError::Protocol(error.to_string()))?,
         )
         .map_err(|error| SupervisorError::Protocol(error.to_string()))?;
-        if !matches!(
-            event,
+        match event {
             SidecarEvent::HelloAccepted {
-                protocol_version: PROTOCOL_VERSION
+                protocol_version: PROTOCOL_VERSION,
+                providers_digest,
+            } => {
+                *self.providers_digest.lock().await = providers_digest;
             }
-        ) {
-            return Err(SupervisorError::Protocol(
-                "sidecar rejected protocol hello".into(),
-            ));
+            _ => {
+                return Err(SupervisorError::Protocol(
+                    "sidecar rejected protocol hello".into(),
+                ))
+            }
         }
 
         let (mut writer, mut reader) = websocket.split();
@@ -365,11 +406,73 @@ impl InferenceSupervisor {
     }
 }
 
+/// Append one stderr chunk to `path`, creating parent directories and rotating
+/// the current file to `<name>.1` (replacing any previous `.1`) once it would
+/// exceed `max_bytes`. Chunks are written verbatim; the sidecar itself never
+/// logs credentials.
+pub fn append_log_chunk(path: &Path, chunk: &[u8], max_bytes: u64) -> std::io::Result<()> {
+    use std::io::Write;
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let current_len = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    if current_len > 0 && current_len + chunk.len() as u64 > max_bytes {
+        let rotated = rotated_log_path(path);
+        let _ = std::fs::remove_file(&rotated);
+        std::fs::rename(path, &rotated)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(chunk)
+}
+
+fn rotated_log_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| "sidecar.log".into());
+    name.push(".1");
+    path.with_file_name(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::AudioFrameHeader;
     use serde_json::json;
+
+    #[test]
+    fn stderr_log_appends_creates_parents_and_rotates() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("logs/nested/sidecar.log");
+        append_log_chunk(&path, b"first line\n", 32).unwrap();
+        append_log_chunk(&path, b"second line\n", 32).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "first line\nsecond line\n"
+        );
+        // 23 bytes so far; the next chunk would exceed 32 and rotates first.
+        append_log_chunk(&path, b"third line\n", 32).unwrap();
+        let rotated = directory.path().join("logs/nested/sidecar.log.1");
+        assert_eq!(
+            std::fs::read_to_string(&rotated).unwrap(),
+            "first line\nsecond line\n"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "third line\n");
+        // A second rotation replaces the previous `.1` rather than stacking.
+        append_log_chunk(&path, &[b'x'; 30], 32).unwrap();
+        assert_eq!(std::fs::read_to_string(&rotated).unwrap(), "third line\n");
+        assert_eq!(std::fs::read(&path).unwrap().len(), 30);
+        // A chunk larger than the limit on an empty file is still written.
+        std::fs::remove_file(&path).unwrap();
+        append_log_chunk(&path, &[b'y'; 40], 32).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap().len(), 40);
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -393,6 +496,7 @@ mod tests {
             executable: Some(executable),
             configured_url: None,
             startup_timeout: Duration::from_secs(5),
+            log_path: Some(directory.path().join("logs/sidecar.log")),
         });
         let started = std::time::Instant::now();
         let error = supervisor.ensure_started().await.unwrap_err();
@@ -407,6 +511,8 @@ mod tests {
             ),
             "unexpected startup error: {error:?}"
         );
+        let logged = std::fs::read_to_string(directory.path().join("logs/sidecar.log")).unwrap();
+        assert!(logged.contains("incompatible embedded library signature"));
     }
 
     #[tokio::test]
@@ -424,6 +530,7 @@ mod tests {
             executable: executable.clone(),
             configured_url: None,
             startup_timeout: Duration::from_secs(if executable.is_some() { 120 } else { 20 }),
+            log_path: None,
         });
         supervisor.ensure_started().await.unwrap();
         let mut events = supervisor.subscribe();

@@ -6,7 +6,10 @@ use std::convert::TryInto;
 use uuid::Uuid;
 
 mod supervisor;
-pub use supervisor::{InferenceSupervisor, SidecarLaunchConfig, SupervisorError};
+pub use supervisor::{
+    append_log_chunk, InferenceSupervisor, SidecarLaunchConfig, SupervisorError,
+    SIDECAR_LOG_ROTATE_BYTES,
+};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const AUDIO_MAGIC: [u8; 4] = *b"ELAF";
@@ -25,9 +28,16 @@ pub struct Hello {
 pub enum SidecarCommand {
     Hello(Hello),
     PlanSession(Value),
+    /// Validate cloud credentials/reachability for the named providers. ASR
+    /// probes perform the authenticated handshake only and upload no audio;
+    /// translation probes translate one fixed sentence. Omitted providers are
+    /// skipped.
     ProbeCloud {
         request_id: Uuid,
-        include_translation: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        asr_provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        translation_provider: Option<String>,
     },
     StartSession(Value),
     Pause {
@@ -49,6 +59,10 @@ pub enum SidecarCommand {
 pub enum SidecarEvent {
     HelloAccepted {
         protocol_version: u16,
+        /// SHA-256 of the sidecar's provider catalog JSON, so the shell can
+        /// detect a stale embedded `configs/providers.json`.
+        #[serde(default)]
+        providers_digest: Option<String>,
     },
     Ready {
         session_id: Uuid,
@@ -215,10 +229,39 @@ mod tests {
         let probe_id = Uuid::nil();
         let probe = serde_json::to_value(SidecarCommand::ProbeCloud {
             request_id: probe_id,
-            include_translation: true,
+            asr_provider: Some("deepgram".into()),
+            translation_provider: None,
         })
         .unwrap();
         assert_eq!(probe["type"], "probe_cloud");
         assert_eq!(probe["payload"]["request_id"], probe_id.to_string());
+        assert_eq!(probe["payload"]["asr_provider"], "deepgram");
+        assert!(probe["payload"].get("translation_provider").is_none());
+        assert!(probe["payload"].get("include_translation").is_none());
+    }
+
+    #[test]
+    fn hello_accepted_tolerates_sidecars_without_a_catalog_digest() {
+        let legacy: SidecarEvent = serde_json::from_value(serde_json::json!({
+            "type": "hello_accepted",
+            "payload": {"protocol_version": PROTOCOL_VERSION}
+        }))
+        .unwrap();
+        assert_eq!(
+            legacy,
+            SidecarEvent::HelloAccepted {
+                protocol_version: PROTOCOL_VERSION,
+                providers_digest: None
+            }
+        );
+        let current: SidecarEvent = serde_json::from_value(serde_json::json!({
+            "type": "hello_accepted",
+            "payload": {"protocol_version": PROTOCOL_VERSION, "providers_digest": "abc"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            current,
+            SidecarEvent::HelloAccepted { providers_digest: Some(digest), .. } if digest == "abc"
+        ));
     }
 }

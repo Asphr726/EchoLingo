@@ -6,6 +6,12 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod providers;
+pub use providers::{
+    catalog, catalog_digest, catalog_value, CredentialField, CredentialGroup, Locality,
+    ProviderCatalog, ProviderKind, ProviderSetting, ProviderSpec,
+};
+
 pub const PRODUCT_PHASE: &str = "phase4";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,7 +68,18 @@ pub struct StartSessionRequest {
     pub inference_mode: InferenceMode,
     pub asr_provider: String,
     pub translation_provider: String,
+    /// Which cloud ASR provider the Auto/Cloud route may fall over to. Only
+    /// consulted when the route leaves the device and consent was given.
+    #[serde(default = "default_cloud_preference")]
+    pub cloud_asr_preference: String,
+    /// Which cloud translation provider the Auto/Cloud route may use.
+    #[serde(default = "default_cloud_preference")]
+    pub cloud_translation_preference: String,
     pub privacy: PrivacyPolicy,
+}
+
+fn default_cloud_preference() -> String {
+    "qwen_cloud".into()
 }
 
 impl Default for StartSessionRequest {
@@ -77,6 +94,8 @@ impl Default for StartSessionRequest {
             inference_mode: InferenceMode::Auto,
             asr_provider: "auto".into(),
             translation_provider: "auto".into(),
+            cloud_asr_preference: default_cloud_preference(),
+            cloud_translation_preference: default_cloud_preference(),
             privacy: PrivacyPolicy::default(),
         }
     }
@@ -87,10 +106,14 @@ pub struct RouteStatus {
     pub asr_provider: String,
     pub asr_model: Option<String>,
     pub asr_locality: String,
+    #[serde(default)]
+    pub asr_display_name: Option<String>,
     pub asr_health: BackendHealth,
     pub translation_provider: String,
     pub translation_model: Option<String>,
     pub translation_locality: String,
+    #[serde(default)]
+    pub translation_display_name: Option<String>,
     pub translation_health: BackendHealth,
     pub deployment: String,
     pub reason: String,
@@ -98,14 +121,24 @@ pub struct RouteStatus {
 
 impl RouteStatus {
     pub fn starting(request: &StartSessionRequest) -> Self {
+        let display_name = |kind: ProviderKind, id: &str| {
+            catalog()
+                .find(kind, id)
+                .map(|spec| spec.display_name.clone())
+        };
         Self {
             asr_provider: request.asr_provider.clone(),
             asr_model: None,
             asr_locality: "pending".into(),
+            asr_display_name: display_name(ProviderKind::Asr, &request.asr_provider),
             asr_health: BackendHealth::Starting,
             translation_provider: request.translation_provider.clone(),
             translation_model: None,
             translation_locality: "pending".into(),
+            translation_display_name: display_name(
+                ProviderKind::Translation,
+                &request.translation_provider,
+            ),
             translation_health: BackendHealth::Starting,
             deployment: "pending".into(),
             reason: "Runtime calibration and privacy policy are being evaluated".into(),
@@ -223,6 +256,8 @@ pub enum SessionError {
     AudioUploadNotAllowed,
     #[error("cloud translation requires explicit transcript upload consent")]
     TranscriptUploadNotAllowed,
+    #[error("unknown provider: {0}")]
+    UnknownProvider(String),
 }
 
 #[derive(Debug, Default)]
@@ -601,12 +636,43 @@ impl AppCore {
     }
 }
 
+/// Gate explicit provider selections on the catalog's privacy flags.
+///
+/// `auto` defers to the sidecar's route planner, which enforces the same
+/// flags against the resolved provider; every other id must exist in the
+/// catalog for its kind. Cloud preferences only name which cloud provider the
+/// planner may pick, so they must be cloud ids but carry no consent of their
+/// own: without the privacy flag the planner simply stays local.
 fn validate_privacy(request: &StartSessionRequest) -> Result<(), SessionError> {
-    if request.asr_provider == "qwen_cloud" && !request.privacy.audio_upload_allowed {
-        return Err(SessionError::AudioUploadNotAllowed);
+    let catalog = catalog();
+    for (kind, id) in [
+        (ProviderKind::Asr, request.asr_provider.as_str()),
+        (ProviderKind::Translation, request.translation_provider.as_str()),
+    ] {
+        if id == "auto" {
+            continue;
+        }
+        let spec = catalog
+            .find(kind, id)
+            .ok_or_else(|| SessionError::UnknownProvider(format!("{kind}:{id}")))?;
+        if spec.audio_upload_required && !request.privacy.audio_upload_allowed {
+            return Err(SessionError::AudioUploadNotAllowed);
+        }
+        if spec.transcript_upload_required && !request.privacy.transcript_upload_allowed {
+            return Err(SessionError::TranscriptUploadNotAllowed);
+        }
     }
-    if request.translation_provider == "qwen_cloud" && !request.privacy.transcript_upload_allowed {
-        return Err(SessionError::TranscriptUploadNotAllowed);
+    for (kind, id) in [
+        (ProviderKind::Asr, request.cloud_asr_preference.as_str()),
+        (
+            ProviderKind::Translation,
+            request.cloud_translation_preference.as_str(),
+        ),
+    ] {
+        match catalog.find(kind, id) {
+            Some(spec) if spec.is_cloud() => {}
+            _ => return Err(SessionError::UnknownProvider(format!("{kind}:{id}"))),
+        }
     }
     Ok(())
 }
@@ -620,10 +686,12 @@ mod tests {
             asr_provider: "qwen_local".into(),
             asr_model: Some("qwen3-asr-0.6b".into()),
             asr_locality: "local".into(),
+            asr_display_name: Some("Qwen3-ASR (local)".into()),
             asr_health: BackendHealth::Connected,
             translation_provider: "hymt_local".into(),
             translation_model: Some("hymt2-1.8b".into()),
             translation_locality: "local".into(),
+            translation_display_name: Some("Hy-MT2 (local)".into()),
             translation_health: BackendHealth::Connected,
             deployment: "local".into(),
             reason: "Local calibration meets realtime SLA".into(),
@@ -677,6 +745,106 @@ mod tests {
         assert_eq!(
             core.start(request),
             Err(SessionError::TranscriptUploadNotAllowed)
+        );
+        // Every cloud adapter in the catalog is gated the same way.
+        for spec in catalog().specs(ProviderKind::Asr) {
+            if spec.is_cloud() {
+                let mut request = StartSessionRequest::default();
+                request.asr_provider = spec.id.clone();
+                assert_eq!(core.start(request), Err(SessionError::AudioUploadNotAllowed));
+            }
+        }
+        for spec in catalog().specs(ProviderKind::Translation) {
+            if spec.is_cloud() {
+                let mut request = StartSessionRequest::default();
+                request.translation_provider = spec.id.clone();
+                assert_eq!(
+                    core.start(request),
+                    Err(SessionError::TranscriptUploadNotAllowed)
+                );
+            }
+        }
+        let mut request = StartSessionRequest::default();
+        request.asr_provider = "deepgram".into();
+        request.translation_provider = "deepl".into();
+        request.privacy = PrivacyPolicy {
+            audio_upload_allowed: true,
+            transcript_upload_allowed: true,
+        };
+        assert_eq!(core.start(request).unwrap().phase, SessionPhase::Starting);
+    }
+
+    #[test]
+    fn unknown_providers_and_non_cloud_preferences_are_rejected() {
+        let mut core = AppCore::default();
+        let mut request = StartSessionRequest::default();
+        request.asr_provider = "whisper_cloud".into();
+        assert_eq!(
+            core.start(request),
+            Err(SessionError::UnknownProvider("asr:whisper_cloud".into()))
+        );
+        let mut request = StartSessionRequest::default();
+        request.translation_provider = "qwen_local".into();
+        assert_eq!(
+            core.start(request),
+            Err(SessionError::UnknownProvider("translation:qwen_local".into()))
+        );
+        let mut request = StartSessionRequest::default();
+        request.cloud_asr_preference = "qwen_local".into();
+        assert_eq!(
+            core.start(request),
+            Err(SessionError::UnknownProvider("asr:qwen_local".into()))
+        );
+        // Auto with a cloud preference needs no consent up front: the planner
+        // stays local until the privacy flag is set.
+        let mut request = StartSessionRequest::default();
+        request.cloud_asr_preference = "deepgram".into();
+        request.cloud_translation_preference = "deepl".into();
+        let starting = core.start(request).unwrap();
+        assert_eq!(starting.phase, SessionPhase::Starting);
+        let route = starting.route.unwrap();
+        assert_eq!(route.asr_display_name, None);
+        assert_eq!(route.asr_locality, "pending");
+    }
+
+    #[test]
+    fn requests_and_routes_deserialize_without_the_new_fields() {
+        let request: StartSessionRequest = serde_json::from_value(serde_json::json!({
+            "expected_state_revision": 0,
+            "source_language": "en",
+            "target_language": "zh",
+            "audio_source": "microphone",
+            "audio_device_id": null,
+            "audio_profile": "lecture",
+            "inference_mode": "auto",
+            "asr_provider": "qwen_local",
+            "translation_provider": "hymt_local",
+            "privacy": {"audio_upload_allowed": false, "transcript_upload_allowed": false}
+        }))
+        .unwrap();
+        assert_eq!(request.cloud_asr_preference, "qwen_cloud");
+        assert_eq!(request.cloud_translation_preference, "qwen_cloud");
+        let serialized = serde_json::to_value(&request).unwrap();
+        assert_eq!(serialized["cloud_asr_preference"], "qwen_cloud");
+        let route: RouteStatus = serde_json::from_value(serde_json::json!({
+            "asr_provider": "qwen_local",
+            "asr_model": null,
+            "asr_locality": "local",
+            "asr_health": "connected",
+            "translation_provider": "hymt_local",
+            "translation_model": null,
+            "translation_locality": "local",
+            "translation_health": "connected",
+            "deployment": "local",
+            "reason": "ok"
+        }))
+        .unwrap();
+        assert_eq!(route.asr_display_name, None);
+        let starting = RouteStatus::starting(&request);
+        assert_eq!(starting.asr_display_name.as_deref(), Some("Qwen3-ASR (local)"));
+        assert_eq!(
+            starting.translation_display_name.as_deref(),
+            Some("Hy-MT2 (local)")
         );
     }
 

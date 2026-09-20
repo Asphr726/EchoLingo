@@ -1,5 +1,6 @@
 use app_core::{
-    AppCore, AudioSourceKind as AppAudioSourceKind, BackendHealth, LiveMetrics, RouteStatus,
+    catalog, catalog_digest, catalog_value, AppCore, AudioSourceKind as AppAudioSourceKind, BackendHealth,
+    CredentialGroup, LiveMetrics, ProviderCatalog, ProviderKind, ProviderSetting, RouteStatus,
     SegmentSummary, SessionPhase, SessionSnapshot, StartSessionRequest,
 };
 use audio_core::{
@@ -10,8 +11,9 @@ use audio_core::{
     PermissionKind, PermissionState,
 };
 use inference_ipc::{
-    AudioFrameHeader, InferenceSupervisor, SidecarCommand, SidecarEvent, SidecarLaunchConfig,
-    UiEventEnvelope, UiEventKind, PROTOCOL_VERSION,
+    append_log_chunk, AudioFrameHeader, InferenceSupervisor, SidecarCommand, SidecarEvent,
+    SidecarLaunchConfig, UiEventEnvelope, UiEventKind, PROTOCOL_VERSION,
+    SIDECAR_LOG_ROTATE_BYTES,
 };
 #[cfg(target_os = "macos")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -34,23 +36,35 @@ use transcript_store::{
 const UI_EVENT_CHANNEL: &str = "echolingo://ui-event";
 const MODEL_PROGRESS_CHANNEL: &str = "echolingo://model-progress";
 const KEYCHAIN_SERVICE: &str = "app.echolingo.desktop";
-const DASHSCOPE_API_KEY_ACCOUNT: &str = "dashscope-api-key";
-const DASHSCOPE_WORKSPACE_ACCOUNT: &str = "dashscope-workspace-id";
+const DESKTOP_LOG_FILE: &str = "desktop.log";
+const SIDECAR_LOG_FILE: &str = "sidecar.log";
 
+/// Non-secret provider settings, keyed by credential group id and then by
+/// `ProviderSetting.key` (for example `{"dashscope": {"region": "beijing"}}`).
+type ProviderSettings = HashMap<String, HashMap<String, String>>;
+
+/// OS secure-store access. Account names come from the catalog
+/// (`CredentialField.keychain_account`) so adding a provider never touches
+/// this code. Secret values are never logged, never returned to the webview
+/// and never included in error messages.
 #[derive(Default)]
 struct CredentialStore;
 
-#[derive(Debug, Clone, Serialize)]
-struct CloudCredentialStatus {
-    api_key_available: bool,
-    workspace_id_available: bool,
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct CredentialFieldStatus {
+    key: String,
+    available: bool,
+    /// `keychain` | `environment` | `none`
     source: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct CloudCredentialInput {
-    api_key: String,
-    workspace_id: String,
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct CredentialGroupStatus {
+    group_id: String,
+    fields: Vec<CredentialFieldStatus>,
+    /// Effective non-secret settings: the stored preference, else the process
+    /// environment, else the catalog default (empty defaults are omitted).
+    settings: HashMap<String, String>,
 }
 
 impl CredentialStore {
@@ -79,49 +93,315 @@ impl CredentialStore {
         }
     }
 
-    fn status(&self) -> Result<CloudCredentialStatus, String> {
-        let keychain_key = Self::get(DASHSCOPE_API_KEY_ACCOUNT)?.is_some();
-        let keychain_workspace = Self::get(DASHSCOPE_WORKSPACE_ACCOUNT)?.is_some();
-        let environment_key = std::env::var_os("DASHSCOPE_API_KEY").is_some();
-        let environment_workspace = std::env::var_os("DASHSCOPE_WORKSPACE_ID").is_some();
-        let source = if keychain_key || keychain_workspace {
-            "macos_keychain"
-        } else if environment_key || environment_workspace {
-            "environment"
-        } else {
-            "none"
-        };
-        Ok(CloudCredentialStatus {
-            api_key_available: keychain_key || environment_key,
-            workspace_id_available: keychain_workspace || environment_workspace,
-            source: source.into(),
-        })
+    /// A keychain lookup that records the first failure instead of aborting,
+    /// so the composition helpers stay pure functions of the catalog.
+    fn lookup_recording<'a>(
+        failure: &'a std::cell::RefCell<Option<String>>,
+    ) -> impl Fn(&str) -> Option<String> + 'a {
+        move |account| match Self::get(account) {
+            Ok(value) => value,
+            Err(error) => {
+                failure.borrow_mut().get_or_insert(error);
+                None
+            }
+        }
     }
 
-    fn sidecar_environment(&self) -> Result<HashMap<String, String>, String> {
-        let mut values = HashMap::new();
-        let api_key = Self::get(DASHSCOPE_API_KEY_ACCOUNT)?
-            .or_else(|| std::env::var("DASHSCOPE_API_KEY").ok());
-        let workspace = Self::get(DASHSCOPE_WORKSPACE_ACCOUNT)?
-            .or_else(|| std::env::var("DASHSCOPE_WORKSPACE_ID").ok());
-        if let Some(value) = api_key {
-            values.insert("DASHSCOPE_API_KEY".into(), value);
+    fn status(&self, providers: &ProviderSettings) -> Result<Vec<CredentialGroupStatus>, String> {
+        let failure = std::cell::RefCell::new(None);
+        let statuses = catalog()
+            .credential_groups
+            .iter()
+            .map(|group| {
+                group_status(
+                    group,
+                    Self::lookup_recording(&failure),
+                    process_env,
+                    providers,
+                )
+            })
+            .collect();
+        if let Some(error) = failure.into_inner() {
+            return Err(error);
         }
-        if let Some(value) = workspace {
-            values.insert("DASHSCOPE_WORKSPACE_ID".into(), value);
+        Ok(statuses)
+    }
+
+    fn group_status(
+        &self,
+        group_id: &str,
+        providers: &ProviderSettings,
+    ) -> Result<CredentialGroupStatus, String> {
+        let group = credential_group(group_id)?;
+        let failure = std::cell::RefCell::new(None);
+        let status = group_status(
+            group,
+            Self::lookup_recording(&failure),
+            process_env,
+            providers,
+        );
+        if let Some(error) = failure.into_inner() {
+            return Err(error);
+        }
+        Ok(status)
+    }
+
+    fn sidecar_environment(
+        &self,
+        providers: &ProviderSettings,
+    ) -> Result<HashMap<String, String>, String> {
+        let failure = std::cell::RefCell::new(None);
+        let values = compose_sidecar_environment(
+            catalog(),
+            Self::lookup_recording(&failure),
+            process_env,
+            providers,
+        );
+        if let Some(error) = failure.into_inner() {
+            return Err(error);
         }
         Ok(values)
     }
 }
 
-fn validate_cloud_credentials(input: &CloudCredentialInput) -> Result<(), String> {
-    if input.api_key.trim().len() < 8 {
-        return Err("DashScope API key is too short".into());
+fn credential_group(group_id: &str) -> Result<&'static CredentialGroup, String> {
+    catalog()
+        .group(group_id)
+        .ok_or_else(|| format!("unknown credential group '{group_id}'"))
+}
+
+fn process_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// The value a setting takes for the sidecar and the UI: the stored preference
+/// when it is valid, else the process environment, else the catalog default.
+fn effective_setting(
+    group_id: &str,
+    setting: &ProviderSetting,
+    env: &impl Fn(&str) -> Option<String>,
+    providers: &ProviderSettings,
+) -> Option<String> {
+    providers
+        .get(group_id)
+        .and_then(|group| group.get(&setting.key))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && setting.accepts(value))
+        .or_else(|| {
+            setting
+                .env_var()
+                .and_then(env)
+                .filter(|value| setting.accepts(value))
+        })
+        .or_else(|| (!setting.default.is_empty()).then(|| setting.default.clone()))
+}
+
+fn group_status(
+    group: &CredentialGroup,
+    lookup: impl Fn(&str) -> Option<String>,
+    env: impl Fn(&str) -> Option<String>,
+    providers: &ProviderSettings,
+) -> CredentialGroupStatus {
+    let fields = group
+        .fields
+        .iter()
+        .map(|field| {
+            let (available, source) = if lookup(&field.keychain_account)
+                .is_some_and(|value| !value.is_empty())
+            {
+                (true, "keychain")
+            } else if env(&field.env_var).is_some() {
+                (true, "environment")
+            } else {
+                (false, "none")
+            };
+            CredentialFieldStatus {
+                key: field.key.clone(),
+                available,
+                source: source.into(),
+            }
+        })
+        .collect();
+    let settings = group
+        .settings
+        .iter()
+        .filter_map(|setting| {
+            effective_setting(&group.id, setting, &env, providers)
+                .map(|value| (setting.key.clone(), value))
+        })
+        .collect();
+    CredentialGroupStatus {
+        group_id: group.id.clone(),
+        fields,
+        settings,
     }
-    if input.workspace_id.trim().len() < 3 {
-        return Err("DashScope workspace ID is too short".into());
+}
+
+/// Every environment variable the sidecar needs for cloud providers: each
+/// credential field from the keychain (`lookup` by keychain account) or else
+/// the process environment (`env` by variable name), and each provider setting
+/// with an `env_var` from the stored preference, the process environment or
+/// the catalog default. Pure so it can be unit-tested without a keychain.
+fn compose_sidecar_environment(
+    catalog: &ProviderCatalog,
+    lookup: impl Fn(&str) -> Option<String>,
+    env: impl Fn(&str) -> Option<String>,
+    providers: &ProviderSettings,
+) -> HashMap<String, String> {
+    let mut values = HashMap::new();
+    for group in &catalog.credential_groups {
+        for field in &group.fields {
+            let value = lookup(&field.keychain_account)
+                .filter(|value| !value.is_empty())
+                .or_else(|| env(&field.env_var));
+            if let Some(value) = value {
+                values.insert(field.env_var.clone(), value);
+            }
+        }
+        for setting in &group.settings {
+            let Some(name) = setting.env_var() else {
+                continue;
+            };
+            if let Some(value) = effective_setting(&group.id, setting, &env, providers) {
+                values.insert(name.to_string(), value);
+            }
+        }
     }
-    Ok(())
+    values
+}
+
+/// One keychain mutation planned by [`plan_credential_update`]. `Debug` never
+/// prints the value.
+#[derive(Clone, PartialEq, Eq)]
+enum CredentialWrite {
+    Set { account: String, value: String },
+    Delete { account: String },
+}
+
+impl std::fmt::Debug for CredentialWrite {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CredentialWrite::Set { account, .. } => formatter
+                .debug_struct("Set")
+                .field("account", account)
+                .field("value", &"[redacted]")
+                .finish(),
+            CredentialWrite::Delete { account } => formatter
+                .debug_struct("Delete")
+                .field("account", account)
+                .finish(),
+        }
+    }
+}
+
+/// Validate a `set_credentials` payload against the catalog and turn it into
+/// keychain writes. Provided values are trimmed and checked against
+/// `min_len`; a required field must be provided unless it is already stored
+/// (`stored` by keychain account); an empty string deletes an optional field
+/// and keeps a stored required one. Error messages carry labels only.
+fn plan_credential_update(
+    group: &CredentialGroup,
+    fields: &HashMap<String, String>,
+    stored: impl Fn(&str) -> bool,
+) -> Result<Vec<CredentialWrite>, String> {
+    for key in fields.keys() {
+        if group.field(key).is_none() {
+            return Err(format!(
+                "{} has no credential field '{key}'",
+                group.display_name
+            ));
+        }
+    }
+    let mut writes = Vec::new();
+    for field in &group.fields {
+        let provided = fields.get(&field.key).map(|value| value.trim());
+        match provided {
+            Some(value) if !value.is_empty() => {
+                if value.chars().count() < field.min_len {
+                    return Err(format!(
+                        "{} is too short (at least {} characters)",
+                        field.label, field.min_len
+                    ));
+                }
+                if value.chars().any(char::is_control) {
+                    return Err(format!("{} contains control characters", field.label));
+                }
+                writes.push(CredentialWrite::Set {
+                    account: field.keychain_account.clone(),
+                    value: value.to_string(),
+                });
+            }
+            Some(_) if !field.required => writes.push(CredentialWrite::Delete {
+                account: field.keychain_account.clone(),
+            }),
+            _ => {
+                if field.required && !stored(&field.keychain_account) {
+                    return Err(format!("{} is required", field.label));
+                }
+            }
+        }
+    }
+    Ok(writes)
+}
+
+/// Validate and normalise provider settings for one group: unknown keys and
+/// invalid `select` values are rejected, values are trimmed and empty values
+/// are dropped (the catalog default applies again).
+fn normalize_provider_settings(
+    group: &CredentialGroup,
+    settings: &HashMap<String, String>,
+) -> Result<HashMap<String, String>, String> {
+    let mut normalized = HashMap::new();
+    for (key, value) in settings {
+        let setting = group
+            .setting(key)
+            .ok_or_else(|| format!("{} has no setting '{key}'", group.display_name))?;
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if value.chars().any(char::is_control) {
+            return Err(format!("{} contains control characters", setting.label));
+        }
+        if !setting.accepts(value) {
+            let options = setting
+                .options
+                .iter()
+                .map(|(option, _)| option.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!("{} must be one of: {options}", setting.label));
+        }
+        normalized.insert(key.clone(), value.to_string());
+    }
+    Ok(normalized)
+}
+
+/// Validate a whole `providers` map (every group and key against the catalog).
+fn validate_provider_settings(providers: &ProviderSettings) -> Result<ProviderSettings, String> {
+    let mut normalized = ProviderSettings::new();
+    for (group_id, settings) in providers {
+        let group = credential_group(group_id)?;
+        let values = normalize_provider_settings(group, settings)?;
+        if !values.is_empty() {
+            normalized.insert(group_id.clone(), values);
+        }
+    }
+    Ok(normalized)
+}
+
+/// Replace every known secret value in `text` so a diagnostic line can never
+/// leak a credential even if a provider echoes it back.
+fn redact_secrets<'a>(text: &str, secrets: impl IntoIterator<Item = &'a str>) -> String {
+    let mut redacted = text.to_string();
+    for secret in secrets {
+        if secret.len() >= 4 && redacted.contains(secret) {
+            redacted = redacted.replace(secret, "[redacted]");
+        }
+    }
+    redacted
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,10 +439,18 @@ struct RuntimeState {
     shutting_down: std::sync::atomic::AtomicBool,
     caption_preferences: Mutex<CaptionPreferences>,
     session_defaults: Mutex<StartSessionRequest>,
-    supervisor: Arc<InferenceSupervisor>,
+    /// Set in `setup` with the app-data log path; falls back to the plain
+    /// desktop launch config when first used outside a Tauri app (tests).
+    supervisor: std::sync::OnceLock<Arc<InferenceSupervisor>>,
     store: tokio::sync::OnceCell<TranscriptStore>,
     preferences_path: std::sync::OnceLock<PathBuf>,
+    logs_directory: std::sync::OnceLock<PathBuf>,
     credentials: CredentialStore,
+    /// Credentials or provider settings changed since the sidecar was
+    /// launched; the next runtime preparation restarts it with a fresh
+    /// environment.
+    sidecar_environment_stale: std::sync::atomic::AtomicBool,
+    catalog_mismatch_reported: std::sync::atomic::AtomicBool,
     models: std::sync::OnceLock<ModelManager>,
     local_runtimes: std::sync::OnceLock<LocalRuntimeManager>,
     onboarding_complete: std::sync::atomic::AtomicBool,
@@ -171,9 +459,12 @@ struct RuntimeState {
     warmup_in_progress: std::sync::atomic::AtomicBool,
 }
 
+fn project_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
+}
+
 impl Default for RuntimeState {
     fn default() -> Self {
-        let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
         Self {
             core: Mutex::new(AppCore::default()),
             event_sequence: AtomicU64::new(0),
@@ -182,10 +473,13 @@ impl Default for RuntimeState {
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             caption_preferences: Mutex::new(CaptionPreferences::default()),
             session_defaults: Mutex::new(StartSessionRequest::default()),
-            supervisor: InferenceSupervisor::new(SidecarLaunchConfig::desktop(project_root)),
+            supervisor: std::sync::OnceLock::new(),
             store: tokio::sync::OnceCell::new(),
             preferences_path: std::sync::OnceLock::new(),
+            logs_directory: std::sync::OnceLock::new(),
             credentials: CredentialStore,
+            sidecar_environment_stale: std::sync::atomic::AtomicBool::new(false),
+            catalog_mismatch_reported: std::sync::atomic::AtomicBool::new(false),
             models: std::sync::OnceLock::new(),
             local_runtimes: std::sync::OnceLock::new(),
             onboarding_complete: std::sync::atomic::AtomicBool::new(false),
@@ -236,6 +530,125 @@ impl PersistenceThrottle {
 }
 
 impl RuntimeState {
+    fn supervisor(&self) -> &Arc<InferenceSupervisor> {
+        self.supervisor
+            .get_or_init(|| InferenceSupervisor::new(SidecarLaunchConfig::desktop(project_root())))
+    }
+
+    fn provider_settings(&self) -> Result<ProviderSettings, String> {
+        Ok(self
+            .runtime_preferences
+            .lock()
+            .map_err(|_| "runtime preferences lock poisoned".to_string())?
+            .providers
+            .clone())
+    }
+
+    fn sidecar_environment(&self) -> Result<HashMap<String, String>, String> {
+        self.credentials
+            .sidecar_environment(&self.provider_settings()?)
+    }
+
+    fn is_idle(&self) -> bool {
+        self.snapshot()
+            .map(|snapshot| {
+                matches!(
+                    snapshot.phase,
+                    SessionPhase::Idle | SessionPhase::Completed
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    /// Credentials or settings changed: restart the sidecar now when nothing
+    /// is running, otherwise before the next session so a live session is
+    /// never interrupted.
+    async fn invalidate_sidecar_environment(&self) {
+        self.sidecar_environment_stale
+            .store(true, Ordering::Release);
+        if self.is_idle() {
+            self.supervisor().shutdown().await;
+            self.sidecar_environment_stale
+                .store(false, Ordering::Release);
+        }
+    }
+
+    /// Compare the sidecar's provider catalog with the one embedded in this
+    /// binary. A mismatch means `configs/providers.json` was not regenerated
+    /// after a registry change; report it once so Settings can be trusted.
+    async fn check_catalog_digest(&self, app: Option<&AppHandle>) {
+        let Some(sidecar) = self.supervisor().providers_digest().await else {
+            return;
+        };
+        if sidecar == catalog_digest() {
+            return;
+        }
+        if self
+            .catalog_mismatch_reported
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let message = format!(
+            "Provider catalog mismatch: sidecar {} vs embedded {}; regenerate configs/providers.json",
+            &sidecar[..sidecar.len().min(12)],
+            &catalog_digest()[..12]
+        );
+        eprintln!("{message}");
+        self.log_desktop_event(&format!("providers_catalog_mismatch {message}"));
+        if let Some(app) = app {
+            let _ = self.emit_event(
+                app,
+                None,
+                UiEventKind::Error,
+                json!({
+                    "code": "providers_catalog_mismatch",
+                    "message": message,
+                    "recoverable": true
+                }),
+            );
+        }
+    }
+
+    /// Append one redacted diagnostic line to `<app_data>/logs/desktop.log`.
+    /// Callers pass text that never contains credentials; known secret values
+    /// are scrubbed again here as a last line of defence.
+    fn log_desktop_event(&self, line: &str) {
+        let Some(directory) = self.logs_directory.get() else {
+            return;
+        };
+        let secrets: Vec<String> = self
+            .sidecar_environment()
+            .map(|values| {
+                let secret_names: std::collections::HashSet<&str> = catalog()
+                    .credential_groups
+                    .iter()
+                    .flat_map(|group| group.fields.iter())
+                    .filter(|field| field.secret)
+                    .map(|field| field.env_var.as_str())
+                    .collect();
+                values
+                    .into_iter()
+                    .filter(|(name, _)| secret_names.contains(name.as_str()))
+                    .map(|(_, value)| value)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let line = redact_secrets(line, secrets.iter().map(String::as_str));
+        let entry = format!(
+            "{} {}\n",
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            line.replace(['\n', '\r'], " ")
+        );
+        if let Err(error) = append_log_chunk(
+            &directory.join(DESKTOP_LOG_FILE),
+            entry.as_bytes(),
+            SIDECAR_LOG_ROTATE_BYTES,
+        ) {
+            eprintln!("desktop log unavailable: {error}");
+        }
+    }
+
     fn snapshot(&self) -> Result<SessionSnapshot, String> {
         self.core
             .lock()
@@ -349,12 +762,16 @@ struct RuntimePreferences {
     /// Start the inference sidecar and the local model services right after
     /// launch so the first Start does not wait ~1-2 minutes for model load.
     preload_local_models: bool,
+    /// Non-secret `ProviderSetting` values per credential group, for example
+    /// `{"dashscope": {"region": "beijing"}}`. Secrets never live here.
+    providers: ProviderSettings,
 }
 
 impl Default for RuntimePreferences {
     fn default() -> Self {
         Self {
             preload_local_models: true,
+            providers: ProviderSettings::new(),
         }
     }
 }
@@ -374,17 +791,32 @@ fn validate_session_defaults(defaults: &StartSessionRequest) -> Result<(), Strin
     ) {
         return Err("unknown audio profile".into());
     }
-    if !matches!(
-        defaults.asr_provider.as_str(),
-        "auto" | "qwen_local" | "qwen_cloud" | "simulstreaming" | "mock"
-    ) {
+    let catalog = catalog();
+    let selectable = |kind: ProviderKind, id: &str| {
+        id == "auto"
+            || catalog
+                .find(kind, id)
+                .is_some_and(|spec| spec.selectable)
+    };
+    if !selectable(ProviderKind::Asr, &defaults.asr_provider) {
         return Err("unknown ASR provider".into());
     }
-    if !matches!(
-        defaults.translation_provider.as_str(),
-        "auto" | "hymt_local" | "qwen_cloud" | "mock" | "none"
-    ) {
+    if !selectable(ProviderKind::Translation, &defaults.translation_provider) {
         return Err("unknown translation provider".into());
+    }
+    let cloud = |kind: ProviderKind, id: &str| {
+        catalog
+            .find(kind, id)
+            .is_some_and(|spec| spec.is_cloud())
+    };
+    if !cloud(ProviderKind::Asr, &defaults.cloud_asr_preference) {
+        return Err("cloud ASR preference must name a cloud provider".into());
+    }
+    if !cloud(
+        ProviderKind::Translation,
+        &defaults.cloud_translation_preference,
+    ) {
+        return Err("cloud translation preference must name a cloud provider".into());
     }
     Ok(())
 }
@@ -496,10 +928,14 @@ fn load_preferences(path: &std::path::Path) -> DesktopPreferences {
         || validate_session_defaults(&preferences.session).is_err()
         || validate_caption_preferences(&preferences.caption).is_err()
     {
-        DesktopPreferences::default()
-    } else {
-        preferences
+        return DesktopPreferences::default();
     }
+    let mut preferences = preferences;
+    // Provider settings are dropped on corruption rather than discarding the
+    // whole file; the catalog defaults apply again.
+    preferences.runtime.providers =
+        validate_provider_settings(&preferences.runtime.providers).unwrap_or_default();
+    preferences
 }
 
 fn save_preferences(
@@ -635,89 +1071,249 @@ async fn test_audio_input(
     result
 }
 
+/// The embedded provider catalog (`configs/providers.json`), verbatim.
 #[tauri::command]
-fn credential_status(state: State<'_, RuntimeState>) -> Result<CloudCredentialStatus, String> {
-    state.credentials.status()
+fn list_providers() -> Result<Value, String> {
+    Ok(catalog_value())
 }
 
 #[tauri::command]
-async fn probe_qwen_cloud(
+fn credential_status(state: State<'_, RuntimeState>) -> Result<Vec<CredentialGroupStatus>, String> {
+    state.credentials.status(&state.provider_settings()?)
+}
+
+#[tauri::command]
+fn logs_directory(state: State<'_, RuntimeState>) -> Result<String, String> {
+    state
+        .logs_directory
+        .get()
+        .map(|path| path.to_string_lossy().into_owned())
+        .ok_or_else(|| "logs directory is not initialized".to_string())
+}
+
+/// Store credential fields for one catalog group in the OS secure store.
+/// Values are validated against the catalog (`min_len`, required fields),
+/// written per field, and never echoed back, logged or kept in memory.
+#[tauri::command]
+async fn set_credentials(
     state: State<'_, RuntimeState>,
-    include_translation: bool,
-) -> Result<Value, String> {
-    let phase = state.snapshot()?.phase;
-    if !matches!(phase, SessionPhase::Idle | SessionPhase::Completed) {
-        return Err("Stop the current session before testing cloud credentials".into());
+    group_id: String,
+    fields: HashMap<String, String>,
+) -> Result<CredentialGroupStatus, String> {
+    let group = credential_group(&group_id)?;
+    let mut stored = HashMap::new();
+    for field in &group.fields {
+        stored.insert(
+            field.keychain_account.as_str(),
+            CredentialStore::get(&field.keychain_account)?.is_some(),
+        );
     }
-    let status = state.credentials.status()?;
-    if !status.api_key_available || !status.workspace_id_available {
-        return Err("Save both the DashScope API key and workspace ID first".into());
-    }
-
-    state.supervisor.shutdown().await;
-    state
-        .supervisor
-        .configure_secret_environment(state.credentials.sidecar_environment()?)
-        .await;
-    state
-        .supervisor
-        .ensure_started()
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut events = state.supervisor.subscribe();
-    let request_id = uuid::Uuid::new_v4();
-    state
-        .supervisor
-        .send_command(SidecarCommand::ProbeCloud {
-            request_id,
-            include_translation,
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-
-    let response = tokio::time::timeout(std::time::Duration::from_secs(20), async move {
-        loop {
-            match events.recv().await.map_err(|error| error.to_string())? {
-                SidecarEvent::CloudProbeResult {
-                    request_id: response_id,
-                    result,
-                } if response_id == request_id => return Ok(result),
-                SidecarEvent::Error { message, .. } => return Err(message),
-                _ => {}
+    let writes = plan_credential_update(group, &fields, |account| {
+        stored.get(account).copied().unwrap_or(false)
+    })?;
+    drop(fields);
+    let mut created = Vec::new();
+    for write in &writes {
+        let result = match write {
+            CredentialWrite::Set { account, value } => CredentialStore::set(account, value),
+            CredentialWrite::Delete { account } => CredentialStore::delete(account),
+        };
+        if let Err(error) = result {
+            // Never leave a group half-saved: undo entries this call created.
+            for account in created {
+                let _ = CredentialStore::delete(account);
+            }
+            return Err(error);
+        }
+        if let CredentialWrite::Set { account, .. } = write {
+            if !stored.get(account.as_str()).copied().unwrap_or(false) {
+                created.push(account.as_str());
             }
         }
-    })
-    .await;
-    // A probe sidecar was launched with credentials only. Stop it so the next
-    // real session starts with its complete model/runtime capability environment.
-    state.supervisor.shutdown().await;
-    response.map_err(|_| "Qwen Cloud validation timed out".to_string())?
-}
-
-#[tauri::command]
-async fn set_cloud_credentials(
-    state: State<'_, RuntimeState>,
-    input: CloudCredentialInput,
-) -> Result<CloudCredentialStatus, String> {
-    validate_cloud_credentials(&input)?;
-    CredentialStore::set(DASHSCOPE_API_KEY_ACCOUNT, input.api_key.trim())?;
-    if let Err(error) = CredentialStore::set(DASHSCOPE_WORKSPACE_ACCOUNT, input.workspace_id.trim())
-    {
-        let _ = CredentialStore::delete(DASHSCOPE_API_KEY_ACCOUNT);
-        return Err(error);
     }
-    state.supervisor.shutdown().await;
-    state.credentials.status()
+    state.invalidate_sidecar_environment().await;
+    state
+        .credentials
+        .group_status(&group_id, &state.provider_settings()?)
 }
 
 #[tauri::command]
-async fn clear_cloud_credentials(
+async fn clear_credentials(
     state: State<'_, RuntimeState>,
-) -> Result<CloudCredentialStatus, String> {
-    CredentialStore::delete(DASHSCOPE_API_KEY_ACCOUNT)?;
-    CredentialStore::delete(DASHSCOPE_WORKSPACE_ACCOUNT)?;
-    state.supervisor.shutdown().await;
-    state.credentials.status()
+    group_id: String,
+) -> Result<CredentialGroupStatus, String> {
+    let group = credential_group(&group_id)?;
+    for field in &group.fields {
+        CredentialStore::delete(&field.keychain_account)?;
+    }
+    state.invalidate_sidecar_environment().await;
+    state
+        .credentials
+        .group_status(&group_id, &state.provider_settings()?)
+}
+
+/// Merge non-secret settings for one credential group into the runtime
+/// preferences (an empty value resets that key to the catalog default).
+#[tauri::command]
+async fn update_provider_settings(
+    state: State<'_, RuntimeState>,
+    group_id: String,
+    settings: HashMap<String, String>,
+) -> Result<RuntimePreferences, String> {
+    let group = credential_group(&group_id)?;
+    let mut cleared = Vec::new();
+    for (key, value) in &settings {
+        if group.setting(key).is_none() {
+            return Err(format!("{} has no setting '{key}'", group.display_name));
+        }
+        if value.trim().is_empty() {
+            cleared.push(key.clone());
+        }
+    }
+    let normalized = normalize_provider_settings(group, &settings)?;
+    let (preferences, changed) = {
+        let mut guard = state
+            .runtime_preferences
+            .lock()
+            .map_err(|_| "runtime preferences lock poisoned".to_string())?;
+        let previous = guard.providers.clone();
+        let entry = guard.providers.entry(group_id.clone()).or_default();
+        for key in cleared {
+            entry.remove(&key);
+        }
+        entry.extend(normalized);
+        if entry.is_empty() {
+            guard.providers.remove(&group_id);
+        }
+        let changed = guard.providers != previous;
+        (guard.clone(), changed)
+    };
+    state.persist_preferences()?;
+    if changed {
+        state.invalidate_sidecar_environment().await;
+    }
+    Ok(preferences)
+}
+
+/// Validate cloud credentials for the requested providers by launching a
+/// credentials-only sidecar and asking it to probe. ASR probes perform the
+/// authenticated handshake only (no audio is uploaded); translation probes
+/// translate one fixed sentence. Failures are appended, redacted, to
+/// `<app_data>/logs/desktop.log`.
+#[tauri::command]
+async fn probe_cloud(
+    state: State<'_, RuntimeState>,
+    asr_provider: Option<String>,
+    translation_provider: Option<String>,
+) -> Result<Value, String> {
+    if !state.is_idle() {
+        return Err("Stop the current session before testing cloud credentials".into());
+    }
+    let asr_provider = asr_provider.filter(|id| !id.trim().is_empty());
+    let translation_provider = translation_provider.filter(|id| !id.trim().is_empty());
+    if asr_provider.is_none() && translation_provider.is_none() {
+        return Err("Choose at least one cloud provider to test".into());
+    }
+    let providers = state.provider_settings()?;
+    for (kind, id) in [
+        (ProviderKind::Asr, asr_provider.as_deref()),
+        (ProviderKind::Translation, translation_provider.as_deref()),
+    ] {
+        let Some(id) = id else {
+            continue;
+        };
+        let spec = catalog()
+            .find(kind, id)
+            .ok_or_else(|| format!("unknown {kind} provider '{id}'"))?;
+        if !spec.is_cloud() {
+            return Err(format!("{} is not a cloud provider", spec.display_name));
+        }
+        let Some(group_id) = spec.credential_group.as_deref() else {
+            continue;
+        };
+        let group = credential_group(group_id)?;
+        let status = state.credentials.group_status(group_id, &providers)?;
+        let missing = group
+            .fields
+            .iter()
+            .filter(|field| field.required)
+            .filter(|field| {
+                !status
+                    .fields
+                    .iter()
+                    .any(|entry| entry.key == field.key && entry.available)
+            })
+            .map(|field| field.label.as_str())
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "Save the {} credentials first (missing: {})",
+                group.display_name,
+                missing.join(", ")
+            ));
+        }
+    }
+
+    let describe = format!(
+        "asr={} translation={}",
+        asr_provider.as_deref().unwrap_or("-"),
+        translation_provider.as_deref().unwrap_or("-")
+    );
+    let supervisor = state.supervisor().clone();
+    supervisor.shutdown().await;
+    supervisor
+        .configure_secret_environment(state.credentials.sidecar_environment(&providers)?)
+        .await;
+    let outcome = async {
+        supervisor
+            .ensure_started()
+            .await
+            .map_err(|error| error.to_string())?;
+        state.check_catalog_digest(None).await;
+        let mut events = supervisor.subscribe();
+        let request_id = uuid::Uuid::new_v4();
+        supervisor
+            .send_command(SidecarCommand::ProbeCloud {
+                request_id,
+                asr_provider: asr_provider.clone(),
+                translation_provider: translation_provider.clone(),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async move {
+            loop {
+                match events.recv().await.map_err(|error| error.to_string())? {
+                    SidecarEvent::CloudProbeResult {
+                        request_id: response_id,
+                        result,
+                    } if response_id == request_id => return Ok(result),
+                    SidecarEvent::Error { message, .. } => return Err(message),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .map_err(|_| "Cloud provider validation timed out".to_string())?
+    }
+    .await;
+    // The probe sidecar was launched with credentials only. Stop it so the
+    // next real session starts with its complete model/runtime environment.
+    supervisor.shutdown().await;
+    state
+        .sidecar_environment_stale
+        .store(false, Ordering::Release);
+    match &outcome {
+        Ok(result) if result["ok"].as_bool() == Some(true) => {}
+        Ok(result) => state.log_desktop_event(&format!(
+            "probe_cloud failed {describe} code={} message={}",
+            result["code"].as_str().unwrap_or("cloud_probe_failed"),
+            result["message"].as_str().unwrap_or("no message")
+        )),
+        Err(message) => state.log_desktop_event(&format!(
+            "probe_cloud failed {describe} code=probe_transport message={message}"
+        )),
+    }
+    outcome
 }
 
 #[tauri::command]
@@ -772,12 +1368,31 @@ fn route_status(value: &Value) -> RouteStatus {
         .unwrap_or("none")
         .to_string();
     let degraded = value["degraded"].as_bool().unwrap_or(false);
-    let locality = |provider: &str| {
-        if provider.contains("cloud") {
-            "cloud"
-        } else {
-            "local"
-        }
+    let catalog = catalog();
+    let asr_spec = catalog.find(ProviderKind::Asr, &asr);
+    let translation_spec = catalog.find(ProviderKind::Translation, &translation);
+    let text = |key: &str| {
+        value[key]
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    // Prefer what the sidecar reports (registry locality/model/display name);
+    // fall back to the catalog, then to the historical id heuristics.
+    let locality = |key: &str, provider: &str, spec: Option<&app_core::ProviderSpec>| {
+        text(key)
+            .or_else(|| spec.map(|spec| spec.locality.as_str().to_string()))
+            .unwrap_or_else(|| {
+                if provider.contains("cloud") {
+                    "cloud".into()
+                } else {
+                    "local".into()
+                }
+            })
+    };
+    let display_name = |key: &str, spec: Option<&app_core::ProviderSpec>| {
+        text(key).or_else(|| spec.map(|spec| spec.display_name.clone()))
     };
     let reasons = value["reasons"]
         .as_array()
@@ -791,23 +1406,25 @@ fn route_status(value: &Value) -> RouteStatus {
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| "Runtime route selected".into());
     RouteStatus {
-        asr_model: match asr.as_str() {
+        asr_model: text("asr_model").or_else(|| match asr.as_str() {
             "qwen_local" => Some("qwen3-asr-0.6b".into()),
             "qwen_cloud" => Some("qwen3-asr-flash-realtime".into()),
             _ => None,
-        },
-        asr_locality: locality(&asr).into(),
+        }),
+        asr_locality: locality("asr_locality", &asr, asr_spec),
+        asr_display_name: display_name("asr_display_name", asr_spec),
         asr_health: if degraded {
             BackendHealth::Degraded
         } else {
             BackendHealth::Connected
         },
-        translation_model: match translation.as_str() {
+        translation_model: text("translation_model").or_else(|| match translation.as_str() {
             "hymt_local" => Some("tencent/Hy-MT2-1.8B".into()),
             "qwen_cloud" => Some("qwen-mt-flash".into()),
             _ => None,
-        },
-        translation_locality: locality(&translation).into(),
+        }),
+        translation_locality: locality("translation_locality", &translation, translation_spec),
+        translation_display_name: display_name("translation_display_name", translation_spec),
         translation_health: if translation == "none" {
             BackendHealth::Unavailable
         } else if degraded {
@@ -1002,7 +1619,7 @@ async fn persist_sidecar_event(
 const TRANSLATION_DELTA_UI_INTERVAL: std::time::Duration = std::time::Duration::from_millis(66);
 
 fn forward_sidecar_events(app: AppHandle) {
-    let mut receiver = app.state::<RuntimeState>().supervisor.subscribe();
+    let mut receiver = app.state::<RuntimeState>().supervisor().subscribe();
     // Persistence runs on its own task so SQLite latency never delays the
     // canonical UI event stream. The channel is bounded; the forwarder awaits
     // when it fills, which only happens if storage is far behind.
@@ -1239,7 +1856,7 @@ fn pump_audio_frames(
                 for sample in samples {
                     packet.extend_from_slice(&sample.to_le_bytes());
                 }
-                if let Err(error) = state.supervisor.send_audio(packet).await {
+                if let Err(error) = state.supervisor().send_audio(packet).await {
                     let _ = state.emit_event(
                         &app,
                         state
@@ -1274,7 +1891,7 @@ fn forward_audio_events(app: AppHandle, mut events: tokio::sync::mpsc::Receiver<
                 if let Some(snapshot) = recovery {
                     if let Some(session_id) = snapshot.session_id {
                         let _ = state
-                            .supervisor
+                            .supervisor()
                             .send_command(SidecarCommand::Pause {
                                 session_id,
                                 epoch: snapshot.state_revision as u32,
@@ -1316,9 +1933,9 @@ async fn shutdown_application(app: &AppHandle) {
                 let _ = state.emit_snapshot(app, &stopping);
                 let _ = stop_audio_capture(&state).await;
                 if let Some(session_id) = stopping.session_id {
-                    let mut receiver = state.supervisor.subscribe();
+                    let mut receiver = state.supervisor().subscribe();
                     if state
-                        .supervisor
+                        .supervisor()
                         .send_command(SidecarCommand::FinishSession { session_id })
                         .await
                         .is_ok()
@@ -1349,7 +1966,7 @@ async fn shutdown_application(app: &AppHandle) {
     } else {
         let _ = stop_audio_capture(&state).await;
     }
-    state.supervisor.shutdown().await;
+    state.supervisor().shutdown().await;
     if let Ok(runtimes) = state.local_runtimes() {
         runtimes.shutdown().await;
     }
@@ -1408,11 +2025,12 @@ fn get_runtime_preferences(state: State<'_, RuntimeState>) -> Result<RuntimePref
 }
 
 #[tauri::command]
-fn update_runtime_preferences(
+async fn update_runtime_preferences(
     app: AppHandle,
     state: State<'_, RuntimeState>,
-    preferences: RuntimePreferences,
+    mut preferences: RuntimePreferences,
 ) -> Result<RuntimePreferences, String> {
+    preferences.providers = validate_provider_settings(&preferences.providers)?;
     let previous = {
         let mut guard = state
             .runtime_preferences
@@ -1421,6 +2039,9 @@ fn update_runtime_preferences(
         std::mem::replace(&mut *guard, preferences.clone())
     };
     state.persist_preferences()?;
+    if preferences.providers != previous.providers {
+        state.invalidate_sidecar_environment().await;
+    }
     if preferences.preload_local_models && !previous.preload_local_models {
         warm_local_runtimes(app);
     }
@@ -1504,7 +2125,7 @@ async fn prepare_inference_runtimes(
     session_id: uuid::Uuid,
     payload: &Value,
 ) -> Result<Vec<String>, String> {
-    let mut sidecar_environment = state.credentials.sidecar_environment()?;
+    let mut sidecar_environment = state.sidecar_environment()?;
     sidecar_environment.insert(
         "ECHOLINGO_MODEL_ROOT".into(),
         state.models()?.root().to_string_lossy().into_owned(),
@@ -1520,18 +2141,27 @@ async fn prepare_inference_runtimes(
         alignment_spool.to_string_lossy().into_owned(),
     );
     sidecar_environment.extend(state.local_runtimes()?.capability_environment());
+    if state
+        .sidecar_environment_stale
+        .swap(false, Ordering::AcqRel)
+    {
+        // Credentials or provider settings changed while the sidecar was up;
+        // environment variables only apply at launch.
+        state.supervisor().shutdown().await;
+    }
     state
-        .supervisor
+        .supervisor()
         .configure_secret_environment(sidecar_environment)
         .await;
     state
-        .supervisor
+        .supervisor()
         .ensure_started()
         .await
         .map_err(|error| error.to_string())?;
-    let mut receiver = state.supervisor.subscribe();
+    state.check_catalog_digest(Some(app)).await;
+    let mut receiver = state.supervisor().subscribe();
     state
-        .supervisor
+        .supervisor()
         .send_command(SidecarCommand::PlanSession(payload.clone()))
         .await
         .map_err(|error| error.to_string())?;
@@ -1680,10 +2310,10 @@ async fn start_session(
             json!(capture_format.sample_rate_hz),
         );
         object.insert("channels".into(), json!(capture_format.channels));
-        let mut receiver = state.supervisor.subscribe();
+        let mut receiver = state.supervisor().subscribe();
         prepare_inference_runtimes(&app, &state, session_id, &payload).await?;
         state
-            .supervisor
+            .supervisor()
             .send_command(SidecarCommand::StartSession(payload))
             .await
             .map_err(|error| error.to_string())?;
@@ -1771,7 +2401,7 @@ async fn pause_session(
         .session_id
         .ok_or_else(|| "no active session".to_string())?;
     state
-        .supervisor
+        .supervisor()
         .send_command(SidecarCommand::Pause {
             session_id,
             epoch: 0,
@@ -1799,7 +2429,7 @@ async fn resume_session(
         .session_id
         .ok_or_else(|| "no active session".to_string())?;
     state
-        .supervisor
+        .supervisor()
         .send_command(SidecarCommand::Resume {
             session_id,
             epoch: 1,
@@ -1835,9 +2465,9 @@ async fn stop_session(
     stop_audio_capture(&state).await?;
     let mut warnings = Vec::new();
     if let Some(session_id) = stopping.session_id {
-        let mut receiver = state.supervisor.subscribe();
+        let mut receiver = state.supervisor().subscribe();
         match state
-            .supervisor
+            .supervisor()
             .send_command(SidecarCommand::FinishSession { session_id })
             .await
         {
@@ -1995,10 +2625,13 @@ pub fn run() {
             audio_permission_status,
             request_audio_permission,
             test_audio_input,
+            list_providers,
             credential_status,
-            probe_qwen_cloud,
-            set_cloud_credentials,
-            clear_cloud_credentials,
+            set_credentials,
+            clear_credentials,
+            update_provider_settings,
+            probe_cloud,
+            logs_directory,
             list_models,
             install_model,
             verify_model,
@@ -2026,6 +2659,17 @@ pub fn run() {
         .setup(|app| {
             let state = app.state::<RuntimeState>();
             let app_data_directory = app.path().app_data_dir()?;
+            let logs_directory = app_data_directory.join("logs");
+            let mut launch = SidecarLaunchConfig::desktop(project_root());
+            launch.log_path = Some(logs_directory.join(SIDECAR_LOG_FILE));
+            state
+                .supervisor
+                .set(InferenceSupervisor::new(launch))
+                .map_err(|_| std::io::Error::other("inference supervisor already initialized"))?;
+            state
+                .logs_directory
+                .set(logs_directory)
+                .map_err(|_| std::io::Error::other("logs directory already initialized"))?;
             let database_path = app_data_directory.join("history.sqlite");
             let store = tauri::async_runtime::block_on(TranscriptStore::open(database_path))
                 .map_err(std::io::Error::other)?;
@@ -2265,13 +2909,360 @@ mod tests {
     }
 
     #[test]
-    fn cloud_credential_validation_never_echoes_secret() {
-        let input = CloudCredentialInput {
-            api_key: "sekrit".into(),
-            workspace_id: "workspace".into(),
+    fn desktop_preferences_accept_every_selectable_catalog_provider() {
+        for spec in catalog().specs(ProviderKind::Asr) {
+            let mut defaults = StartSessionRequest::default();
+            defaults.asr_provider = spec.id.clone();
+            assert_eq!(
+                validate_session_defaults(&defaults).is_ok(),
+                spec.selectable,
+                "{}",
+                spec.id
+            );
+        }
+        for spec in catalog().specs(ProviderKind::Translation) {
+            let mut defaults = StartSessionRequest::default();
+            defaults.translation_provider = spec.id.clone();
+            assert_eq!(
+                validate_session_defaults(&defaults).is_ok(),
+                spec.selectable,
+                "{}",
+                spec.id
+            );
+        }
+        let mut defaults = StartSessionRequest::default();
+        defaults.asr_provider = "whisper_cloud".into();
+        assert!(validate_session_defaults(&defaults).is_err());
+        let mut defaults = StartSessionRequest::default();
+        defaults.cloud_asr_preference = "qwen_local".into();
+        assert!(validate_session_defaults(&defaults).is_err());
+        let mut defaults = StartSessionRequest::default();
+        defaults.cloud_asr_preference = "deepgram".into();
+        defaults.cloud_translation_preference = "deepl".into();
+        assert!(validate_session_defaults(&defaults).is_ok());
+    }
+
+    fn env_from<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string())
+        }
+    }
+
+    #[test]
+    fn sidecar_environment_uses_setting_defaults_and_preferences() {
+        let none = |_: &str| None;
+        let empty = ProviderSettings::new();
+        let values = compose_sidecar_environment(catalog(), none, none, &empty);
+        assert_eq!(
+            values.get("ECHOLINGO_QWEN_REGION").map(String::as_str),
+            Some("singapore")
+        );
+        assert_eq!(
+            values.get("ECHOLINGO_DEEPL_TIER").map(String::as_str),
+            Some("free")
+        );
+        assert_eq!(
+            values.get("ECHOLINGO_OPENAI_CHAT_MODEL").map(String::as_str),
+            Some("gpt-4o-mini")
+        );
+        // Empty defaults (custom endpoint base URL) are never exported.
+        assert!(!values.contains_key("ECHOLINGO_CUSTOM_OPENAI_BASE_URL"));
+        // No credential without a source.
+        assert!(!values.contains_key("DASHSCOPE_API_KEY"));
+        assert!(!values.contains_key("DASHSCOPE_WORKSPACE_ID"));
+
+        let mut providers = ProviderSettings::new();
+        providers.insert(
+            "dashscope".into(),
+            HashMap::from([("region".to_string(), "beijing".to_string())]),
+        );
+        let values = compose_sidecar_environment(catalog(), none, none, &providers);
+        assert_eq!(
+            values.get("ECHOLINGO_QWEN_REGION").map(String::as_str),
+            Some("beijing")
+        );
+
+        // An invalid stored select value falls back to the default.
+        providers.insert(
+            "dashscope".into(),
+            HashMap::from([("region".to_string(), "mars".to_string())]),
+        );
+        let values = compose_sidecar_environment(catalog(), none, none, &providers);
+        assert_eq!(
+            values.get("ECHOLINGO_QWEN_REGION").map(String::as_str),
+            Some("singapore")
+        );
+    }
+
+    #[test]
+    fn sidecar_environment_prefers_keychain_over_environment_and_omits_optional_fields() {
+        let keychain = |account: &str| match account {
+            "dashscope-api-key" => Some("keychain-dashscope-key".to_string()),
+            "openai-api-key" => Some("keychain-openai-key".to_string()),
+            _ => None,
         };
-        let error = validate_cloud_credentials(&input).unwrap_err();
-        assert!(!error.contains("sekrit"));
+        let env_pairs = [
+            ("DASHSCOPE_API_KEY", "env-dashscope-key"),
+            ("DEEPGRAM_API_KEY", "env-deepgram-key"),
+            ("ECHOLINGO_QWEN_REGION", "beijing"),
+        ];
+        let empty = ProviderSettings::new();
+        let values =
+            compose_sidecar_environment(catalog(), keychain, env_from(&env_pairs), &empty);
+        assert_eq!(
+            values.get("DASHSCOPE_API_KEY").map(String::as_str),
+            Some("keychain-dashscope-key")
+        );
+        assert_eq!(
+            values.get("OPENAI_API_KEY").map(String::as_str),
+            Some("keychain-openai-key")
+        );
+        assert_eq!(
+            values.get("DEEPGRAM_API_KEY").map(String::as_str),
+            Some("env-deepgram-key")
+        );
+        // The optional workspace id is omitted when nothing provides it.
+        assert!(!values.contains_key("DASHSCOPE_WORKSPACE_ID"));
+        // A developer's shell region applies when no preference is stored...
+        assert_eq!(
+            values.get("ECHOLINGO_QWEN_REGION").map(String::as_str),
+            Some("beijing")
+        );
+        // ...and a stored preference wins over the shell.
+        let mut providers = ProviderSettings::new();
+        providers.insert(
+            "dashscope".into(),
+            HashMap::from([("region".to_string(), "singapore".to_string())]),
+        );
+        let values =
+            compose_sidecar_environment(catalog(), keychain, env_from(&env_pairs), &providers);
+        assert_eq!(
+            values.get("ECHOLINGO_QWEN_REGION").map(String::as_str),
+            Some("singapore")
+        );
+    }
+
+    #[test]
+    fn credential_group_status_reports_sources_without_values() {
+        let group = catalog().group("dashscope").unwrap();
+        let keychain =
+            |account: &str| (account == "dashscope-api-key").then(|| "sekrit-key-value".to_string());
+        let env_pairs = [("DASHSCOPE_WORKSPACE_ID", "ws-123")];
+        let status = group_status(
+            group,
+            keychain,
+            env_from(&env_pairs),
+            &ProviderSettings::new(),
+        );
+        assert_eq!(status.group_id, "dashscope");
+        assert_eq!(
+            status.fields,
+            vec![
+                CredentialFieldStatus {
+                    key: "api_key".into(),
+                    available: true,
+                    source: "keychain".into()
+                },
+                CredentialFieldStatus {
+                    key: "workspace_id".into(),
+                    available: true,
+                    source: "environment".into()
+                },
+            ]
+        );
+        assert_eq!(
+            status.settings.get("region").map(String::as_str),
+            Some("singapore")
+        );
+        let serialized = serde_json::to_string(&status).unwrap();
+        assert!(!serialized.contains("sekrit") && !serialized.contains("ws-123"));
+
+        let none = |_: &str| None;
+        let status = group_status(group, none, none, &ProviderSettings::new());
+        assert!(status
+            .fields
+            .iter()
+            .all(|field| !field.available && field.source == "none"));
+    }
+
+    #[test]
+    fn credential_updates_are_validated_without_echoing_values() {
+        let group = catalog().group("dashscope").unwrap();
+        let nothing_stored = |_: &str| false;
+        let fields = HashMap::from([("api_key".to_string(), "zq7-tiny".to_string()[..5].to_string())]);
+        let error = plan_credential_update(group, &fields, nothing_stored).unwrap_err();
+        assert!(error.contains("API key") && error.contains("at least 8"));
+        assert!(!error.contains("zq7-t"));
+
+        let fields = HashMap::from([("workspace_id".to_string(), "ws-only".to_string())]);
+        let error = plan_credential_update(group, &fields, nothing_stored).unwrap_err();
+        assert!(error.contains("required") && !error.contains("ws-only"));
+
+        let fields = HashMap::from([("token".to_string(), "x".to_string())]);
+        assert!(plan_credential_update(group, &fields, nothing_stored).is_err());
+
+        let fields = HashMap::from([
+            ("api_key".to_string(), " sk-valid-key-value ".to_string()),
+            ("workspace_id".to_string(), String::new()),
+        ]);
+        let writes = plan_credential_update(group, &fields, nothing_stored).unwrap();
+        assert_eq!(
+            writes,
+            vec![
+                CredentialWrite::Set {
+                    account: "dashscope-api-key".into(),
+                    value: "sk-valid-key-value".into()
+                },
+                CredentialWrite::Delete {
+                    account: "dashscope-workspace-id".into()
+                },
+            ]
+        );
+        assert!(!format!("{writes:?}").contains("sk-valid"));
+
+        // A stored required key may be left out or blank (kept as is).
+        let stored = |account: &str| account == "dashscope-api-key";
+        let fields = HashMap::from([("workspace_id".to_string(), "workspace-1".to_string())]);
+        let writes = plan_credential_update(group, &fields, stored).unwrap();
+        assert_eq!(writes.len(), 1);
+        let fields = HashMap::from([("api_key".to_string(), String::new())]);
+        assert!(plan_credential_update(group, &fields, stored)
+            .unwrap()
+            .is_empty());
+
+        // Optional-only groups accept an empty payload.
+        let custom = catalog().group("custom_openai").unwrap();
+        assert!(plan_credential_update(custom, &HashMap::new(), nothing_stored)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn provider_settings_are_validated_against_the_catalog() {
+        let dashscope = catalog().group("dashscope").unwrap();
+        let ok = normalize_provider_settings(
+            dashscope,
+            &HashMap::from([("region".to_string(), " beijing ".to_string())]),
+        )
+        .unwrap();
+        assert_eq!(ok.get("region").map(String::as_str), Some("beijing"));
+        let error = normalize_provider_settings(
+            dashscope,
+            &HashMap::from([("region".to_string(), "mars".to_string())]),
+        )
+        .unwrap_err();
+        assert!(error.contains("singapore, beijing"));
+        assert!(normalize_provider_settings(
+            dashscope,
+            &HashMap::from([("model".to_string(), "x".to_string())])
+        )
+        .is_err());
+        let mut providers = ProviderSettings::new();
+        providers.insert(
+            "openai".into(),
+            HashMap::from([("chat_model".to_string(), String::new())]),
+        );
+        providers.insert(
+            "deepl".into(),
+            HashMap::from([("tier".to_string(), "pro".to_string())]),
+        );
+        let normalized = validate_provider_settings(&providers).unwrap();
+        assert!(!normalized.contains_key("openai"));
+        assert_eq!(normalized["deepl"]["tier"], "pro");
+        providers.insert("nope".into(), HashMap::new());
+        assert!(validate_provider_settings(&providers).is_err());
+    }
+
+    #[test]
+    fn runtime_preferences_round_trip_provider_settings_without_secrets() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preferences.json");
+        let mut preferences = DesktopPreferences::default();
+        preferences.runtime.providers.insert(
+            "dashscope".into(),
+            HashMap::from([("region".to_string(), "beijing".to_string())]),
+        );
+        save_preferences(&path, &preferences).unwrap();
+        let loaded = load_preferences(&path);
+        assert_eq!(loaded.runtime.providers["dashscope"]["region"], "beijing");
+        // Older files without `providers` and corrupt settings both load.
+        let legacy: RuntimePreferences =
+            serde_json::from_str(r#"{"preload_local_models": false}"#).unwrap();
+        assert!(legacy.providers.is_empty() && !legacy.preload_local_models);
+        preferences.runtime.providers.insert(
+            "dashscope".into(),
+            HashMap::from([("region".to_string(), "mars".to_string())]),
+        );
+        save_preferences(&path, &preferences).unwrap();
+        assert!(load_preferences(&path).runtime.providers.is_empty());
+    }
+
+    #[test]
+    fn route_status_prefers_sidecar_keys_and_falls_back_to_heuristics() {
+        let route = route_status(&json!({
+            "asr_provider": "deepgram",
+            "translation_provider": "deepl",
+            "asr_locality": "cloud",
+            "asr_model": "nova-3",
+            "asr_display_name": "Deepgram streaming (cloud)",
+            "translation_locality": "cloud",
+            "translation_model": null,
+            "translation_display_name": "DeepL (cloud)",
+            "status": "cloud",
+            "reasons": ["cloud requested"]
+        }));
+        assert_eq!(route.asr_locality, "cloud");
+        assert_eq!(route.asr_model.as_deref(), Some("nova-3"));
+        assert_eq!(
+            route.asr_display_name.as_deref(),
+            Some("Deepgram streaming (cloud)")
+        );
+        assert_eq!(route.translation_model, None);
+        assert_eq!(
+            route.translation_display_name.as_deref(),
+            Some("DeepL (cloud)")
+        );
+        assert_eq!(route.translation_health, BackendHealth::Connected);
+
+        let legacy = route_status(&json!({
+            "asr_provider": "qwen_local",
+            "translation_provider": "qwen_cloud",
+            "status": "hybrid",
+            "degraded": false
+        }));
+        assert_eq!(legacy.asr_locality, "local");
+        assert_eq!(legacy.asr_model.as_deref(), Some("qwen3-asr-0.6b"));
+        assert_eq!(
+            legacy.asr_display_name.as_deref(),
+            Some("Qwen3-ASR (local)")
+        );
+        assert_eq!(legacy.translation_locality, "cloud");
+        assert_eq!(legacy.translation_model.as_deref(), Some("qwen-mt-flash"));
+        assert_eq!(
+            legacy.translation_display_name.as_deref(),
+            Some("Qwen-MT (cloud)")
+        );
+
+        let unknown = route_status(&json!({
+            "asr_provider": "mystery_cloud",
+            "translation_provider": "none"
+        }));
+        assert_eq!(unknown.asr_locality, "cloud");
+        assert_eq!(unknown.asr_display_name, None);
+        assert_eq!(unknown.translation_health, BackendHealth::Unavailable);
+    }
+
+    #[test]
+    fn redaction_scrubs_known_secrets_only() {
+        let secrets = ["sk-live-abcdef", "abc"];
+        assert_eq!(
+            redact_secrets("auth failed for sk-live-abcdef (abc)", secrets),
+            "auth failed for [redacted] (abc)"
+        );
+        assert_eq!(redact_secrets("clean", secrets), "clean");
     }
 
     #[test]
@@ -2306,8 +3297,8 @@ mod tests {
             .store
             .set(TranscriptStore::open(&database_path).await.unwrap())
             .unwrap();
-        state.supervisor.ensure_started().await.unwrap();
-        let mut receiver = state.supervisor.subscribe();
+        state.supervisor().ensure_started().await.unwrap();
+        let mut receiver = state.supervisor().subscribe();
 
         let mut request = StartSessionRequest::default();
         request.asr_provider = "mock".into();
@@ -2316,7 +3307,7 @@ mod tests {
         let starting = state.core.lock().unwrap().start(request).unwrap();
         let session_id = starting.session_id.unwrap();
         state
-            .supervisor
+            .supervisor()
             .send_command(SidecarCommand::StartSession(mock_session_payload(
                 session_id, true,
             )))
@@ -2356,7 +3347,7 @@ mod tests {
                         core.pause(revision).unwrap()
                     };
                     sender_state
-                        .supervisor
+                        .supervisor()
                         .send_command(SidecarCommand::Pause {
                             session_id,
                             epoch: paused.state_revision as u32,
@@ -2364,7 +3355,7 @@ mod tests {
                         .await
                         .unwrap();
                     sender_state
-                        .supervisor
+                        .supervisor()
                         .send_command(SidecarCommand::Resume {
                             session_id,
                             epoch: paused.state_revision as u32 + 1,
@@ -2389,7 +3380,7 @@ mod tests {
                 let mut packet = Vec::with_capacity(32 + pcm.len());
                 packet.extend_from_slice(&header.encode());
                 packet.extend_from_slice(&pcm);
-                sender_state.supervisor.send_audio(packet).await.unwrap();
+                sender_state.supervisor().send_audio(packet).await.unwrap();
                 if realtime {
                     tokio::time::sleep(std::time::Duration::from_millis(frame_ms)).await;
                 } else if sequence % 100 == 0 {
@@ -2420,7 +3411,7 @@ mod tests {
             .begin_stop(current_revision)
             .unwrap();
         state
-            .supervisor
+            .supervisor()
             .send_command(SidecarCommand::FinishSession { session_id })
             .await
             .unwrap();
@@ -2464,7 +3455,7 @@ mod tests {
         let second = state.core.lock().unwrap().start(second_request).unwrap();
         let second_id = second.session_id.unwrap();
         state
-            .supervisor
+            .supervisor()
             .send_command(SidecarCommand::StartSession(mock_session_payload(
                 second_id, false,
             )))
@@ -2493,7 +3484,7 @@ mod tests {
         let revision = state.core.lock().unwrap().snapshot().state_revision;
         state.core.lock().unwrap().begin_stop(revision).unwrap();
         state
-            .supervisor
+            .supervisor()
             .send_command(SidecarCommand::FinishSession {
                 session_id: second_id,
             })
@@ -2520,7 +3511,7 @@ mod tests {
             state.store().unwrap().search("", 10).await.unwrap().len(),
             2
         );
-        state.supervisor.shutdown().await;
+        state.supervisor().shutdown().await;
 
         let database_bytes = std::fs::metadata(&database_path).unwrap().len()
             + std::fs::metadata(database_path.with_extension("sqlite-wal"))

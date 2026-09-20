@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { emptySnapshot, type UiEventEnvelope } from "../types";
-import { applyUiEvent } from "./AppContext";
+import { defaultSessionDefaults, emptySnapshot, type UiEventEnvelope } from "../types";
+import { applyUiEvent, withProviderDefaults } from "./AppContext";
 
 function event(kind: UiEventEnvelope["kind"], payload: unknown): UiEventEnvelope {
   return {
@@ -191,5 +191,18 @@ describe("canonical desktop event projection", () => {
     expect(applyUiEvent(current, foreign)).toBe(current);
     const own: UiEventEnvelope = { ...foreign, session_id: "session-a" };
     expect(applyUiEvent(current, own).live.original_unstable).toBe("other");
+  });
+});
+
+describe("session defaults from the shell", () => {
+  it("fills missing cloud preferences so the provider selects stay controlled", () => {
+    const { cloud_asr_preference: _asr, cloud_translation_preference: _mt, ...legacy } = defaultSessionDefaults;
+    const filled = withProviderDefaults({ ...legacy, asr_provider: "deepgram" });
+    expect(filled.asr_provider).toBe("deepgram");
+    expect(filled.cloud_asr_preference).toBe("qwen_cloud");
+    expect(filled.cloud_translation_preference).toBe("qwen_cloud");
+    const explicit = withProviderDefaults({ ...defaultSessionDefaults, cloud_translation_preference: "deepl" });
+    expect(explicit.cloud_translation_preference).toBe("deepl");
+    expect(withProviderDefaults({ ...defaultSessionDefaults, cloud_asr_preference: "" }).cloud_asr_preference).toBe("qwen_cloud");
   });
 });

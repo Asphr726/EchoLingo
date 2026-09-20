@@ -153,7 +153,7 @@ button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-
   letter-spacing: .02em;
 }
 .field--wide { grid-column: span 2; }
-select, input[type="text"], textarea {
+select, input[type="text"], input[type="password"], textarea {
   width: 100%;
   border: 1px solid #cfcec5;
   border-radius: 9px;
@@ -161,9 +161,10 @@ select, input[type="text"], textarea {
   font-size: 12px;
   transition: border-color .2s var(--ease), background .2s var(--ease);
 }
-select, input[type="text"] { min-height: 36px; padding: 0 11px; }
+select, input[type="text"], input[type="password"] { min-height: 36px; padding: 0 11px; }
 textarea { padding: 10px 11px; resize: vertical; }
-select:hover, input[type="text"]:hover, textarea:hover { border-color: #b6b8ae; background: var(--surface-raised); }
+select:hover, input[type="text"]:hover, input[type="password"]:hover, textarea:hover { border-color: #b6b8ae; background: var(--surface-raised); }
+input::placeholder { color: #9a9c93; }
 .session-actions { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 21px; }
 .live-session-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding-bottom: 17px; border-bottom: 1px solid var(--line); }
 .live-session-header h2 { margin-top: 5px; }
@@ -442,6 +443,25 @@ select:hover, input[type="text"]:hover, textarea:hover { border-color: #b6b8ae; 
 .privacy-toggle input { width: 16px; height: 16px; accent-color: var(--accent); }
 .advanced-status { max-width: 570px; margin: 0; }
 .advanced-status div { padding: 9px 0; border-top: 1px solid var(--line); }
+.logs-path { display: block; padding: 9px 11px; border: 1px solid var(--line); border-radius: 9px; background: rgba(255, 255, 255, .42); color: #464842; font-family: var(--mono-font); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; user-select: all; }
+
+/* Cloud providers: one card per credential group. */
+.provider-cards { display: grid; gap: 12px; }
+.provider-card { display: grid; gap: 15px; padding: 18px 20px 17px; border: 1px solid var(--line); border-radius: 12px; background: rgba(255, 255, 255, .42); }
+.provider-card-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.provider-card-copy { display: grid; min-width: 0; gap: 5px; }
+.provider-card-copy strong { font-size: 13px; font-weight: 670; letter-spacing: -.01em; }
+.provider-card-copy small { color: var(--muted); font-size: 10px; line-height: 1.5; text-wrap: pretty; }
+.provider-card-copy a { display: inline-flex; align-items: center; gap: 3px; color: var(--accent-deep); font-weight: 640; text-decoration: none; white-space: nowrap; }
+.provider-card-copy a:hover { text-decoration: underline; }
+.provider-card-roles { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 2px; color: #5f625a; font-size: 9px; font-weight: 620; letter-spacing: .02em; }
+.provider-badge { display: inline-flex; flex-shrink: 0; align-items: center; gap: 6px; padding: 5px 9px; border: 1px solid #d9d4c6; border-radius: 999px; background: #f4efe3; color: #8a6a3a; font-size: 9px; font-weight: 660; white-space: nowrap; }
+.provider-badge--ok { border-color: #bfd0c3; background: var(--accent-soft); color: var(--accent-deep); }
+.provider-badge--neutral { border-color: var(--line); background: rgba(255, 255, 255, .5); color: var(--muted); }
+.provider-card-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px 16px; }
+.provider-card-grid .settings-control { max-width: none; }
+.provider-card .settings-helper { margin: 0; }
+.provider-card .cloud-probe { max-width: none; }
 
 .onboarding-shell { display: grid; min-height: 100dvh; grid-template-columns: 260px minmax(0, 1fr); background: var(--surface); color: var(--ink); }
 .onboarding-progress { display: flex; flex-direction: column; padding: 34px 28px; border-right: 1px solid var(--line); background: #e7e6df; }
@@ -528,4 +548,5 @@ body:has(.caption-window), body:has(.caption-window) #root { min-width: 0; min-h
   .privacy-disclosure { align-self: start; }
   .session-config { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .history-layout { grid-template-columns: 300px minmax(0, 1fr); }
+  .provider-card-grid { grid-template-columns: 1fr; }
 }

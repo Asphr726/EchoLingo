@@ -1,8 +1,24 @@
-import { CheckCircle, ClosedCaptioning, CloudArrowUp, Key, LockKey, SlidersHorizontal, Warning } from "@phosphor-icons/react";
+import { ArrowSquareOut, CheckCircle, ClosedCaptioning, CloudArrowUp, Key, LockKey, PlugsConnected, SlidersHorizontal, Warning } from "@phosphor-icons/react";
 import { type ReactNode, useEffect, useState } from "react";
 import { api, subscribeModelProgress } from "../lib/bridge";
+import { providersForGroup } from "../lib/providers";
 import { useApp } from "../state/AppContext";
-import type { CaptionDisplay, CloudCredentialStatus, CloudProbeResult, InferenceMode, ModelProgress, ModelStatus, RuntimePreferences, StartSessionRequest } from "../types";
+import type {
+  CaptionDisplay,
+  CloudProbeAsrResult,
+  CloudProbeResult,
+  CloudProbeTranslationResult,
+  CredentialGroup,
+  CredentialGroupStatus,
+  CredentialSource,
+  InferenceMode,
+  ModelProgress,
+  ModelStatus,
+  ProviderSpec,
+  RuntimePreferences,
+  StartSessionRequest,
+} from "../types";
+import { ProviderSelect } from "./ProviderSelect";
 
 const sections = [
   "General",
@@ -10,6 +26,7 @@ const sections = [
   "Languages",
   "Inference",
   "Models",
+  "Cloud providers",
   "Privacy",
   "Translation",
   "Appearance",
@@ -17,20 +34,29 @@ const sections = [
 ] as const;
 type Section = (typeof sections)[number];
 
+const sectionSlug = (section: Section) => section.toLowerCase().replace(/\s+/g, "-");
+
+/** `?section=cloud-providers` opens a section directly (browser preview and
+ *  screenshots); the in-app navigation never changes the URL. */
+function initialSection(): Section {
+  if (typeof window === "undefined") return "General";
+  const requested = new URLSearchParams(window.location.search).get("section");
+  return sections.find((section) => sectionSlug(section) === requested) ?? "General";
+}
+
 export function SettingsView() {
-  const [section, setSection] = useState<Section>("General");
-  const [credentialStatus, setCredentialStatus] = useState<CloudCredentialStatus | null>(null);
-  const [apiKey, setApiKey] = useState("");
-  const [workspaceId, setWorkspaceId] = useState("");
-  const [credentialPending, setCredentialPending] = useState(false);
+  const [section, setSection] = useState<Section>(initialSection);
+  // Availability per credential group; secret values are never held here.
+  const [credentialStatus, setCredentialStatus] = useState<Record<string, CredentialGroupStatus>>({});
   const [credentialError, setCredentialError] = useState<string | null>(null);
-  const [cloudProbe, setCloudProbe] = useState<CloudProbeResult | null>(null);
+  const [logsDirectory, setLogsDirectory] = useState<string | null>(null);
   const [models, setModels] = useState<ModelStatus[]>([]);
   const [modelProgress, setModelProgress] = useState<Record<string, ModelProgress>>({});
   const [modelPending, setModelPending] = useState<string | null>(null);
   const [modelError, setModelError] = useState<string | null>(null);
-  const { caption, draft, setDraft, snapshot, updateCaption } = useApp();
-  const [runtime, setRuntime] = useState<RuntimePreferences>({ preload_local_models: true });
+  const { caption, catalog, draft, setDraft, snapshot, updateCaption } = useApp();
+  const sessionActive = !["IDLE", "COMPLETED"].includes(snapshot.phase);
+  const [runtime, setRuntime] = useState<RuntimePreferences>({ preload_local_models: true, providers: {} });
   useEffect(() => {
     let active = true;
     api.runtimePreferences().then((value) => active && setRuntime(value)).catch(() => undefined);
@@ -50,9 +76,18 @@ export function SettingsView() {
     setDraft((current) => ({ ...current, [key]: value }));
 
   useEffect(() => {
-    void api.credentialStatus().then(setCredentialStatus).catch((error) => {
-      setCredentialError(String(error));
-    });
+    let active = true;
+    void api
+      .credentialStatus()
+      .then((groups) => {
+        if (!active) return;
+        setCredentialStatus(Object.fromEntries(groups.map((group) => [group.group_id, group])));
+      })
+      .catch((error) => active && setCredentialError(String(error)));
+    void api.logsDirectory().then((path) => active && setLogsDirectory(path)).catch(() => undefined);
+    return () => {
+      active = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -91,49 +126,6 @@ export function SettingsView() {
       setModels(await api.models().catch(() => models));
     } finally {
       setModelPending(null);
-    }
-  };
-
-  const saveCredentials = async () => {
-    setCredentialPending(true);
-    setCredentialError(null);
-    try {
-      setCredentialStatus(await api.setCloudCredentials(apiKey, workspaceId));
-      setCloudProbe(null);
-      setApiKey("");
-      setWorkspaceId("");
-    } catch (error) {
-      setCredentialError(String(error));
-    } finally {
-      setCredentialPending(false);
-    }
-  };
-
-  const testCloud = async () => {
-    setCredentialPending(true);
-    setCredentialError(null);
-    setCloudProbe(null);
-    try {
-      setCloudProbe(
-        await api.probeQwenCloud(draft.privacy.transcript_upload_allowed),
-      );
-    } catch (error) {
-      setCredentialError(String(error));
-    } finally {
-      setCredentialPending(false);
-    }
-  };
-
-  const clearCredentials = async () => {
-    setCredentialPending(true);
-    setCredentialError(null);
-    try {
-      setCredentialStatus(await api.clearCloudCredentials());
-      setCloudProbe(null);
-    } catch (error) {
-      setCredentialError(String(error));
-    } finally {
-      setCredentialPending(false);
     }
   };
 
@@ -213,7 +205,7 @@ export function SettingsView() {
               </div>
               <div className="auto-decision">
                 <span>Selected ASR</span>
-                <strong>{snapshot.route?.asr_model ?? "Evaluated when the session starts"}</strong>
+                <strong>{snapshot.route?.asr_model ?? snapshot.route?.asr_display_name ?? "Evaluated when the session starts"}</strong>
                 <p>{snapshot.route?.reason ?? "Auto compares calibration, memory, local model availability, network, credentials, and privacy policy."}</p>
               </div>
             </SettingsGroup>
@@ -235,21 +227,12 @@ export function SettingsView() {
           <div className="settings-groups">
             <SettingsGroup title="Provider preferences" description="Unavailable local models fall back through RuntimeRouter; provider APIs never leak into the pipeline.">
               <Control label="ASR provider">
-                <select value={draft.asr_provider} onChange={(event) => update("asr_provider", event.target.value)}>
-                  <option value="auto">Auto select</option>
-                  <option value="qwen_local">Qwen3-ASR local</option>
-                  <option value="qwen_cloud">Qwen realtime cloud</option>
-                  <option value="simulstreaming">SimulStreaming / Whisper</option>
-                </select>
+                <ProviderSelect kind="asr" catalog={catalog} sourceLanguage={draft.source_language} value={draft.asr_provider} onChange={(value) => update("asr_provider", value)} />
               </Control>
               <Control label="Translation provider">
-                <select value={draft.translation_provider} onChange={(event) => update("translation_provider", event.target.value)}>
-                  <option value="auto">Auto select</option>
-                  <option value="hymt_local">Hy-MT2 local</option>
-                  <option value="qwen_cloud">Qwen-MT cloud</option>
-                </select>
+                <ProviderSelect kind="translation" catalog={catalog} sourceLanguage={draft.source_language} value={draft.translation_provider} onChange={(value) => update("translation_provider", value)} />
               </Control>
-              <p className="settings-helper">Auto uses an installed model only after the matching runtime calibration meets the configured latency target.</p>
+              <p className="settings-helper">Auto uses an installed model only after the matching runtime calibration meets the configured latency target. Cloud entries need their credentials saved under Cloud providers.</p>
             </SettingsGroup>
             <SettingsGroup title="Local model manager" description="Downloads are pinned, checked, and activated atomically in EchoLingo application storage.">
               <div className="model-list">
@@ -289,51 +272,36 @@ export function SettingsView() {
               </div>
               {modelError && <p className="settings-error" role="alert">{modelError}</p>}
             </SettingsGroup>
-            <SettingsGroup title="Cloud credentials" description="Saved in macOS Keychain. Secret values never enter EchoLingo settings, history, events, or logs.">
-              <div className="credential-status" role="status">
-                {credentialStatus?.api_key_available && credentialStatus.workspace_id_available ? (
-                  <CheckCircle size={20} weight="fill" aria-hidden="true" />
-                ) : (
-                  <Warning size={20} weight="fill" aria-hidden="true" />
-                )}
-                <div>
-                  <strong>{credentialStatus?.api_key_available && credentialStatus.workspace_id_available ? "Qwen Cloud configured" : "Qwen Cloud not configured"}</strong>
-                  <small>{credentialStatus?.source === "macos_keychain" ? "Credentials are stored in macOS Keychain." : credentialStatus?.source === "environment" ? "Using development environment variables." : "Cloud sessions stay unavailable until both values are saved."}</small>
-                </div>
-              </div>
-              <Control label="DashScope API key">
-                <input type="password" autoComplete="off" value={apiKey} placeholder={credentialStatus?.api_key_available ? "Saved — enter to replace" : "Enter API key"} onChange={(event) => setApiKey(event.target.value)} />
+          </div>
+        )}
+
+        {section === "Cloud providers" && (
+          <div className="settings-groups">
+            <SettingsGroup title="Auto route" description="Auto keeps the local Qwen3-ASR and Hy-MT2 route as long as it meets the latency target; these are the cloud providers it hands over to.">
+              <Control label="Preferred cloud recognizer">
+                <ProviderSelect kind="asr" cloudOnly catalog={catalog} sourceLanguage={draft.source_language} value={draft.cloud_asr_preference} onChange={(value) => update("cloud_asr_preference", value)} />
               </Control>
-              <Control label="DashScope workspace ID">
-                <input type="password" autoComplete="off" value={workspaceId} placeholder={credentialStatus?.workspace_id_available ? "Saved — enter to replace" : "Enter workspace ID"} onChange={(event) => setWorkspaceId(event.target.value)} />
+              <Control label="Preferred cloud translator">
+                <ProviderSelect kind="translation" cloudOnly catalog={catalog} sourceLanguage={draft.source_language} value={draft.cloud_translation_preference} onChange={(value) => update("cloud_translation_preference", value)} />
               </Control>
-              <p className="settings-helper">
-                Use an international Model Studio API key and workspace ID from the same Singapore region. The connection test opens an authenticated ASR WebSocket but uploads no audio.
-              </p>
+              <p className="settings-helper">Used when the route is Auto and the local model misses its latency target. Audio or transcript upload must be allowed under Privacy before Auto may hand over.</p>
+            </SettingsGroup>
+            <SettingsGroup title="Credentials" description="Saved in the OS secure store. Secret values never enter EchoLingo settings, history, events, or logs; the inference service receives them only for the duration of a session.">
+              {!catalog && <p className="settings-helper">Loading the provider catalog…</p>}
               {credentialError && <p className="settings-error" role="alert">{credentialError}</p>}
-              {cloudProbe && (
-                <div className={cloudProbe.ok ? "cloud-probe cloud-probe--ok" : "cloud-probe cloud-probe--error"} role="status">
-                  <strong>{cloudProbe.ok ? "Qwen Cloud connection works" : "Qwen Cloud needs attention"}</strong>
-                  <span>
-                    ASR: {cloudProbe.asr.status}
-                    {cloudProbe.asr.handshake_latency_ms != null ? ` · ${cloudProbe.asr.handshake_latency_ms.toFixed(0)} ms handshake` : ""}
-                    {` · Translation: ${cloudProbe.translation.status}`}
-                  </span>
-                  {cloudProbe.message && <small>{cloudProbe.message}</small>}
-                  <small>Audio uploaded: no{draft.privacy.transcript_upload_allowed ? " · A fixed test sentence was sent to Qwen-MT." : " · Enable transcript upload to include Qwen-MT in this test."}</small>
-                </div>
-              )}
-              <div className="settings-inline">
-                <button className="button button--primary" type="button" disabled={credentialPending || apiKey.trim().length < 8 || workspaceId.trim().length < 3} onClick={() => void saveCredentials()}>
-                  <Key size={18} weight="regular" aria-hidden="true" />
-                  {credentialPending ? "Saving…" : "Save to Keychain"}
-                </button>
-                <button className="button" type="button" disabled={credentialPending || credentialStatus?.source !== "macos_keychain"} onClick={() => void clearCredentials()}>
-                  Remove
-                </button>
-                <button className="button" type="button" disabled={credentialPending || !credentialStatus?.api_key_available || !credentialStatus.workspace_id_available} onClick={() => void testCloud()}>
-                  {credentialPending ? "Working…" : "Test connection"}
-                </button>
+              <div className="provider-cards">
+                {catalog?.credential_groups.map((group) => (
+                  <CredentialGroupCard
+                    key={group.id}
+                    group={group}
+                    providers={providersForGroup(catalog, group.id)}
+                    status={credentialStatus[group.id] ?? null}
+                    transcriptUploadAllowed={draft.privacy.transcript_upload_allowed}
+                    sessionActive={sessionActive}
+                    onStatus={(next) => setCredentialStatus((current) => ({ ...current, [group.id]: next }))}
+                    onRuntime={setRuntime}
+                  />
+                ))}
               </div>
             </SettingsGroup>
           </div>
@@ -409,6 +377,11 @@ export function SettingsView() {
                 <div><dt>Cloud benchmark</dt><dd>Pending credentials</dd></div>
               </dl>
             </SettingsGroup>
+            <SettingsGroup title="Logs" description="Shell and inference-service logs for support requests. Credentials are never written to them.">
+              <Control label="Logs directory">
+                <code className="logs-path" tabIndex={0}>{logsDirectory ?? "Resolving…"}</code>
+              </Control>
+            </SettingsGroup>
           </div>
         )}
       </section>
@@ -418,6 +391,270 @@ export function SettingsView() {
 
 function formatBytes(bytes: number): string {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
+const sourceLabels: Record<CredentialSource, string> = {
+  keychain: "Stored in the secure store",
+  environment: "Using development environment variables",
+  none: "Not configured",
+};
+
+/** One credential group (vendor account) with its secret fields, non-secret
+ *  settings and a connection test. Typed values live only in component
+ *  state until Save; the shell reports availability, never the values. */
+function CredentialGroupCard({
+  group,
+  onRuntime,
+  onStatus,
+  providers,
+  sessionActive,
+  status,
+  transcriptUploadAllowed,
+}: {
+  group: CredentialGroup;
+  onRuntime: (runtime: RuntimePreferences) => void;
+  onStatus: (status: CredentialGroupStatus) => void;
+  providers: { asr?: ProviderSpec; translation?: ProviderSpec };
+  sessionActive: boolean;
+  status: CredentialGroupStatus | null;
+  transcriptUploadAllowed: boolean;
+}) {
+  const [values, setValues] = useState<Record<string, string>>({});
+  const [settingsDraft, setSettingsDraft] = useState<Record<string, string>>({});
+  const [pending, setPending] = useState<"save" | "clear" | "test" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [probe, setProbe] = useState<CloudProbeResult | null>(null);
+
+  const fieldStatus = (key: string) => status?.fields.find((field) => field.key === key);
+  const available = (key: string) => fieldStatus(key)?.available ?? false;
+  const configured = group.fields.filter((field) => field.required).every((field) => available(field.key));
+  const anyAvailable = group.fields.some((field) => available(field.key));
+  const source: CredentialSource = status?.fields.some((field) => field.available && field.source === "keychain")
+    ? "keychain"
+    : status?.fields.some((field) => field.available && field.source === "environment")
+      ? "environment"
+      : "none";
+  const storedSetting = (key: string) =>
+    status?.settings[key] ?? group.settings.find((setting) => setting.key === key)?.default ?? "";
+  const effectiveSetting = (key: string) => settingsDraft[key] ?? storedSetting(key);
+  const settingsChanged = group.settings.some((setting) => effectiveSetting(setting.key) !== storedSetting(setting.key));
+
+  const typed: Record<string, string> = {};
+  for (const field of group.fields) {
+    const value = (values[field.key] ?? "").trim();
+    if (value.length > 0) typed[field.key] = value;
+  }
+  const typedCount = Object.keys(typed).length;
+  const tooShort = group.fields.find((field) => typed[field.key] !== undefined && typed[field.key].length < field.min_len);
+  const missingRequired = group.fields.find((field) => field.required && !available(field.key) && typed[field.key] === undefined);
+  const canSave = !pending && !tooShort && (typedCount > 0 ? !missingRequired : settingsChanged);
+
+  const asrId = providers.asr?.id ?? null;
+  const translationId = transcriptUploadAllowed ? providers.translation?.id ?? null : null;
+  const canTest = !pending && !sessionActive && configured && Boolean(asrId || translationId);
+  const testHint = sessionActive
+    ? "Stop the current session before testing."
+    : !configured
+      ? "Save the required credentials first."
+      : !asrId && !translationId
+        ? "Enable transcript upload under Privacy to test translation."
+        : undefined;
+
+  const save = async () => {
+    setPending("save");
+    setError(null);
+    try {
+      let next = status;
+      if (typedCount > 0) {
+        next = await api.setCredentials(group.id, typed);
+        setValues({});
+        setProbe(null);
+      }
+      if (settingsChanged) {
+        const settings = Object.fromEntries(group.settings.map((setting) => [setting.key, effectiveSetting(setting.key)]));
+        const runtime = await api.updateProviderSettings(group.id, settings);
+        onRuntime(runtime);
+        next = {
+          group_id: group.id,
+          fields: next?.fields ?? group.fields.map((field) => ({ key: field.key, available: false, source: "none" as const })),
+          settings: { ...(next?.settings ?? {}), ...settings, ...(runtime.providers[group.id] ?? {}) },
+        };
+        setSettingsDraft({});
+        setProbe(null);
+      }
+      if (next) onStatus(next);
+    } catch (failure) {
+      setError(String(failure));
+    } finally {
+      setPending(null);
+    }
+  };
+
+  const clear = async () => {
+    setPending("clear");
+    setError(null);
+    try {
+      onStatus(await api.clearCredentials(group.id));
+      setValues({});
+      setProbe(null);
+    } catch (failure) {
+      setError(String(failure));
+    } finally {
+      setPending(null);
+    }
+  };
+
+  const test = async () => {
+    setPending("test");
+    setError(null);
+    setProbe(null);
+    try {
+      setProbe(await api.probeCloud(asrId, translationId));
+    } catch (failure) {
+      setError(String(failure));
+    } finally {
+      setPending(null);
+    }
+  };
+
+  return (
+    <article className="provider-card" aria-label={group.display_name}>
+      <header className="provider-card-header">
+        <div className="provider-card-copy">
+          <strong>{group.display_name}</strong>
+          <small>
+            {group.vendor}
+            {group.free_tier_note ? ` · ${group.free_tier_note}` : ""}
+            {group.docs_url && (
+              <>
+                {" "}
+                <a href={group.docs_url} target="_blank" rel="noreferrer">
+                  Get a key
+                  <ArrowSquareOut size={11} weight="bold" aria-hidden="true" />
+                </a>
+              </>
+            )}
+          </small>
+          <span className="provider-card-roles">
+            {providers.asr && <span>Recognition · {providers.asr.display_name}</span>}
+            {providers.translation && <span>Translation · {providers.translation.display_name}</span>}
+          </span>
+        </div>
+        <span className={anyAvailable ? "provider-badge provider-badge--ok" : configured ? "provider-badge provider-badge--neutral" : "provider-badge"} role="status">
+          {anyAvailable ? <CheckCircle size={15} weight="fill" aria-hidden="true" /> : configured ? <Key size={15} weight="regular" aria-hidden="true" /> : <Warning size={15} weight="fill" aria-hidden="true" />}
+          {anyAvailable ? sourceLabels[source] : !status ? "Checking…" : configured ? "Key optional" : "Not configured"}
+        </span>
+      </header>
+      <div className="provider-card-grid">
+        {group.fields.map((field) => (
+          <Control key={field.key} label={field.label}>
+            <input
+              type={field.secret ? "password" : "text"}
+              autoComplete="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              value={values[field.key] ?? ""}
+              placeholder={available(field.key) ? "Saved — enter to replace" : `Enter ${field.label}`}
+              onChange={(event) => setValues((current) => ({ ...current, [field.key]: event.target.value }))}
+            />
+          </Control>
+        ))}
+        {group.settings.map((setting) => (
+          <Control key={setting.key} label={setting.label}>
+            {setting.kind === "select" ? (
+              <select value={effectiveSetting(setting.key)} onChange={(event) => setSettingsDraft((current) => ({ ...current, [setting.key]: event.target.value }))}>
+                {setting.options.map(([value, label]) => (
+                  <option key={value} value={value}>{label}</option>
+                ))}
+              </select>
+            ) : (
+              <input
+                type="text"
+                autoComplete="off"
+                spellCheck={false}
+                value={effectiveSetting(setting.key)}
+                placeholder={setting.placeholder}
+                onChange={(event) => setSettingsDraft((current) => ({ ...current, [setting.key]: event.target.value }))}
+              />
+            )}
+          </Control>
+        ))}
+      </div>
+      <p className="settings-helper">
+        {providers.translation
+          ? `Test sends one fixed English sentence to ${group.vendor} when transcript upload is enabled; recognition tests never upload audio.`
+          : "Test completes the authenticated handshake only and never uploads audio."}
+      </p>
+      {tooShort && <p className="settings-error" role="alert">{tooShort.label} must be at least {tooShort.min_len} characters.</p>}
+      {error && <p className="settings-error" role="alert">{error}</p>}
+      {probe && <ProbeResult group={group} probe={probe} translationTested={Boolean(translationId)} translationAvailable={Boolean(providers.translation)} />}
+      <div className="settings-inline">
+        <button className="button button--primary" type="button" disabled={!canSave} onClick={() => void save()}>
+          <Key size={18} weight="regular" aria-hidden="true" />
+          {pending === "save" ? "Saving…" : "Save"}
+        </button>
+        <button className="button" type="button" disabled={Boolean(pending) || !anyAvailable || source !== "keychain"} onClick={() => void clear()}>
+          {pending === "clear" ? "Clearing…" : "Clear"}
+        </button>
+        <button className="button" type="button" disabled={!canTest} title={testHint} onClick={() => void test()}>
+          <PlugsConnected size={18} weight="regular" aria-hidden="true" />
+          {pending === "test" ? "Testing…" : "Test"}
+        </button>
+      </div>
+    </article>
+  );
+}
+
+function ProbeResult({
+  group,
+  probe,
+  translationAvailable,
+  translationTested,
+}: {
+  group: CredentialGroup;
+  probe: CloudProbeResult;
+  translationAvailable: boolean;
+  translationTested: boolean;
+}) {
+  const showRegion = group.id === "dashscope" && (probe.region || probe.host || probe.workspace_scoped != null);
+  return (
+    <div className={probe.ok ? "cloud-probe cloud-probe--ok" : "cloud-probe cloud-probe--error"} role="status">
+      <strong>{probe.ok ? `${group.display_name} connection works` : `${group.display_name} needs attention`}</strong>
+      {probe.asr.status !== "skipped" && <span>Recognition: {roleSummary(probe.asr, "handshake")}</span>}
+      {probe.translation.status !== "skipped" && <span>Translation: {roleSummary(probe.translation)}</span>}
+      {showRegion && (
+        <span>
+          Endpoint: {[probe.region, probe.host, probe.workspace_scoped == null ? null : probe.workspace_scoped ? "workspace-scoped" : "default workspace"]
+            .filter(Boolean)
+            .join(" · ")}
+        </span>
+      )}
+      {probe.message && <small>{probe.message}{probe.code ? ` (${probe.code})` : ""}</small>}
+      <small>
+        Audio uploaded: {probe.audio_uploaded ? "yes" : "no"}
+        {translationTested
+          ? ` · One fixed sentence was sent to ${group.vendor}.`
+          : translationAvailable
+            ? " · Enable transcript upload to include translation in this test."
+            : ""}
+      </small>
+    </div>
+  );
+}
+
+function roleSummary(result: CloudProbeAsrResult | CloudProbeTranslationResult, latencySuffix = ""): string {
+  const latency =
+    "handshake_latency_ms" in result
+      ? result.handshake_latency_ms
+      : "latency_ms" in result
+        ? result.latency_ms
+        : undefined;
+  const parts = [result.status.replace("_", " ")];
+  if (result.status === "connected") {
+    if (result.model) parts.push(result.model);
+    if (latency != null) parts.push(`${latency.toFixed(0)} ms${latencySuffix ? ` ${latencySuffix}` : ""}`);
+  }
+  return parts.join(" · ");
 }
 
 function SettingsGroup({ children, description, title }: { children: ReactNode; description: string; title: string }) {
