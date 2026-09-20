@@ -256,3 +256,26 @@ def test_redacted_dict_never_contains_secret_values(monkeypatch) -> None:
     text = json.dumps(AppConfig().redacted_dict())
     assert "dg-secret-value" not in text
     assert '"deepgram_api_key_available": true' in text
+
+
+def test_desktop_profiles_follow_installed_models() -> None:
+    from echolingo.service.session import align_local_profiles
+
+    config = AppConfig()
+    assert config.asr.local_profile == "quality"
+    align_local_profiles(
+        config, capabilities(local_models={"qwen3-asr-0.6b": True, "hymt2-1.8b": True})
+    )
+    assert config.asr.local_profile == "lightweight"
+    assert config.translation.local_profile == "lightweight"
+    payload = route_payload(
+        RuntimeRouter(config, capabilities()).select(), config
+    )
+    assert payload["asr_model"] == "qwen3-asr-0.6b"
+    # Nothing changes when the quality models are installed or nothing is.
+    config = AppConfig()
+    align_local_profiles(config, capabilities(local_models={"qwen3-asr-1.7b": True}))
+    assert config.asr.local_profile == "quality"
+    config = AppConfig()
+    align_local_profiles(config, capabilities(local_models={}))
+    assert config.asr.local_profile == "quality"

@@ -89,6 +89,30 @@ def desktop_config(payload: dict[str, Any]):
     return config
 
 
+def align_local_profiles(config, capabilities) -> None:
+    """Fall back to the lightweight local models when the quality ones are absent.
+
+    The desktop runtime manager only ships the 0.6B ASR and 1.8B Hy-MT models,
+    so the requested model name and the route label must follow what is
+    installed rather than the config's default profile.
+    """
+    models = capabilities.local_models
+    asr = config.asr.qwen_local
+    if (
+        config.asr.local_profile == "quality"
+        and not models.get(asr.quality_model)
+        and models.get(asr.lightweight_model)
+    ):
+        config.asr.local_profile = "lightweight"
+    mt = config.translation.hymt_local
+    if (
+        config.translation.local_profile == "quality"
+        and not models.get(mt.quality_model)
+        and models.get(mt.lightweight_model)
+    ):
+        config.translation.local_profile = "lightweight"
+
+
 def route_payload(decision, config=None) -> dict[str, Any]:
     """Serialize a route with the registry's locality, model and display names."""
     route = asdict(decision)
@@ -193,6 +217,7 @@ class DesktopInferenceSession:
     def plan(cls, payload: dict[str, Any]) -> dict[str, Any]:
         config = desktop_config(payload)
         capabilities = CapabilityDetector(Path.cwd()).detect()
+        align_local_profiles(config, capabilities)
         plan = RuntimeRouter(config, capabilities).plan()
         return {
             "session_id": str(payload["session_id"]),
@@ -207,6 +232,7 @@ class DesktopInferenceSession:
         config = desktop_config(payload)
 
         capabilities = CapabilityDetector(Path.cwd()).detect()
+        align_local_profiles(config, capabilities)
         decision = RuntimeRouter(config, capabilities).select()
         input_rate_hz = int(payload.get("sample_rate_hz", 48_000))
         channels = int(payload.get("channels", 1))
