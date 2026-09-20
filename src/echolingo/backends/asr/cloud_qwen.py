@@ -1,36 +1,22 @@
+"""Qwen realtime ASR over DashScope (Alibaba Model Studio)."""
+
 from __future__ import annotations
 
 import asyncio
 import base64
 import json
 import os
-import statistics
-import time
 import uuid
-from collections import deque
-from collections.abc import AsyncIterator
 
-import numpy as np
-
-from ...errors import AuthenticationError, PolicyDeniedError
-from ...models import (
-    AsrAudioChunk,
-    AsrSessionConfig,
-    BackendDescriptor,
-    BackendLocality,
-    CanonicalTranscriptEvent,
-    TranscriptKind,
-)
-from ...networking import AudioRingBuffer, RetryPolicy
-from ...streaming import SentenceUnitSegmenter, join_text, sanitize_committed_text
+from ...errors import AuthenticationError
 from .. import dashscope
-from ._queue import AsrEventQueue
-from .reconcile import TranscriptReconciler
+from .cloud_streaming import CloudStreamingAsrBase, ProviderTranscriptDelta
 
 
-class CloudQwenAsrBackend:
+class CloudQwenAsrBackend(CloudStreamingAsrBase):
     name = "qwen_cloud"
-    streaming_mode = "provider_realtime"
+    provider_id = "qwen_cloud"
+    display_name = "Qwen Cloud"
 
     def __init__(
         self,
@@ -51,64 +37,31 @@ class CloudQwenAsrBackend:
     ) -> None:
         if region not in dashscope.REGIONS:
             raise ValueError("Qwen ASR region must be singapore or beijing")
-        self.api_key = (api_key or os.getenv("DASHSCOPE_API_KEY") or "").strip() or None
+        super().__init__(
+            api_key=api_key or os.getenv("DASHSCOPE_API_KEY"),
+            model=model,
+            language=language,
+            audio_upload_allowed=audio_upload_allowed,
+            send_batch_ms=send_batch_ms,
+            ring_capacity_ms=ring_capacity_ms,
+            replay_overlap_ms=replay_overlap_ms,
+            reconnect_budget_s=reconnect_budget_s,
+            websocket_factory=websocket_factory,
+        )
         self.workspace_id = (
             (workspace_id or os.getenv("DASHSCOPE_WORKSPACE_ID") or "").strip() or None
         )
         self.region = region
-        self.model = model
-        self.language = language
-        self.audio_upload_allowed = audio_upload_allowed
         self.turn_detection_threshold = turn_detection_threshold
         self.silence_duration_ms = silence_duration_ms
-        self.send_batch_samples = int(send_batch_ms * 16_000 / 1000)
-        self.replay_overlap_ms = replay_overlap_ms
-        self.websocket_factory = websocket_factory
-        self.descriptor = BackendDescriptor(
-            "qwen_cloud",
-            model,
-            BackendLocality.CLOUD,
-            ("en", "zh", "ja", "ko"),
-            audio_upload_required=True,
-        )
-        self.ring = AudioRingBuffer(ring_capacity_ms)
-        self.retry = RetryPolicy(budget_s=reconnect_budget_s)
-        self._events = AsrEventQueue()
-        self._websocket = None
-        self._receiver: asyncio.Task[None] | None = None
-        self._connected = asyncio.Event()
-        self._session_finished = asyncio.Event()
-        self._closing = False
-        self._finishing = False
-        self._send_lock = asyncio.Lock()
-        self._pending: list[AsrAudioChunk] = []
-        self._pending_samples = 0
-        self._reconciler = TranscriptReconciler()
-        self._provider_confirmed = ""
-        self._provider_stash = ""
-        self._segmenter: SentenceUnitSegmenter | None = None
-        self._closed_text = ""
-        self._last_unit_end_ms = 0.0
-        self._revision = 0
-        self._epoch = 0
-        self._last_speech_end_ms = 0.0
-        self._sent_times: deque[tuple[float, int]] = deque(maxlen=100)
-        self._rtts: deque[float] = deque(maxlen=20)
-        self._session_started_ns: int | None = None
-        self._audio_origin_ns: int | None = None
-        self._first_text_seen = False
-        self.cloud_roundtrip_latency_ms: float | None = None
-        self.network_jitter_ms: float | None = None
-        self.reconnect_count = 0
-        self.cloud_audio_uploaded_ms = 0.0
-        self.lag_ms: float | None = None
+
+    # -------------------------------------------------------------- endpoint
 
     @property
     def dashscope_endpoint(self) -> dashscope.DashScopeEndpoint:
         return dashscope.resolve_endpoint(self.region, self.workspace_id)
 
-    @property
-    def endpoint(self) -> str:
+    def build_url(self) -> str:
         return f"{self.dashscope_endpoint.realtime_url}?model={self.model}"
 
     def describe_endpoint(self) -> dict[str, object]:
@@ -117,25 +70,11 @@ class CloudQwenAsrBackend:
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.api_key}", **dashscope.REALTIME_HEADERS}
 
-    @property
-    def buffered_audio_ms(self) -> float:
-        return self.ring.buffered_audio_ms
+    def connect_headers(self) -> dict[str, str]:
+        return self._headers()
 
-    @property
-    def dropped_audio_ms(self) -> float:
-        return self.ring.dropped_audio_ms
-
-    async def _open(self):
-        if self.websocket_factory is not None:
-            return await self.websocket_factory(self.endpoint, self._headers())
-        import websockets
-
-        return await websockets.connect(
-            self.endpoint,
-            additional_headers=self._headers(),
-            max_size=8 * 1024 * 1024,
-            open_timeout=10,
-        )
+    def missing_credentials_message(self) -> str:
+        return "Qwen Cloud requires a DashScope API key."
 
     @staticmethod
     def connection_error(
@@ -164,27 +103,13 @@ class CloudQwenAsrBackend:
             f"({type(error).__name__}). Check the network, region, and workspace ID."
         )
 
-    async def _open_with_diagnostics(self):
-        try:
-            return await self._open()
-        except Exception as error:
-            raise self.connection_error(
-                error, region=self.region, workspace_id=self.workspace_id
-            ) from error
+    def map_connection_error(self, error: Exception) -> Exception:
+        return self.connection_error(error, region=self.region, workspace_id=self.workspace_id)
 
-    async def probe_connection(self) -> float:
-        """Validate the authenticated WebSocket handshake without uploading audio."""
-        if not self.api_key:
-            raise AuthenticationError("Qwen Cloud requires a DashScope API key.")
-        started_ns = time.monotonic_ns()
-        websocket = await self._open_with_diagnostics()
-        try:
-            return (time.monotonic_ns() - started_ns) / 1_000_000.0
-        finally:
-            await websocket.close()
+    # -------------------------------------------------------------- protocol
 
-    async def _connect(self) -> None:
-        self._websocket = await self._open_with_diagnostics()
+    def session_start_messages(self) -> list[str | bytes]:
+        assert self.config is not None
         transcription: dict[str, object] = {}
         if self.config.language != "auto":
             transcription["language"] = self.config.language
@@ -202,316 +127,62 @@ class CloudQwenAsrBackend:
         }
         if transcription:
             session["input_audio_transcription"] = transcription
-        await self._websocket.send(
+        return [
             json.dumps(
                 {"event_id": str(uuid.uuid4()), "type": "session.update", "session": session}
             )
-        )
-        self._connected.set()
+        ]
 
-    async def start_session(self, config: AsrSessionConfig) -> None:
-        if not self.audio_upload_allowed:
-            raise PolicyDeniedError("Cloud ASR requires explicit audio upload consent")
-        if not self.api_key:
-            raise AuthenticationError("DASHSCOPE_API_KEY is required")
-        self.config = config
-        self._segmenter = SentenceUnitSegmenter(config.language)
-        self._session_started_ns = time.monotonic_ns()
-        await self._connect()
-        self._receiver = asyncio.create_task(self._receive_loop())
-
-    async def _send_json(self, value: dict) -> None:
-        await self._websocket.send(json.dumps(value))
-
-    @staticmethod
-    def _pcm_bytes(chunks: tuple[AsrAudioChunk, ...] | list[AsrAudioChunk]) -> bytes:
-        if not chunks:
-            return b""
-        samples = np.concatenate([chunk.samples for chunk in chunks])
-        return (np.clip(samples, -1.0, 1.0) * 32767.0).astype("<i2", copy=False).tobytes()
-
-    async def _send_chunks(self, chunks: tuple[AsrAudioChunk, ...] | list[AsrAudioChunk]) -> None:
-        pcm = self._pcm_bytes(chunks)
-        if not pcm:
-            return
-        await self._send_json(
+    def encode_audio(self, pcm: bytes) -> str | bytes:
+        return json.dumps(
             {
                 "event_id": str(uuid.uuid4()),
                 "type": "input_audio_buffer.append",
                 "audio": base64.b64encode(pcm).decode("ascii"),
             }
         )
-        self.cloud_audio_uploaded_ms += len(pcm) / 2 / 16_000 * 1000.0
-        self._sent_times.append((chunks[-1].end_ms, time.monotonic_ns()))
 
-    async def push_audio(self, chunk: AsrAudioChunk) -> None:
-        if self._audio_origin_ns is None:
-            self._audio_origin_ns = chunk.sent_at_monotonic_ns - int(chunk.start_ms * 1_000_000)
-        self.ring.append(chunk)
-        async with self._send_lock:
-            self._pending.append(chunk)
-            self._pending_samples += chunk.samples.size
-            if self._pending_samples < self.send_batch_samples:
-                return
-            batch, self._pending = self._pending, []
-            self._pending_samples = 0
-            if not self._connected.is_set():
-                return
-            try:
-                await self._send_chunks(batch)
-            except Exception:
-                self._connected.clear()
+    def finish_messages(self) -> list[str | bytes]:
+        return [json.dumps({"event_id": str(uuid.uuid4()), "type": "session.finish"})]
 
-    def _note_delivery(self, event: dict) -> None:
-        if not self._sent_times:
-            return
-        now = time.monotonic_ns()
-        _, sent = self._sent_times[-1]
-        value = max(0.0, (now - sent) / 1_000_000.0)
-        self.cloud_roundtrip_latency_ms = value
-        self._rtts.append(value)
-        if len(self._rtts) >= 2:
-            self.network_jitter_ms = statistics.pstdev(self._rtts)
-        if self._audio_origin_ns is not None:
-            self.lag_ms = max(
-                0.0,
-                (now - self._audio_origin_ns) / 1_000_000.0 - self.ring.latest_end_ms,
-            )
-
-    def _canonical(
-        self,
-        kind: TranscriptKind,
-        text: str,
-        provider_event: dict,
-        *,
-        committed: str = "",
-        unstable: str = "",
-        error_code: str | None = None,
-        recoverable: bool | None = None,
-    ) -> CanonicalTranscriptEvent:
-        now_ns = time.monotonic_ns()
-        first_token_latency_ms = None
-        if kind in {TranscriptKind.PARTIAL, TranscriptKind.STABLE} and not self._first_text_seen:
-            self._first_text_seen = True
-            if self._session_started_ns is not None:
-                first_token_latency_ms = (now_ns - self._session_started_ns) / 1_000_000.0
-        commit_latency_ms = None
-        if (
-            kind == TranscriptKind.FINAL
-            and self._audio_origin_ns is not None
-            and self._last_speech_end_ms
-        ):
-            audio_end_ns = self._audio_origin_ns + int(self._last_speech_end_ms * 1_000_000)
-            commit_latency_ms = max(0.0, (now_ns - audio_end_ns) / 1_000_000.0)
-        return CanonicalTranscriptEvent(
-            session_id=self.config.session_id,
-            event_id=str(uuid.uuid4()),
-            revision_id=self._revision,
-            kind=kind,
-            text=text,
-            language=self.config.language,
-            emitted_at_monotonic_ns=now_ns,
-            backend=self.name,
-            streaming_mode=self.streaming_mode,
-            committed_text=committed,
-            unstable_text=unstable,
-            audio_cursor_ms=self.ring.latest_end_ms,
-            locality=BackendLocality.CLOUD,
-            provider="qwen_cloud",
-            model=self.model,
-            session_epoch=self._epoch,
-            provider_event_id=provider_event.get("event_id"),
-            error_code=error_code,
-            recoverable=recoverable,
-            first_token_latency_ms=first_token_latency_ms,
-            commit_latency_ms=commit_latency_ms,
-        )
-
-    async def _handle_message(self, message: dict) -> None:
+    def parse_message(self, raw: str | bytes) -> ProviderTranscriptDelta | None:
+        if not isinstance(raw, str):
+            return None
+        message = json.loads(raw)
         event_type = str(message.get("type", ""))
+        event_id = message.get("event_id")
         if event_type == "session.finished":
-            self._session_finished.set()
-            return
+            return ProviderTranscriptDelta("finished", provider_event_id=event_id)
         if event_type == "input_audio_buffer.speech_stopped":
-            self._last_speech_end_ms = float(message.get("audio_end_ms") or 0.0)
-            return
+            return ProviderTranscriptDelta(
+                "speech_stopped",
+                speech_end_ms=float(message.get("audio_end_ms") or 0.0),
+                provider_event_id=event_id,
+            )
         if event_type == "error" or message.get("error"):
             error = message.get("error") or {}
             code = str(error.get("code") or message.get("code") or "provider_error")
             detail = str(error.get("message") or message.get("message") or code)
-            recoverable = "rate" in code.lower() or "timeout" in code.lower()
-            await self._events.put(
-                self._canonical(
-                    TranscriptKind.ERROR,
-                    detail,
-                    message,
-                    error_code=code,
-                    recoverable=recoverable,
-                )
+            return ProviderTranscriptDelta(
+                "error",
+                error_code=code,
+                error_message=detail,
+                recoverable="rate" in code.lower() or "timeout" in code.lower(),
+                provider_event_id=event_id,
             )
-            return
         if event_type == "conversation.item.input_audio_transcription.text":
-            self._note_delivery(message)
             payload = message.get("transcript") or message
-            confirmed = str(payload.get("text") or "").strip()
-            stash = str(payload.get("stash") or "").strip()
-            if confirmed != self._provider_confirmed:
-                self._provider_confirmed = confirmed
-                await self._commit_confirmed(confirmed, message)
-            if stash != self._provider_stash:
-                self._provider_stash = stash
-                await self._emit_partial(stash, message)
-            return
+            return ProviderTranscriptDelta(
+                "text",
+                confirmed=str(payload.get("text") or "").strip(),
+                unstable=str(payload.get("stash") or "").strip(),
+                provider_event_id=event_id,
+            )
         if event_type == "conversation.item.input_audio_transcription.completed":
-            self._note_delivery(message)
             payload = message.get("transcript") or message
-            final_text = str(payload.get("text") or payload.get("transcript") or "").strip()
-            await self._commit_confirmed(final_text, message)
-            self._provider_stash = ""
-            if self._segmenter is not None:
-                await self._emit_units([self._segmenter.flush()], message)
-            self._revision += 1
-            await self._events.put(
-                self._canonical(
-                    TranscriptKind.FINAL,
-                    self._closed_text,
-                    message,
-                    committed=self._closed_text,
-                )
+            return ProviderTranscriptDelta(
+                "final",
+                final_text=str(payload.get("text") or payload.get("transcript") or "").strip(),
+                provider_event_id=event_id,
             )
-            if self._last_speech_end_ms:
-                self.ring.discard_before(
-                    max(0.0, self._last_speech_end_ms - self.replay_overlap_ms)
-                )
-
-    async def _commit_confirmed(self, confirmed: str, message: dict) -> None:
-        """Merge provider-confirmed text and release any completed sentence units."""
-        previous = self._reconciler.committed
-        committed, changed = self._reconciler.merge_confirmed(confirmed)
-        if not changed or self._segmenter is None:
-            return
-        delta = committed[len(previous):] if committed.startswith(previous) else committed
-        delta = sanitize_committed_text(delta, self.config.language)
-        if not delta.strip():
-            return
-        units = self._segmenter.append(
-            delta, start_ms=self._last_unit_end_ms, end_ms=self.ring.latest_end_ms
-        )
-        await self._emit_units(units, message)
-
-    async def _emit_units(self, units, message: dict) -> None:
-        for unit in units:
-            if unit is None or not unit.text:
-                continue
-            self._closed_text = join_text(self.config.language, self._closed_text, unit.text)
-            self._revision += 1
-            event = self._canonical(
-                TranscriptKind.STABLE,
-                unit.text,
-                message,
-                committed=self._closed_text,
-                unstable=self._provider_stash,
-            )
-            event.start_ms = unit.start_ms
-            event.end_ms = unit.end_ms
-            if unit.end_ms is not None:
-                self._last_unit_end_ms = unit.end_ms
-            await self._events.put(event)
-
-    async def _emit_partial(self, stash: str, message: dict) -> None:
-        open_text = self._segmenter.open_text if self._segmenter is not None else ""
-        display = join_text(self.config.language, open_text, stash)
-        if not display:
-            return
-        self._revision += 1
-        event = self._canonical(
-            TranscriptKind.PARTIAL,
-            display,
-            message,
-            committed=self._closed_text,
-            unstable=stash,
-        )
-        event.stable_text = open_text
-        await self._events.put(event)
-
-    async def _reconnect(self, cause: Exception) -> bool:
-        self._connected.clear()
-        if self._closing or self._finishing:
-            return False
-        for delay in self.retry.delays():
-            await asyncio.sleep(delay)
-            try:
-                await self._connect()
-                self._epoch += 1
-                self.reconnect_count += 1
-                self._provider_confirmed = ""
-                self._provider_stash = ""
-                replay_start = max(0.0, self._last_speech_end_ms - self.replay_overlap_ms)
-                replay = self.ring.replay_from(replay_start)
-                for index in range(0, len(replay), 10):
-                    await self._send_chunks(replay[index : index + 10])
-                self._pending.clear()
-                self._pending_samples = 0
-                return True
-            except AuthenticationError:
-                break
-            except Exception:
-                continue
-        await self._events.put(
-            self._canonical(
-                TranscriptKind.ERROR,
-                f"Cloud ASR connection unavailable: {type(cause).__name__}",
-                {},
-                error_code="network_error",
-                recoverable=True,
-            )
-        )
-        return False
-
-    async def _receive_loop(self) -> None:
-        while not self._closing:
-            try:
-                raw = await self._websocket.recv()
-                if isinstance(raw, str):
-                    await self._handle_message(json.loads(raw))
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                if not await self._reconnect(error):
-                    return
-
-    def events(self) -> AsyncIterator[CanonicalTranscriptEvent]:
-        return self._events.events()
-
-    async def finish_session(self) -> None:
-        async with self._send_lock:
-            if self._pending and self._connected.is_set():
-                await self._send_chunks(self._pending)
-            self._pending.clear()
-            self._pending_samples = 0
-        self._finishing = True
-        if self._connected.is_set():
-            await self._send_json({"event_id": str(uuid.uuid4()), "type": "session.finish"})
-            try:
-                await asyncio.wait_for(self._session_finished.wait(), timeout=30.0)
-            except TimeoutError:
-                await self._events.put(
-                    self._canonical(
-                        TranscriptKind.ERROR,
-                        "Cloud ASR finish timed out",
-                        {},
-                        error_code="provider_timeout",
-                        recoverable=True,
-                    )
-                )
-        self._closing = True
-        await self._events.end()
-
-    async def close(self) -> None:
-        self._closing = True
-        if self._receiver is not None and not self._receiver.done():
-            self._receiver.cancel()
-            await asyncio.gather(self._receiver, return_exceptions=True)
-        if self._websocket is not None:
-            await self._websocket.close()
-        await self._events.end()
+        return None

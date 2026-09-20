@@ -1,23 +1,16 @@
+"""Qwen-MT over the DashScope OpenAI-compatible endpoint."""
+
 from __future__ import annotations
 
-import json
 import os
-import time
-import uuid
-from collections.abc import AsyncIterator
 
 import httpx
 
-from ...errors import AuthenticationError, PolicyDeniedError, RateLimitError
-from ...models import (
-    BackendDescriptor,
-    BackendLocality,
-    CanonicalTranslationEvent,
-    GlossaryTerm,
-    TranslationKind,
-    TranslationRequest,
-)
+from ...errors import AuthenticationError, RateLimitError
+from ...models import TranslationRequest
+from ...translation.policy import TranslationRequestError
 from .. import dashscope
+from .chat_base import OpenAiCompatibleChatTranslation
 
 _LANGUAGE_NAMES = {
     "auto": "auto",
@@ -28,7 +21,10 @@ _LANGUAGE_NAMES = {
 }
 
 
-class CloudQwenMtBackend:
+class CloudQwenMtBackend(OpenAiCompatibleChatTranslation):
+    provider_id = "qwen_cloud"
+    display_name = "Qwen-MT"
+
     def __init__(
         self,
         *,
@@ -43,49 +39,56 @@ class CloudQwenMtBackend:
     ) -> None:
         if region not in dashscope.REGIONS:
             raise ValueError("Qwen-MT region must be singapore or beijing")
-        self.api_key = (api_key or os.getenv("DASHSCOPE_API_KEY") or "").strip() or None
         self.workspace_id = (
             (workspace_id or os.getenv("DASHSCOPE_WORKSPACE_ID") or "").strip() or None
         )
         self.region = region
         self.interactive_model = interactive_model
         self.quality_model = quality_model
-        self.transcript_upload_allowed = transcript_upload_allowed
-        self._owns_client = client is None
-        self.client = client or httpx.AsyncClient(timeout=timeout_s)
-        self.glossary: tuple[GlossaryTerm, ...] = ()
-        self.descriptor = BackendDescriptor(
-            "qwen_cloud",
-            interactive_model,
-            BackendLocality.CLOUD,
-            transcript_upload_required=True,
+        super().__init__(
+            base_url=dashscope.resolve_endpoint(region, self.workspace_id).compatible_base_url,
+            model=interactive_model,
+            api_key=api_key or os.getenv("DASHSCOPE_API_KEY"),
+            transcript_upload_allowed=transcript_upload_allowed,
+            timeout_s=timeout_s,
+            client=client,
         )
 
     @property
     def dashscope_endpoint(self) -> dashscope.DashScopeEndpoint:
         return dashscope.resolve_endpoint(self.region, self.workspace_id)
 
-    @property
-    def base_url(self) -> str:
-        return self.dashscope_endpoint.compatible_base_url
-
     def describe_endpoint(self) -> dict[str, object]:
         return self.dashscope_endpoint.describe()
 
-    def _authorize(self) -> None:
+    def missing_credentials_message(self) -> str:
+        return "DASHSCOPE_API_KEY is required"
+
+    def authorize(self) -> None:
         if not self.transcript_upload_allowed:
-            raise PolicyDeniedError(
-                "Cloud translation requires explicit transcript upload consent"
-            )
+            from ...errors import PolicyDeniedError
+
+            raise PolicyDeniedError("Cloud translation requires explicit transcript upload consent")
         if not self.api_key:
-            raise AuthenticationError("DASHSCOPE_API_KEY is required")
+            raise AuthenticationError(self.missing_credentials_message())
 
-    async def set_glossary(self, terms: tuple[GlossaryTerm, ...]) -> None:
-        self.glossary = terms
+    def model_for(self, request: TranslationRequest) -> str:
+        return self.interactive_model
 
-    def build_payload(
-        self, request: TranslationRequest, *, model: str, stream: bool
-    ) -> dict:
+    def window_model_for(self, request: TranslationRequest) -> str:
+        return self.quality_model
+
+    def accumulate(self, text: str, delta: str) -> str:
+        # qwen-mt-plus/turbo stream the whole translation on every delta.
+        if self.interactive_model in {"qwen-mt-plus", "qwen-mt-turbo"}:
+            return delta
+        return text + delta
+
+    def guard(self, text: str, request: TranslationRequest) -> tuple[str, str | None]:
+        # Qwen-MT is a dedicated translation model; no repetition guard needed.
+        return text, None
+
+    def build_payload(self, request: TranslationRequest, *, model: str, stream: bool) -> dict:
         terms = request.terms or self.glossary
         memory = [
             {"source": item.source, "target": item.target}
@@ -126,126 +129,11 @@ class CloudQwenMtBackend:
             raise AuthenticationError(dashscope.forbidden_message("Qwen-MT", endpoint))
         if response.status_code == 429:
             raise RateLimitError("Cloud Qwen-MT rate limit exceeded")
-        response.raise_for_status()
-
-    def _event(
-        self,
-        request: TranslationRequest,
-        kind: TranslationKind,
-        text: str,
-        revision: int,
-        model: str,
-        started_ns: int,
-        first_delta_ms: float | None = None,
-        usage: dict | None = None,
-    ) -> CanonicalTranslationEvent:
-        return CanonicalTranslationEvent(
-            request_id=request.request_id,
-            event_id=str(uuid.uuid4()),
-            revision_id=revision,
-            source_revision_id=request.source_revision_id,
-            kind=kind,
-            text=text,
-            provider="qwen_cloud",
-            model=model,
-            locality=BackendLocality.CLOUD,
-            emitted_at_monotonic_ns=time.monotonic_ns(),
-            editable_text=text if kind == TranslationKind.PARTIAL else "",
-            committed_text=text if kind == TranslationKind.FINAL else "",
-            first_delta_latency_ms=first_delta_ms,
-            total_latency_ms=(time.monotonic_ns() - started_ns) / 1_000_000.0,
-            prompt_tokens=(usage or {}).get("prompt_tokens"),
-            completion_tokens=(usage or {}).get("completion_tokens"),
-        )
-
-    def translate_incremental(
-        self, request: TranslationRequest
-    ) -> AsyncIterator[CanonicalTranslationEvent]:
-        async def generate():
-            self._authorize()
-            started = time.monotonic_ns()
-            text = ""
-            revision = 0
-            first_delta = None
-            usage: dict | None = None
-            payload = self.build_payload(
-                request, model=self.interactive_model, stream=True
-            )
-            async with self.client.stream(
-                "POST",
-                f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json=payload,
-            ) as response:
-                self._raise_status(response)
-                async for line in response.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    raw = line[5:].strip()
-                    if not raw or raw == "[DONE]":
-                        continue
-                    chunk = json.loads(raw)
-                    usage = chunk.get("usage") or usage
-                    choices = chunk.get("choices") or []
-                    if not choices:
-                        continue
-                    content = str(choices[0].get("delta", {}).get("content") or "")
-                    if not content:
-                        continue
-                    if self.interactive_model in {"qwen-mt-plus", "qwen-mt-turbo"}:
-                        text = content
-                    else:
-                        text += content
-                    revision += 1
-                    if first_delta is None:
-                        first_delta = (time.monotonic_ns() - started) / 1_000_000.0
-                    yield self._event(
-                        request,
-                        TranslationKind.PARTIAL,
-                        text,
-                        revision,
-                        self.interactive_model,
-                        started,
-                        first_delta,
-                        usage,
-                    )
-            revision += 1
-            yield self._event(
-                request,
-                TranslationKind.FINAL,
-                text,
-                revision,
-                self.interactive_model,
-                started,
-                first_delta,
-                usage,
+        if response.status_code >= 400:
+            raise TranslationRequestError(
+                f"http_{response.status_code}",
+                f"Qwen-MT returned HTTP {response.status_code}",
             )
 
-        return generate()
-
-    async def retranslate_window(
-        self, request: TranslationRequest
-    ) -> CanonicalTranslationEvent:
-        self._authorize()
-        started = time.monotonic_ns()
-        response = await self.client.post(
-            f"{self.base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            json=self.build_payload(request, model=self.quality_model, stream=False),
-        )
+    async def raise_status(self, response: httpx.Response, request: TranslationRequest) -> None:
         self._raise_status(response)
-        value = response.json()
-        text = str(value["choices"][0]["message"]["content"])
-        return self._event(
-            request,
-            TranslationKind.FINAL,
-            text,
-            1,
-            self.quality_model,
-            started,
-            usage=value.get("usage"),
-        )
-
-    async def close(self) -> None:
-        if self._owns_client:
-            await self.client.aclose()
