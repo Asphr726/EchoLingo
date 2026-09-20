@@ -2,7 +2,7 @@ import { CheckCircle, ClosedCaptioning, CloudArrowUp, Key, LockKey, SlidersHoriz
 import { type ReactNode, useEffect, useState } from "react";
 import { api, subscribeModelProgress } from "../lib/bridge";
 import { useApp } from "../state/AppContext";
-import type { CaptionDisplay, CloudCredentialStatus, CloudProbeResult, InferenceMode, ModelProgress, ModelStatus, StartSessionRequest } from "../types";
+import type { CaptionDisplay, CloudCredentialStatus, CloudProbeResult, InferenceMode, ModelProgress, ModelStatus, RuntimePreferences, StartSessionRequest } from "../types";
 
 const sections = [
   "General",
@@ -30,6 +30,22 @@ export function SettingsView() {
   const [modelPending, setModelPending] = useState<string | null>(null);
   const [modelError, setModelError] = useState<string | null>(null);
   const { caption, draft, setDraft, snapshot, updateCaption } = useApp();
+  const [runtime, setRuntime] = useState<RuntimePreferences>({ preload_local_models: true });
+  useEffect(() => {
+    let active = true;
+    api.runtimePreferences().then((value) => active && setRuntime(value)).catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, []);
+  const updateRuntime = async (next: RuntimePreferences) => {
+    setRuntime(next);
+    try {
+      setRuntime(await api.updateRuntimePreferences(next));
+    } catch {
+      setRuntime(runtime);
+    }
+  };
   const update = <K extends keyof StartSessionRequest>(key: K, value: StartSessionRequest[K]) =>
     setDraft((current) => ({ ...current, [key]: value }));
 
@@ -200,6 +216,17 @@ export function SettingsView() {
                 <strong>{snapshot.route?.asr_model ?? "Evaluated when the session starts"}</strong>
                 <p>{snapshot.route?.reason ?? "Auto compares calibration, memory, local model availability, network, credentials, and privacy policy."}</p>
               </div>
+            </SettingsGroup>
+            <SettingsGroup title="Startup" description="Local models take about a minute to load. Preloading keeps them resident so the first Start responds immediately.">
+              <label className="check-row">
+                <input
+                  type="checkbox"
+                  checked={runtime.preload_local_models}
+                  onChange={(event) => void updateRuntime({ ...runtime, preload_local_models: event.target.checked })}
+                />
+                <span>Preload local models when EchoLingo launches</span>
+              </label>
+              <p className="settings-helper">{snapshot.startup_status ?? "Models load in the background after launch and stay loaded until you quit."}</p>
             </SettingsGroup>
           </div>
         )}

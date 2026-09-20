@@ -193,6 +193,11 @@ export function LiveView() {
             {snapshot.startup_status ?? "Starting the inference service and checking local models…"}
           </p>
         )}
+        {["IDLE", "COMPLETED"].includes(snapshot.phase) && snapshot.startup_status && (
+          <p className={`startup-status ${snapshot.models_ready ? "startup-status--ready" : ""}`} role="status">
+            {snapshot.startup_status}
+          </p>
+        )}
         {privacyBlocked && (
           <p className="field-error" role="alert">
             Enable the required upload permission before starting this cloud route.

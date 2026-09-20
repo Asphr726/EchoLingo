@@ -23,22 +23,6 @@ export function HistoryView() {
   const [title, setTitle] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
 
-  const refresh = async (search = query) => {
-    setLoading(true);
-    setError(null);
-    try {
-      setSessions(await api.historySearch(search));
-    } catch (failure) {
-      setError(String(failure));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    void refresh("");
-  }, []);
-
   const open = async (session: SessionRecord) => {
     setError(null);
     try {
@@ -51,6 +35,26 @@ export function HistoryView() {
       setError(String(failure));
     }
   };
+
+  const refresh = async (search = query) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const found = await api.historySearch(search);
+      setSessions(found);
+      // Land on the most recent session instead of an empty detail pane.
+      if (!search && found.length > 0 && selected === null) await open(found[0]);
+    } catch (failure) {
+      setError(String(failure));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void refresh("");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const rename = async () => {
     if (!selected || !title.trim()) return;

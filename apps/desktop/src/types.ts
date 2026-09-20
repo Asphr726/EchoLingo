@@ -106,6 +106,8 @@ export interface SessionSnapshot {
   metrics: LiveMetrics;
   recoverable_error: string | null;
   startup_status?: string | null;
+  /** UI-only: local model services were pre-warmed and are ready. */
+  models_ready?: boolean;
 }
 
 export interface AudioDevice {
@@ -130,6 +132,10 @@ export interface AudioTestResult {
   channels: number;
   peak_rms_dbfs: number;
   frames_observed: number;
+}
+
+export interface RuntimePreferences {
+  preload_local_models: boolean;
 }
 
 export interface CaptionPreferences {

@@ -71,11 +71,25 @@ export function applyUiEvent(snapshot: SessionSnapshot, event: UiEventEnvelope):
   if (event.kind === "backend_health") {
     const service = String(payload.service ?? "inference backend");
     const state = String(payload.state ?? "starting");
+    if (service === "warmup") {
+      // Background pre-warm of the sidecar and local models at launch.
+      if (state === "starting") {
+        return { ...snapshot, models_ready: false, startup_status: "Preparing local models in the background…" };
+      }
+      if (state === "connected") {
+        return { ...snapshot, models_ready: true, startup_status: "Local models are ready. Start is immediate." };
+      }
+      return {
+        ...snapshot,
+        models_ready: false,
+        startup_status: `Local models will load when you press Start (${String(payload.message ?? "preload unavailable")}).`,
+      };
+    }
     const label = service === "qwen_asr" ? "Qwen3-ASR" : service === "hymt" ? "Hy-MT2" : service;
     const startupStatus = state === "connected"
       ? `${label} is ready.`
       : service === "qwen_asr"
-        ? "Loading Qwen3-ASR on this device. The first start can take 1–2 minutes."
+        ? "Loading Qwen3-ASR on this device. The first load can take 1–2 minutes."
         : `Loading ${label} on this device…`;
     return { ...snapshot, startup_status: startupStatus };
   }

@@ -21,7 +21,10 @@ const views = [
 ];
 
 export function MainWindow() {
-  const [view, setView] = useState<View>("live");
+  const [view, setView] = useState<View>(() => {
+    const requested = new URLSearchParams(window.location.search).get("view");
+    return requested === "history" || requested === "settings" ? requested : "live";
+  });
   const { clearError, error, loading, onboardingComplete, snapshot } = useApp();
   const activeRoute = snapshot.route?.deployment ?? "not routed";
 

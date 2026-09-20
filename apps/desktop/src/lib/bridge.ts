@@ -8,6 +8,7 @@ import type {
   CloudCredentialStatus,
   CloudProbeResult,
   ModelProgress,
+  RuntimePreferences,
   ModelStatus,
   SessionDetail,
   SessionRecord,
@@ -74,8 +75,22 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
       },
     ] satisfies AudioDevice[],
     get_caption_preferences: defaultCaptionPreferences,
+    get_runtime_preferences: { preload_local_models: true } satisfies RuntimePreferences,
     get_session_defaults: defaultSessionDefaults,
-    history_search: [],
+    history_search: previewMode() ? [previewSessionRecord()] : [],
+    history_open: previewMode()
+      ? ({
+          session: previewSessionRecord(),
+          segments: previewScript.map(([source, target], index) => ({
+            id: `preview-history-${index}`,
+            start_ms: index * 6_500,
+            end_ms: index * 6_500 + 6_000,
+            source_text: source,
+            translated_text: index === 3 ? "" : target,
+            timestamp_quality: "forced",
+          })),
+        } satisfies SessionDetail)
+      : undefined,
     credential_status: {
       api_key_available: false,
       workspace_id_available: false,
@@ -100,7 +115,7 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
   if (name === "update_session_defaults") {
     return args?.defaults as T;
   }
-  if (name === "update_caption_preferences") {
+  if (name === "update_caption_preferences" || name === "update_runtime_preferences") {
     return args?.preferences as T;
   }
   if (name in values) return values[name] as T;
@@ -123,6 +138,24 @@ const previewScript: Array<[string, string]> = [
   ["It transitions up through some oranges, through a yellow, through to green.", "它向上过渡为一些橙色，再经过黄色，最终变为绿色。"],
   ["If you see this color organization this way, but if you have to pick.", "如果你这样理解这种颜色排列方式，但当你必须做出选择时……"],
 ];
+
+function previewSessionRecord(): SessionRecord {
+  return {
+    id: "preview-session",
+    title: "en → zh lecture",
+    status: "completed",
+    started_at: new Date(Date.now() - 3_600_000).toISOString(),
+    ended_at: new Date().toISOString(),
+    source_language: "en",
+    target_language: "zh",
+    audio_source: "microphone",
+    audio_profile: "lecture",
+    inference_mode: "auto",
+    asr_backend: "qwen_local",
+    translation_backend: "hymt_local",
+    route_reason: "preview",
+  };
+}
 
 let previewFeedToken = 0;
 
@@ -280,6 +313,9 @@ export const api = {
   stop: (revision: number) =>
     command<SessionSnapshot>("stop_session", { expectedStateRevision: revision }),
   captionPreferences: () => command<CaptionPreferences>("get_caption_preferences"),
+  runtimePreferences: () => command<RuntimePreferences>("get_runtime_preferences"),
+  updateRuntimePreferences: (preferences: RuntimePreferences) =>
+    command<RuntimePreferences>("update_runtime_preferences", { preferences }),
   sessionDefaults: () => command<StartSessionRequest>("get_session_defaults"),
   updateSessionDefaults: (defaults: StartSessionRequest) =>
     command<StartSessionRequest>("update_session_defaults", { defaults }),

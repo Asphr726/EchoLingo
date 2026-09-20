@@ -167,6 +167,8 @@ struct RuntimeState {
     local_runtimes: std::sync::OnceLock<LocalRuntimeManager>,
     onboarding_complete: std::sync::atomic::AtomicBool,
     persistence_throttle: Mutex<PersistenceThrottle>,
+    runtime_preferences: Mutex<RuntimePreferences>,
+    warmup_in_progress: std::sync::atomic::AtomicBool,
 }
 
 impl Default for RuntimeState {
@@ -188,6 +190,8 @@ impl Default for RuntimeState {
             local_runtimes: std::sync::OnceLock::new(),
             onboarding_complete: std::sync::atomic::AtomicBool::new(false),
             persistence_throttle: Mutex::new(PersistenceThrottle::default()),
+            runtime_preferences: Mutex::new(RuntimePreferences::default()),
+            warmup_in_progress: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -287,6 +291,11 @@ impl RuntimeState {
                 .lock()
                 .map_err(|_| "caption preferences lock poisoned".to_string())?
                 .clone(),
+            runtime: self
+                .runtime_preferences
+                .lock()
+                .map_err(|_| "runtime preferences lock poisoned".to_string())?
+                .clone(),
         })
     }
 
@@ -318,6 +327,7 @@ struct DesktopPreferences {
     onboarding_complete: bool,
     session: StartSessionRequest,
     caption: CaptionPreferences,
+    runtime: RuntimePreferences,
 }
 
 impl Default for DesktopPreferences {
@@ -327,6 +337,24 @@ impl Default for DesktopPreferences {
             onboarding_complete: false,
             session: StartSessionRequest::default(),
             caption: CaptionPreferences::default(),
+            runtime: RuntimePreferences::default(),
+        }
+    }
+}
+
+/// Non-secret runtime behaviour the user controls from Settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct RuntimePreferences {
+    /// Start the inference sidecar and the local model services right after
+    /// launch so the first Start does not wait ~1-2 minutes for model load.
+    preload_local_models: bool,
+}
+
+impl Default for RuntimePreferences {
+    fn default() -> Self {
+        Self {
+            preload_local_models: true,
         }
     }
 }
@@ -1371,6 +1399,35 @@ fn update_session_defaults(
 }
 
 #[tauri::command]
+fn get_runtime_preferences(state: State<'_, RuntimeState>) -> Result<RuntimePreferences, String> {
+    Ok(state
+        .runtime_preferences
+        .lock()
+        .map_err(|_| "runtime preferences lock poisoned".to_string())?
+        .clone())
+}
+
+#[tauri::command]
+fn update_runtime_preferences(
+    app: AppHandle,
+    state: State<'_, RuntimeState>,
+    preferences: RuntimePreferences,
+) -> Result<RuntimePreferences, String> {
+    let previous = {
+        let mut guard = state
+            .runtime_preferences
+            .lock()
+            .map_err(|_| "runtime preferences lock poisoned".to_string())?;
+        std::mem::replace(&mut *guard, preferences.clone())
+    };
+    state.persist_preferences()?;
+    if preferences.preload_local_models && !previous.preload_local_models {
+        warm_local_runtimes(app);
+    }
+    Ok(preferences)
+}
+
+#[tauri::command]
 fn update_caption_preferences(
     app: AppHandle,
     state: State<'_, RuntimeState>,
@@ -1437,6 +1494,151 @@ fn hide_caption_window(app: AppHandle) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// Start the sidecar, plan the route for `payload` and bring every local model
+/// service the plan needs to a healthy state, emitting `backend_health` events
+/// so the UI can show model startup. Idempotent: healthy services return
+/// immediately, so a warm-up at launch and a later Start share the work.
+async fn prepare_inference_runtimes(
+    app: &AppHandle,
+    state: &RuntimeState,
+    session_id: uuid::Uuid,
+    payload: &Value,
+) -> Result<Vec<String>, String> {
+    let mut sidecar_environment = state.credentials.sidecar_environment()?;
+    sidecar_environment.insert(
+        "ECHOLINGO_MODEL_ROOT".into(),
+        state.models()?.root().to_string_lossy().into_owned(),
+    );
+    let alignment_spool = state
+        .models()?
+        .root()
+        .parent()
+        .ok_or_else(|| "model directory has no application-data parent".to_string())?
+        .join("alignment-spool");
+    sidecar_environment.insert(
+        "ECHOLINGO_ALIGNMENT_SPOOL_ROOT".into(),
+        alignment_spool.to_string_lossy().into_owned(),
+    );
+    sidecar_environment.extend(state.local_runtimes()?.capability_environment());
+    state
+        .supervisor
+        .configure_secret_environment(sidecar_environment)
+        .await;
+    state
+        .supervisor
+        .ensure_started()
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut receiver = state.supervisor.subscribe();
+    state
+        .supervisor
+        .send_command(SidecarCommand::PlanSession(payload.clone()))
+        .await
+        .map_err(|error| error.to_string())?;
+    let services_to_start = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            match receiver.recv().await {
+                Ok(SidecarEvent::RoutePlan {
+                    session_id: planned,
+                    services_to_start,
+                    ..
+                }) if planned == session_id => return Ok(services_to_start),
+                Ok(SidecarEvent::Error { message, .. }) => return Err(message),
+                Ok(_) => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    })
+    .await
+    .map_err(|_| "inference route planning timed out".to_string())??;
+    for service in &services_to_start {
+        state.emit_event(
+            app,
+            Some(session_id),
+            UiEventKind::BackendHealth,
+            json!({"service": service, "state": "starting"}),
+        )?;
+        state
+            .local_runtimes()?
+            .ensure_service(service)
+            .await
+            .map_err(|error| error.to_string())?;
+        state.emit_event(
+            app,
+            Some(session_id),
+            UiEventKind::BackendHealth,
+            json!({"service": service, "state": "connected"}),
+        )?;
+    }
+    Ok(services_to_start)
+}
+
+/// Pre-warm the inference sidecar and local models for the saved session
+/// defaults so the first Start is immediate. Runs in the background; failures
+/// are reported as a recoverable warning and never block the UI.
+fn warm_local_runtimes(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<RuntimeState>();
+        if state
+            .warmup_in_progress
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let result = async {
+            let enabled = state
+                .runtime_preferences
+                .lock()
+                .map_err(|_| "runtime preferences lock poisoned".to_string())?
+                .preload_local_models;
+            if !enabled || !state.onboarding_complete.load(Ordering::Acquire) {
+                return Ok(Vec::new());
+            }
+            if state.snapshot()?.phase != SessionPhase::Idle {
+                return Ok(Vec::new());
+            }
+            let defaults = state
+                .session_defaults
+                .lock()
+                .map_err(|_| "session defaults lock poisoned".to_string())?
+                .clone();
+            let warmup_id = uuid::Uuid::new_v4();
+            let mut payload = serde_json::to_value(&defaults).map_err(|error| error.to_string())?;
+            let object = payload
+                .as_object_mut()
+                .ok_or_else(|| "invalid session defaults".to_string())?;
+            object.insert("session_id".into(), json!(warmup_id));
+            object.insert("sample_rate_hz".into(), json!(48_000));
+            object.insert("channels".into(), json!(1));
+            state.emit_event(
+                &app,
+                None,
+                UiEventKind::BackendHealth,
+                json!({"service": "warmup", "state": "starting"}),
+            )?;
+            let services = prepare_inference_runtimes(&app, &state, warmup_id, &payload).await?;
+            state.emit_event(
+                &app,
+                None,
+                UiEventKind::BackendHealth,
+                json!({"service": "warmup", "state": "connected", "services": services}),
+            )?;
+            Ok::<Vec<String>, String>(services)
+        }
+        .await;
+        state.warmup_in_progress.store(false, Ordering::Release);
+        if let Err(error) = result {
+            eprintln!("local runtime warm-up skipped: {error}");
+            let _ = state.emit_event(
+                &app,
+                None,
+                UiEventKind::BackendHealth,
+                json!({"service": "warmup", "state": "unavailable", "message": error}),
+            );
+        }
+    });
+}
+
 #[tauri::command]
 async fn start_session(
     app: AppHandle,
@@ -1465,88 +1667,21 @@ async fn start_session(
         let capture_format =
             preferred_capture_format(source_kind, session_config.audio_device_id.as_deref())
                 .map_err(|error| error.to_string())?;
-        let mut sidecar_environment = state.credentials.sidecar_environment()?;
-        sidecar_environment.insert(
-            "ECHOLINGO_MODEL_ROOT".into(),
-            state.models()?.root().to_string_lossy().into_owned(),
-        );
-        let alignment_spool = state
-            .models()?
-            .root()
-            .parent()
-            .ok_or_else(|| "model directory has no application-data parent".to_string())?
-            .join("alignment-spool");
-        sidecar_environment.insert(
-            "ECHOLINGO_ALIGNMENT_SPOOL_ROOT".into(),
-            alignment_spool.to_string_lossy().into_owned(),
-        );
-        sidecar_environment.extend(state.local_runtimes()?.capability_environment());
-        state
-            .supervisor
-            .configure_secret_environment(sidecar_environment)
-            .await;
-        state
-            .supervisor
-            .ensure_started()
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut receiver = state.supervisor.subscribe();
-        let mut payload = serde_json::to_value(
-            starting
-                .config
-                .as_ref()
-                .ok_or_else(|| "missing session config".to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
+        let session_id = starting
+            .session_id
+            .ok_or_else(|| "missing session id".to_string())?;
+        let mut payload = serde_json::to_value(session_config).map_err(|error| error.to_string())?;
         let object = payload
             .as_object_mut()
             .ok_or_else(|| "invalid session config".to_string())?;
-        object.insert("session_id".into(), json!(starting.session_id));
+        object.insert("session_id".into(), json!(session_id));
         object.insert(
             "sample_rate_hz".into(),
             json!(capture_format.sample_rate_hz),
         );
         object.insert("channels".into(), json!(capture_format.channels));
-        state
-            .supervisor
-            .send_command(SidecarCommand::PlanSession(payload.clone()))
-            .await
-            .map_err(|error| error.to_string())?;
-        let services_to_start = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-            loop {
-                match receiver.recv().await {
-                    Ok(SidecarEvent::RoutePlan {
-                        session_id,
-                        services_to_start,
-                        ..
-                    }) if Some(session_id) == starting.session_id => return Ok(services_to_start),
-                    Ok(SidecarEvent::Error { message, .. }) => return Err(message),
-                    Ok(_) => continue,
-                    Err(error) => return Err(error.to_string()),
-                }
-            }
-        })
-        .await
-        .map_err(|_| "inference route planning timed out".to_string())??;
-        for service in &services_to_start {
-            state.emit_event(
-                &app,
-                starting.session_id,
-                UiEventKind::BackendHealth,
-                json!({"service": service, "state": "starting"}),
-            )?;
-            state
-                .local_runtimes()?
-                .ensure_service(service)
-                .await
-                .map_err(|error| error.to_string())?;
-            state.emit_event(
-                &app,
-                starting.session_id,
-                UiEventKind::BackendHealth,
-                json!({"service": service, "state": "connected"}),
-            )?;
-        }
+        let mut receiver = state.supervisor.subscribe();
+        prepare_inference_runtimes(&app, &state, session_id, &payload).await?;
         state
             .supervisor
             .send_command(SidecarCommand::StartSession(payload))
@@ -1872,6 +2007,8 @@ pub fn run() {
             get_caption_preferences,
             get_session_defaults,
             update_session_defaults,
+            get_runtime_preferences,
+            update_runtime_preferences,
             update_caption_preferences,
             show_caption_window,
             hide_caption_window,
@@ -1945,6 +2082,12 @@ pub fn run() {
                 .emit_snapshot(app.handle(), &snapshot)
                 .map_err(std::io::Error::other)?;
             forward_sidecar_events(app.handle().clone());
+            if let Ok(mut runtime) = state.runtime_preferences.lock() {
+                *runtime = preferences.runtime;
+            }
+            if std::env::var("ECHOLINGO_PRELOAD_LOCAL_MODELS").as_deref() != Ok("0") {
+                warm_local_runtimes(app.handle().clone());
+            }
             Ok(())
         })
         .on_window_event(|window, event| {

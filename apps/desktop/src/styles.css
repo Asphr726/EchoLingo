@@ -208,6 +208,7 @@ select:hover, input[type="text"]:hover, textarea:hover { border-color: #b6b8ae; 
 .action-progress { height: 2px; margin-top: 13px; overflow: hidden; border-radius: 2px; background: #d9ddd7; }
 .action-progress::after { display: block; width: 32%; height: 100%; content: ""; background: var(--accent); animation: progress-slide 1.2s var(--ease) infinite; }
 .startup-status { margin: 10px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.startup-status--ready { color: var(--accent-deep); }
 @keyframes progress-slide { from { transform: translateX(-100%); } to { transform: translateX(320%); } }
 .field-error, .inline-error { margin: 10px 0 0; color: var(--danger); font-size: 11px; }
 
@@ -289,7 +290,9 @@ select:hover, input[type="text"]:hover, textarea:hover { border-color: #b6b8ae; 
 .bilingual-row--history { padding: 13px 0; }
 .bilingual-row--history p { font-size: 13.5px; }
 .bilingual-row--history + .bilingual-row--history { border-top: 0; }
-@media (max-width: 900px) {
+/* Stack the two languages when the pane itself is narrow (container width,
+   so the History detail pane beside the session list behaves correctly). */
+@container (max-width: 640px) {
   .bilingual-row { grid-template-columns: 56px minmax(0, 1fr); row-gap: 6px; }
   .bilingual-row .row-translation, .bilingual-row--header span:last-child { grid-column: 2; }
   .bilingual-row--header span:nth-child(3) { display: none; }
@@ -311,9 +314,10 @@ select:hover, input[type="text"]:hover, textarea:hover { border-color: #b6b8ae; 
   font-size: 10px;
   font-weight: 680;
 }
-.detail-segments { border-top: 1px solid var(--line); }
-.detail-segments .bilingual-row--header { background: transparent; backdrop-filter: none; padding-left: 0; padding-right: 0; }
+.detail-segments { container-type: inline-size; border-top: 1px solid var(--line); }
+.detail-segments .bilingual-row--header { position: static; background: transparent; backdrop-filter: none; padding-left: 0; padding-right: 0; }
 .detail-segments .bilingual-row--history { padding-left: 0; padding-right: 0; }
+.live-feed-shell { container-type: inline-size; }
 
 .inspector-section { padding: 23px 21px; border-bottom: 1px solid var(--line); }
 .backend-field { display: grid; gap: 6px; margin-top: 13px; }
@@ -337,7 +341,7 @@ select:hover, input[type="text"]:hover, textarea:hover { border-color: #b6b8ae; 
 .check-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; color: #4f554e; font-size: 10px; }
 .check-row input { accent-color: var(--accent); }
 
-.history-layout { display: grid; grid-template-columns: minmax(270px, 34%) minmax(0, 1fr); min-height: 100%; }
+.history-layout { display: grid; grid-template-columns: minmax(250px, 27%) minmax(0, 1fr); min-height: 100%; }
 .history-list-pane { padding: 25px 18px 36px 34px; border-right: 1px solid var(--line); }
 .search-field { display: flex; height: 38px; align-items: center; gap: 8px; padding: 0 10px; border: 1px solid #cdccc3; border-radius: 10px; background: rgba(255, 254, 250, .68); }
 .search-field svg { color: #85877e; }
@@ -379,7 +383,6 @@ select:hover, input[type="text"]:hover, textarea:hover { border-color: #b6b8ae; 
 .export-row button { padding: 4px 7px; border: 1px solid #cecec5; border-radius: 6px; background: transparent; color: #555850; font-size: 9px; font-weight: 680; }
 .session-meta { display: flex; flex-wrap: wrap; gap: 16px; padding: 13px 0; color: #85877f; font-size: 9px; }
 .session-meta strong { color: #53554e; font-weight: 630; }
-.detail-segments article { grid-template-columns: 86px minmax(0, 1fr); }
 .no-segments { color: var(--muted); font-size: 11px; }
 
 .settings-layout { display: grid; grid-template-columns: 190px minmax(0, 720px); gap: 42px; min-height: 100%; padding: 29px 34px 60px; }
