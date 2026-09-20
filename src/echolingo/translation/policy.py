@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from typing import Protocol
 
 from ..models import (
+    BackendLocality,
     CanonicalTranscriptEvent,
     CanonicalTranslationEvent,
     GlossaryTerm,
@@ -414,7 +415,7 @@ class StreamingTranslationCoordinator:
             text=message,
             provider=getattr(descriptor, "provider", "unknown"),
             model=getattr(descriptor, "model", "unknown"),
-            locality=getattr(descriptor, "locality", None) or _mock_locality(),
+            locality=getattr(descriptor, "locality", None) or BackendLocality.MOCK,
             emitted_at_monotonic_ns=time.monotonic_ns(),
             committed_text=self.target.committed_text,
             editable_text=self.target.editable_text,
@@ -439,8 +440,3 @@ class StreamingTranslationCoordinator:
 
         return generate()
 
-
-def _mock_locality():
-    from ..models import BackendLocality
-
-    return BackendLocality.MOCK
