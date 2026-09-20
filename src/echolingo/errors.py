@@ -13,6 +13,11 @@ class BackendError(EchoLingoError):
     code = "backend_error"
     recoverable = False
 
+    @property
+    def error_code(self) -> str:
+        """Stable machine-readable code for UI/event payloads."""
+        return self.code
+
 
 class BackendUnavailableError(BackendError):
     code = "backend_unavailable"

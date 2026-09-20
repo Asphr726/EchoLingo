@@ -1,0 +1,836 @@
+{
+  "asr": [
+    {
+      "audio_upload_required": false,
+      "auto_route_eligible": false,
+      "credential_group": null,
+      "description": "",
+      "display_name": "No recognition",
+      "id": "none",
+      "kind": "asr",
+      "languages": [],
+      "local_service_id": null,
+      "locality": "mock",
+      "selectable": false,
+      "streaming_partials": true,
+      "transcript_upload_required": false,
+      "vendor": ""
+    },
+    {
+      "audio_upload_required": false,
+      "auto_route_eligible": false,
+      "credential_group": null,
+      "description": "",
+      "display_name": "Mock recognizer",
+      "id": "mock",
+      "kind": "asr",
+      "languages": [
+        "en",
+        "zh",
+        "ja",
+        "ko"
+      ],
+      "local_service_id": null,
+      "locality": "mock",
+      "selectable": true,
+      "streaming_partials": true,
+      "transcript_upload_required": false,
+      "vendor": ""
+    },
+    {
+      "audio_upload_required": false,
+      "auto_route_eligible": true,
+      "credential_group": null,
+      "description": "Runs on this device; no audio leaves the machine.",
+      "display_name": "Qwen3-ASR (local)",
+      "id": "qwen_local",
+      "kind": "asr",
+      "languages": [
+        "en",
+        "zh",
+        "ja",
+        "ko"
+      ],
+      "local_service_id": "qwen_asr",
+      "locality": "local",
+      "selectable": true,
+      "streaming_partials": true,
+      "transcript_upload_required": false,
+      "vendor": "Alibaba / local"
+    },
+    {
+      "audio_upload_required": false,
+      "auto_route_eligible": false,
+      "credential_group": null,
+      "description": "",
+      "display_name": "SimulStreaming / Whisper (local)",
+      "id": "simulstreaming",
+      "kind": "asr",
+      "languages": [
+        "en",
+        "zh",
+        "ja",
+        "ko"
+      ],
+      "local_service_id": "qwen_asr",
+      "locality": "local",
+      "selectable": true,
+      "streaming_partials": true,
+      "transcript_upload_required": false,
+      "vendor": "local"
+    },
+    {
+      "audio_upload_required": true,
+      "auto_route_eligible": true,
+      "credential_group": "dashscope",
+      "description": "",
+      "display_name": "Qwen realtime ASR (cloud)",
+      "id": "qwen_cloud",
+      "kind": "asr",
+      "languages": [
+        "en",
+        "zh",
+        "ja",
+        "ko"
+      ],
+      "local_service_id": null,
+      "locality": "cloud",
+      "selectable": true,
+      "streaming_partials": true,
+      "transcript_upload_required": false,
+      "vendor": "Alibaba Cloud"
+    },
+    {
+      "audio_upload_required": true,
+      "auto_route_eligible": false,
+      "credential_group": "openai",
+      "description": "",
+      "display_name": "OpenAI realtime transcription (cloud)",
+      "id": "openai_realtime",
+      "kind": "asr",
+      "languages": [
+        "en",
+        "zh",
+        "ja",
+        "ko"
+      ],
+      "local_service_id": null,
+      "locality": "cloud",
+      "selectable": true,
+      "streaming_partials": true,
+      "transcript_upload_required": false,
+      "vendor": "OpenAI"
+    },
+    {
+      "audio_upload_required": true,
+      "auto_route_eligible": false,
+      "credential_group": "deepgram",
+      "description": "",
+      "display_name": "Deepgram streaming (cloud)",
+      "id": "deepgram",
+      "kind": "asr",
+      "languages": [
+        "en",
+        "zh",
+        "ja",
+        "ko"
+      ],
+      "local_service_id": null,
+      "locality": "cloud",
+      "selectable": true,
+      "streaming_partials": true,
+      "transcript_upload_required": false,
+      "vendor": "Deepgram"
+    },
+    {
+      "audio_upload_required": true,
+      "auto_route_eligible": false,
+      "credential_group": "assemblyai",
+      "description": "English-first streaming model.",
+      "display_name": "AssemblyAI Universal-Streaming (cloud)",
+      "id": "assemblyai",
+      "kind": "asr",
+      "languages": [
+        "en"
+      ],
+      "local_service_id": null,
+      "locality": "cloud",
+      "selectable": true,
+      "streaming_partials": true,
+      "transcript_upload_required": false,
+      "vendor": "AssemblyAI"
+    },
+    {
+      "audio_upload_required": true,
+      "auto_route_eligible": false,
+      "credential_group": "gladia",
+      "description": "",
+      "display_name": "Gladia live (cloud)",
+      "id": "gladia",
+      "kind": "asr",
+      "languages": [
+        "en",
+        "zh",
+        "ja",
+        "ko"
+      ],
+      "local_service_id": null,
+      "locality": "cloud",
+      "selectable": true,
+      "streaming_partials": true,
+      "transcript_upload_required": false,
+      "vendor": "Gladia"
+    }
+  ],
+  "credential_groups": [
+    {
+      "display_name": "Qwen Cloud (Alibaba Model Studio)",
+      "docs_url": "https://help.aliyun.com/zh/model-studio/",
+      "fields": [
+        {
+          "env_var": "DASHSCOPE_API_KEY",
+          "key": "api_key",
+          "keychain_account": "dashscope-api-key",
+          "label": "API key",
+          "min_len": 8,
+          "required": true,
+          "secret": true
+        },
+        {
+          "env_var": "DASHSCOPE_WORKSPACE_ID",
+          "key": "workspace_id",
+          "keychain_account": "dashscope-workspace-id",
+          "label": "Workspace ID (optional)",
+          "min_len": 3,
+          "required": false,
+          "secret": false
+        }
+      ],
+      "free_tier_note": "New accounts receive free quota per model for 90 days in the Beijing region only; the Singapore region has no free quota.",
+      "id": "dashscope",
+      "settings": [
+        {
+          "default": "singapore",
+          "env_var": "ECHOLINGO_QWEN_REGION",
+          "key": "region",
+          "kind": "select",
+          "label": "Region",
+          "options": [
+            [
+              "singapore",
+              "Singapore (international)"
+            ],
+            [
+              "beijing",
+              "Beijing (mainland China)"
+            ]
+          ],
+          "placeholder": ""
+        }
+      ],
+      "vendor": "Alibaba Cloud"
+    },
+    {
+      "display_name": "OpenAI",
+      "docs_url": "https://platform.openai.com/api-keys",
+      "fields": [
+        {
+          "env_var": "OPENAI_API_KEY",
+          "key": "api_key",
+          "keychain_account": "openai-api-key",
+          "label": "API key",
+          "min_len": 20,
+          "required": true,
+          "secret": true
+        }
+      ],
+      "free_tier_note": "Pay as you go; realtime transcription and chat models are billed per minute / token.",
+      "id": "openai",
+      "settings": [
+        {
+          "default": "gpt-4o-transcribe",
+          "env_var": "ECHOLINGO_OPENAI_REALTIME_MODEL",
+          "key": "realtime_model",
+          "kind": "text",
+          "label": "Realtime transcription model",
+          "options": [],
+          "placeholder": "gpt-4o-transcribe"
+        },
+        {
+          "default": "gpt-4o-mini",
+          "env_var": "ECHOLINGO_OPENAI_CHAT_MODEL",
+          "key": "chat_model",
+          "kind": "text",
+          "label": "Chat translation model",
+          "options": [],
+          "placeholder": "gpt-4o-mini"
+        }
+      ],
+      "vendor": "OpenAI"
+    },
+    {
+      "display_name": "Deepgram",
+      "docs_url": "https://console.deepgram.com/",
+      "fields": [
+        {
+          "env_var": "DEEPGRAM_API_KEY",
+          "key": "api_key",
+          "keychain_account": "deepgram-api-key",
+          "label": "API key",
+          "min_len": 20,
+          "required": true,
+          "secret": true
+        }
+      ],
+      "free_tier_note": "New accounts receive free credit (about $200) without a card.",
+      "id": "deepgram",
+      "settings": [
+        {
+          "default": "nova-3",
+          "env_var": "ECHOLINGO_DEEPGRAM_MODEL",
+          "key": "model",
+          "kind": "text",
+          "label": "Model",
+          "options": [],
+          "placeholder": "nova-3"
+        }
+      ],
+      "vendor": "Deepgram"
+    },
+    {
+      "display_name": "AssemblyAI",
+      "docs_url": "https://www.assemblyai.com/dashboard",
+      "fields": [
+        {
+          "env_var": "ASSEMBLYAI_API_KEY",
+          "key": "api_key",
+          "keychain_account": "assemblyai-api-key",
+          "label": "API key",
+          "min_len": 20,
+          "required": true,
+          "secret": true
+        }
+      ],
+      "free_tier_note": "Free accounts include starter credit; streaming is billed on connection time and is English-first.",
+      "id": "assemblyai",
+      "settings": [],
+      "vendor": "AssemblyAI"
+    },
+    {
+      "display_name": "Gladia",
+      "docs_url": "https://app.gladia.io/",
+      "fields": [
+        {
+          "env_var": "GLADIA_API_KEY",
+          "key": "api_key",
+          "keychain_account": "gladia-api-key",
+          "label": "API key",
+          "min_len": 20,
+          "required": true,
+          "secret": true
+        }
+      ],
+      "free_tier_note": "Free plan includes a monthly allowance of real-time minutes.",
+      "id": "gladia",
+      "settings": [],
+      "vendor": "Gladia"
+    },
+    {
+      "display_name": "DeepSeek",
+      "docs_url": "https://platform.deepseek.com/",
+      "fields": [
+        {
+          "env_var": "DEEPSEEK_API_KEY",
+          "key": "api_key",
+          "keychain_account": "deepseek-api-key",
+          "label": "API key",
+          "min_len": 16,
+          "required": true,
+          "secret": true
+        }
+      ],
+      "free_tier_note": "Pay as you go; very low token prices.",
+      "id": "deepseek",
+      "settings": [
+        {
+          "default": "deepseek-chat",
+          "env_var": "ECHOLINGO_DEEPSEEK_CHAT_MODEL",
+          "key": "chat_model",
+          "kind": "text",
+          "label": "Chat translation model",
+          "options": [],
+          "placeholder": "deepseek-chat"
+        }
+      ],
+      "vendor": "DeepSeek"
+    },
+    {
+      "display_name": "Google Gemini",
+      "docs_url": "https://aistudio.google.com/apikey",
+      "fields": [
+        {
+          "env_var": "GEMINI_API_KEY",
+          "key": "api_key",
+          "keychain_account": "gemini-api-key",
+          "label": "API key",
+          "min_len": 16,
+          "required": true,
+          "secret": true
+        }
+      ],
+      "free_tier_note": "AI Studio keys include a free tier with rate limits.",
+      "id": "gemini",
+      "settings": [
+        {
+          "default": "gemini-2.0-flash",
+          "env_var": "ECHOLINGO_GEMINI_CHAT_MODEL",
+          "key": "chat_model",
+          "kind": "text",
+          "label": "Chat translation model",
+          "options": [],
+          "placeholder": "gemini-2.0-flash"
+        }
+      ],
+      "vendor": "Google"
+    },
+    {
+      "display_name": "Groq",
+      "docs_url": "https://console.groq.com/keys",
+      "fields": [
+        {
+          "env_var": "GROQ_API_KEY",
+          "key": "api_key",
+          "keychain_account": "groq-api-key",
+          "label": "API key",
+          "min_len": 16,
+          "required": true,
+          "secret": true
+        }
+      ],
+      "free_tier_note": "Free tier with per-minute rate limits.",
+      "id": "groq",
+      "settings": [
+        {
+          "default": "llama-3.3-70b-versatile",
+          "env_var": "ECHOLINGO_GROQ_CHAT_MODEL",
+          "key": "chat_model",
+          "kind": "text",
+          "label": "Chat translation model",
+          "options": [],
+          "placeholder": "llama-3.3-70b-versatile"
+        }
+      ],
+      "vendor": "Groq"
+    },
+    {
+      "display_name": "OpenRouter",
+      "docs_url": "https://openrouter.ai/keys",
+      "fields": [
+        {
+          "env_var": "OPENROUTER_API_KEY",
+          "key": "api_key",
+          "keychain_account": "openrouter-api-key",
+          "label": "API key",
+          "min_len": 16,
+          "required": true,
+          "secret": true
+        }
+      ],
+      "free_tier_note": "Some models are free; others are billed per token.",
+      "id": "openrouter",
+      "settings": [
+        {
+          "default": "openai/gpt-4o-mini",
+          "env_var": "ECHOLINGO_OPENROUTER_CHAT_MODEL",
+          "key": "chat_model",
+          "kind": "text",
+          "label": "Chat translation model",
+          "options": [],
+          "placeholder": "openai/gpt-4o-mini"
+        }
+      ],
+      "vendor": "OpenRouter"
+    },
+    {
+      "display_name": "SiliconFlow",
+      "docs_url": "https://cloud.siliconflow.cn/",
+      "fields": [
+        {
+          "env_var": "SILICONFLOW_API_KEY",
+          "key": "api_key",
+          "keychain_account": "siliconflow-api-key",
+          "label": "API key",
+          "min_len": 16,
+          "required": true,
+          "secret": true
+        }
+      ],
+      "free_tier_note": "Free quota for several open models.",
+      "id": "siliconflow",
+      "settings": [
+        {
+          "default": "Qwen/Qwen2.5-7B-Instruct",
+          "env_var": "ECHOLINGO_SILICONFLOW_CHAT_MODEL",
+          "key": "chat_model",
+          "kind": "text",
+          "label": "Chat translation model",
+          "options": [],
+          "placeholder": "Qwen/Qwen2.5-7B-Instruct"
+        }
+      ],
+      "vendor": "SiliconFlow"
+    },
+    {
+      "display_name": "Custom OpenAI-compatible endpoint",
+      "docs_url": "",
+      "fields": [
+        {
+          "env_var": "CUSTOM_OPENAI_API_KEY",
+          "key": "api_key",
+          "keychain_account": "custom_openai-api-key",
+          "label": "API key (optional)",
+          "min_len": 1,
+          "required": false,
+          "secret": true
+        }
+      ],
+      "free_tier_note": "Any server that speaks the OpenAI chat completions API (Ollama, vLLM, LM Studio, ...).",
+      "id": "custom_openai",
+      "settings": [
+        {
+          "default": "",
+          "env_var": "ECHOLINGO_CUSTOM_OPENAI_BASE_URL",
+          "key": "base_url",
+          "kind": "text",
+          "label": "Base URL",
+          "options": [],
+          "placeholder": "http://127.0.0.1:11434/v1"
+        },
+        {
+          "default": "",
+          "env_var": "ECHOLINGO_CUSTOM_OPENAI_CHAT_MODEL",
+          "key": "chat_model",
+          "kind": "text",
+          "label": "Model",
+          "options": [],
+          "placeholder": "qwen2.5:7b"
+        }
+      ],
+      "vendor": "Custom"
+    },
+    {
+      "display_name": "DeepL",
+      "docs_url": "https://www.deepl.com/your-account/keys",
+      "fields": [
+        {
+          "env_var": "DEEPL_API_KEY",
+          "key": "api_key",
+          "keychain_account": "deepl-api-key",
+          "label": "Authentication key",
+          "min_len": 20,
+          "required": true,
+          "secret": true
+        }
+      ],
+      "free_tier_note": "DeepL API Free translates 500,000 characters per month; free keys end with ':fx'.",
+      "id": "deepl",
+      "settings": [
+        {
+          "default": "free",
+          "env_var": "ECHOLINGO_DEEPL_TIER",
+          "key": "tier",
+          "kind": "select",
+          "label": "Plan",
+          "options": [
+            [
+              "free",
+              "API Free"
+            ],
+            [
+              "pro",
+              "API Pro"
+            ]
+          ],
+          "placeholder": ""
+        }
+      ],
+      "vendor": "DeepL"
+    },
+    {
+      "display_name": "Google Cloud Translation",
+      "docs_url": "https://console.cloud.google.com/apis/library/translate.googleapis.com",
+      "fields": [
+        {
+          "env_var": "GOOGLE_TRANSLATE_API_KEY",
+          "key": "api_key",
+          "keychain_account": "google_translate-api-key",
+          "label": "API key",
+          "min_len": 20,
+          "required": true,
+          "secret": true
+        }
+      ],
+      "free_tier_note": "The first 500,000 characters per month are free with an API key.",
+      "id": "google_translate",
+      "settings": [],
+      "vendor": "Google"
+    },
+    {
+      "display_name": "Azure AI Translator",
+      "docs_url": "https://portal.azure.com/",
+      "fields": [
+        {
+          "env_var": "AZURE_TRANSLATOR_KEY",
+          "key": "api_key",
+          "keychain_account": "azure_translator-api-key",
+          "label": "Subscription key",
+          "min_len": 20,
+          "required": true,
+          "secret": true
+        }
+      ],
+      "free_tier_note": "The F0 tier translates 2 million characters per month for free.",
+      "id": "azure_translator",
+      "settings": [
+        {
+          "default": "",
+          "env_var": "ECHOLINGO_AZURE_TRANSLATOR_REGION",
+          "key": "region",
+          "kind": "text",
+          "label": "Resource region",
+          "options": [],
+          "placeholder": "eastasia"
+        }
+      ],
+      "vendor": "Microsoft"
+    }
+  ],
+  "schema_version": 1,
+  "translation": [
+    {
+      "audio_upload_required": false,
+      "auto_route_eligible": false,
+      "credential_group": null,
+      "description": "Recognition only.",
+      "display_name": "No translation",
+      "id": "none",
+      "kind": "translation",
+      "languages": [],
+      "local_service_id": null,
+      "locality": "mock",
+      "selectable": true,
+      "streaming_partials": true,
+      "transcript_upload_required": false,
+      "vendor": ""
+    },
+    {
+      "audio_upload_required": false,
+      "auto_route_eligible": false,
+      "credential_group": null,
+      "description": "",
+      "display_name": "Mock translator",
+      "id": "mock",
+      "kind": "translation",
+      "languages": [],
+      "local_service_id": null,
+      "locality": "mock",
+      "selectable": true,
+      "streaming_partials": true,
+      "transcript_upload_required": false,
+      "vendor": ""
+    },
+    {
+      "audio_upload_required": false,
+      "auto_route_eligible": true,
+      "credential_group": null,
+      "description": "Runs on this device; no text leaves the machine.",
+      "display_name": "Hy-MT2 (local)",
+      "id": "hymt_local",
+      "kind": "translation",
+      "languages": [],
+      "local_service_id": "hymt",
+      "locality": "local",
+      "selectable": true,
+      "streaming_partials": true,
+      "transcript_upload_required": false,
+      "vendor": "Tencent / local"
+    },
+    {
+      "audio_upload_required": false,
+      "auto_route_eligible": true,
+      "credential_group": "dashscope",
+      "description": "",
+      "display_name": "Qwen-MT (cloud)",
+      "id": "qwen_cloud",
+      "kind": "translation",
+      "languages": [],
+      "local_service_id": null,
+      "locality": "cloud",
+      "selectable": true,
+      "streaming_partials": true,
+      "transcript_upload_required": true,
+      "vendor": "Alibaba Cloud"
+    },
+    {
+      "audio_upload_required": false,
+      "auto_route_eligible": false,
+      "credential_group": "openai",
+      "description": "",
+      "display_name": "OpenAI chat translation (cloud)",
+      "id": "openai_chat",
+      "kind": "translation",
+      "languages": [],
+      "local_service_id": null,
+      "locality": "cloud",
+      "selectable": true,
+      "streaming_partials": true,
+      "transcript_upload_required": true,
+      "vendor": "OpenAI"
+    },
+    {
+      "audio_upload_required": false,
+      "auto_route_eligible": false,
+      "credential_group": "deepseek",
+      "description": "",
+      "display_name": "DeepSeek chat translation (cloud)",
+      "id": "deepseek_chat",
+      "kind": "translation",
+      "languages": [],
+      "local_service_id": null,
+      "locality": "cloud",
+      "selectable": true,
+      "streaming_partials": true,
+      "transcript_upload_required": true,
+      "vendor": "DeepSeek"
+    },
+    {
+      "audio_upload_required": false,
+      "auto_route_eligible": false,
+      "credential_group": "gemini",
+      "description": "",
+      "display_name": "Google Gemini chat translation (cloud)",
+      "id": "gemini_chat",
+      "kind": "translation",
+      "languages": [],
+      "local_service_id": null,
+      "locality": "cloud",
+      "selectable": true,
+      "streaming_partials": true,
+      "transcript_upload_required": true,
+      "vendor": "Google"
+    },
+    {
+      "audio_upload_required": false,
+      "auto_route_eligible": false,
+      "credential_group": "groq",
+      "description": "",
+      "display_name": "Groq chat translation (cloud)",
+      "id": "groq_chat",
+      "kind": "translation",
+      "languages": [],
+      "local_service_id": null,
+      "locality": "cloud",
+      "selectable": true,
+      "streaming_partials": true,
+      "transcript_upload_required": true,
+      "vendor": "Groq"
+    },
+    {
+      "audio_upload_required": false,
+      "auto_route_eligible": false,
+      "credential_group": "openrouter",
+      "description": "",
+      "display_name": "OpenRouter chat translation (cloud)",
+      "id": "openrouter_chat",
+      "kind": "translation",
+      "languages": [],
+      "local_service_id": null,
+      "locality": "cloud",
+      "selectable": true,
+      "streaming_partials": true,
+      "transcript_upload_required": true,
+      "vendor": "OpenRouter"
+    },
+    {
+      "audio_upload_required": false,
+      "auto_route_eligible": false,
+      "credential_group": "siliconflow",
+      "description": "",
+      "display_name": "SiliconFlow chat translation (cloud)",
+      "id": "siliconflow_chat",
+      "kind": "translation",
+      "languages": [],
+      "local_service_id": null,
+      "locality": "cloud",
+      "selectable": true,
+      "streaming_partials": true,
+      "transcript_upload_required": true,
+      "vendor": "SiliconFlow"
+    },
+    {
+      "audio_upload_required": false,
+      "auto_route_eligible": false,
+      "credential_group": "custom_openai",
+      "description": "",
+      "display_name": "Custom OpenAI-compatible endpoint chat translation (cloud)",
+      "id": "custom_chat",
+      "kind": "translation",
+      "languages": [],
+      "local_service_id": null,
+      "locality": "cloud",
+      "selectable": true,
+      "streaming_partials": true,
+      "transcript_upload_required": true,
+      "vendor": "Custom"
+    },
+    {
+      "audio_upload_required": false,
+      "auto_route_eligible": false,
+      "credential_group": "deepl",
+      "description": "",
+      "display_name": "DeepL (cloud)",
+      "id": "deepl",
+      "kind": "translation",
+      "languages": [],
+      "local_service_id": null,
+      "locality": "cloud",
+      "selectable": true,
+      "streaming_partials": false,
+      "transcript_upload_required": true,
+      "vendor": "DeepL"
+    },
+    {
+      "audio_upload_required": false,
+      "auto_route_eligible": false,
+      "credential_group": "google_translate",
+      "description": "",
+      "display_name": "Google Cloud Translation (cloud)",
+      "id": "google_translate",
+      "kind": "translation",
+      "languages": [],
+      "local_service_id": null,
+      "locality": "cloud",
+      "selectable": true,
+      "streaming_partials": false,
+      "transcript_upload_required": true,
+      "vendor": "Google"
+    },
+    {
+      "audio_upload_required": false,
+      "auto_route_eligible": false,
+      "credential_group": "azure_translator",
+      "description": "",
+      "display_name": "Azure AI Translator (cloud)",
+      "id": "azure_translator",
+      "kind": "translation",
+      "languages": [],
+      "local_service_id": null,
+      "locality": "cloud",
+      "selectable": true,
+      "streaming_partials": false,
+      "transcript_upload_required": true,
+      "vendor": "Microsoft"
+    }
+  ]
+}
+

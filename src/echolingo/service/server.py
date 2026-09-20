@@ -3,12 +3,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
+import sys
 from typing import Any
 
 from websockets.asyncio.server import ServerConnection, serve
 
-from .cloud_probe import probe_qwen_cloud
+from ..backends import registry
+from .cloud_probe import probe_cloud
 from .parent_watchdog import start_parent_watchdog_from_environment
 from .protocol import PROTOCOL_VERSION, ProtocolError, decode_audio_packet
 from .session import DesktopInferenceSession
@@ -80,7 +83,13 @@ class SidecarConnection:
                 raise ProtocolError("sidecar authentication failed")
             self.authenticated = True
             await self.websocket.send(
-                _event("hello_accepted", {"protocol_version": PROTOCOL_VERSION})
+                _event(
+                    "hello_accepted",
+                    {
+                        "protocol_version": PROTOCOL_VERSION,
+                        "providers_digest": registry.catalog_digest(),
+                    },
+                )
             )
             return
         if command_type == "start_session":
@@ -99,7 +108,14 @@ class SidecarConnection:
         elif command_type == "probe_cloud":
             if self.session is not None:
                 raise ProtocolError("cannot probe cloud while a session is active")
-            result = await probe_qwen_cloud(bool(payload.get("include_translation", False)))
+            asr_provider = payload.get("asr_provider")
+            translation_provider = payload.get("translation_provider")
+            if asr_provider is None and translation_provider is None:
+                # Legacy shape from earlier shells: Qwen Cloud only.
+                asr_provider = "qwen_cloud"
+                if payload.get("include_translation"):
+                    translation_provider = "qwen_cloud"
+            result = await probe_cloud(asr_provider, translation_provider)
             await self.websocket.send(
                 _event(
                     "cloud_probe_result",
@@ -169,6 +185,13 @@ async def run_server(host: str, port: int, token: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     start_parent_watchdog_from_environment()
+    # stderr is captured by the desktop shell into logs/sidecar.log; stdout
+    # stays reserved for the JSON ready line.
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=os.environ.get("ECHOLINGO_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     parser = argparse.ArgumentParser(prog="echolingo-sidecar")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)

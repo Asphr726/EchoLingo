@@ -208,11 +208,13 @@ async def test_sidecar_cloud_probe_is_available_without_a_session(monkeypatch) -
         async def send(self, value: str) -> None:
             self.sent.append(value)
 
-    async def probe(include_translation: bool):
-        assert include_translation is True
+    calls: list[tuple[str | None, str | None]] = []
+
+    async def probe(asr_provider, translation_provider):
+        calls.append((asr_provider, translation_provider))
         return {"ok": True, "audio_uploaded": False}
 
-    monkeypatch.setattr("echolingo.service.server.probe_qwen_cloud", probe)
+    monkeypatch.setattr("echolingo.service.server.probe_cloud", probe)
     websocket = FakeWebSocket()
     connection = SidecarConnection(websocket, "secret")
     connection.authenticated = True
@@ -223,8 +225,16 @@ async def test_sidecar_cloud_probe_is_available_without_a_session(monkeypatch) -
             "payload": {"request_id": "probe-1", "include_translation": True},
         }
     )
+    await connection._command(
+        {
+            "type": "probe_cloud",
+            "payload": {"request_id": "probe-2", "translation_provider": "deepl"},
+        }
+    )
 
     event = json.loads(websocket.sent[-1])
     assert event["type"] == "cloud_probe_result"
-    assert event["payload"]["request_id"] == "probe-1"
+    assert event["payload"]["request_id"] == "probe-2"
     assert event["payload"]["result"]["audio_uploaded"] is False
+    # The legacy shape still means "Qwen Cloud"; the new shape names providers.
+    assert calls == [("qwen_cloud", "qwen_cloud"), (None, "deepl")]

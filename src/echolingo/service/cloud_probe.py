@@ -1,78 +1,82 @@
+"""Connection probes for cloud providers.
+
+A probe validates credentials, region and network reachability. ASR probes
+perform the authenticated handshake only and never upload audio; translation
+probes send one fixed English sentence and are only run when the caller has
+confirmed transcript upload consent (the desktop "Test" button does so
+explicitly). Results never include provider response bodies or secrets.
+"""
+
 from __future__ import annotations
 
-import time
-import uuid
-from collections.abc import Callable
+import logging
+import os
+from collections.abc import Mapping
 from typing import Any
 
-from ..backends.asr.cloud_qwen import CloudQwenAsrBackend
-from ..backends.translation.cloud_qwen_mt import CloudQwenMtBackend
-from ..config.loader import qwen_region_from_environment
+from ..backends import registry
+from ..config import load_config
 from ..errors import AuthenticationError, BackendError
-from ..models import TranslationRequest
+
+log = logging.getLogger("echolingo.cloud_probe")
 
 
-async def probe_qwen_cloud(
-    include_translation: bool,
+async def probe_cloud(
+    asr_provider: str | None = None,
+    translation_provider: str | None = None,
     *,
-    asr_factory: Callable[..., Any] = CloudQwenAsrBackend,
-    translation_factory: Callable[..., Any] = CloudQwenMtBackend,
+    environ: Mapping[str, str] | None = None,
+    config=None,
 ) -> dict[str, Any]:
-    """Probe cloud routes without uploading audio or returning provider content."""
-    region = qwen_region_from_environment()
+    """Probe the selected providers; ``ok`` is true only when every probe passed."""
+    environ = os.environ if environ is None else environ
+    if config is None:
+        config = load_config()
     result: dict[str, Any] = {
         "ok": False,
-        "region": region,
         "audio_uploaded": False,
-        "asr": {"status": "pending"},
-        "translation": {"status": "pending" if include_translation else "skipped"},
+        "asr": {"status": "skipped"},
+        "translation": {"status": "skipped"},
     }
-    asr = asr_factory(audio_upload_allowed=False, region=region)
-    try:
-        handshake_ms = await asr.probe_connection()
-        result["asr"] = {
-            "status": "connected",
-            "model": asr.model,
-            "handshake_latency_ms": round(handshake_ms, 1),
-        }
-    except Exception as error:
-        result["code"] = _error_code(error)
-        result["message"] = _safe_message(error)
-        result["translation"] = {"status": "not_tested"}
-        return result
+    if asr_provider:
+        result["asr"] = {"status": "pending", "provider": asr_provider}
+    if translation_provider:
+        result["translation"] = {"status": "pending", "provider": translation_provider}
 
-    if include_translation:
-        translation = translation_factory(transcript_upload_allowed=True, region=region)
-        started_ns = time.monotonic_ns()
-        try:
-            event = await translation.retranslate_window(
-                TranslationRequest(
-                    request_id=str(uuid.uuid4()),
-                    source_revision_id=0,
-                    source_text="Welcome to the lecture.",
-                    source_lang="en",
-                    target_lang="zh",
-                    final=True,
-                )
-            )
-            result["translation"] = {
-                "status": "connected",
-                "model": event.model,
-                "latency_ms": round(
-                    event.total_latency_ms
-                    or (time.monotonic_ns() - started_ns) / 1_000_000.0,
-                    1,
-                ),
-            }
-        except Exception as error:
-            result["code"] = _error_code(error)
-            result["message"] = _safe_message(error)
-            result["translation"] = {"status": "failed"}
+    for kind, provider_id in (("asr", asr_provider), ("translation", translation_provider)):
+        if not provider_id:
+            continue
+        spec = registry.find(kind, provider_id)
+        if spec is None or spec.probe is None:
+            result[kind] = {"status": "failed", "provider": provider_id}
+            result["code"] = "unknown_provider"
+            result["message"] = f"{provider_id!r} is not a probeable {kind} provider"
             return result
-        finally:
-            await translation.close()
+        try:
+            result[kind] = await spec.probe(spec, config, environ)
+        except Exception as error:
+            result[kind] = {"status": "failed", "provider": provider_id}
+            result["code"] = _error_code(error)
+            result["message"] = _safe_message(spec.display_name, error)
+            log.warning("%s probe failed: %s (%s)", spec.display_name, result["code"], result["message"])
+            other = "translation" if kind == "asr" else "asr"
+            if result[other].get("status") == "pending":
+                result[other] = {"status": "not_tested", "provider": result[other]["provider"]}
+            return result
+        # DashScope endpoints report region/host so the UI can show what was tried.
+        for key in ("region", "host", "workspace_scoped"):
+            if key in result[kind] and key not in result:
+                result[key] = result[kind][key]
+        log.info("%s probe connected", spec.display_name)
 
     result["ok"] = True
+    return result
+
+
+async def probe_qwen_cloud(include_translation: bool, **_: Any) -> dict[str, Any]:
+    """Backwards-compatible wrapper for the original single-provider probe."""
+    result = await probe_cloud("qwen_cloud", "qwen_cloud" if include_translation else None)
+    result.setdefault("region", load_config().asr.qwen_cloud.region)
     return result
 
 
@@ -84,9 +88,9 @@ def _error_code(error: Exception) -> str:
     return "cloud_probe_failed"
 
 
-def _safe_message(error: Exception) -> str:
+def _safe_message(display_name: str, error: Exception) -> str:
     if isinstance(error, (AuthenticationError, BackendError, ConnectionError)):
         return str(error)
     if isinstance(error, (TimeoutError, OSError)):
-        return "Qwen Cloud could not be reached. Check the network and try again."
-    return "Qwen Cloud validation failed without exposing provider diagnostics."
+        return f"{display_name} could not be reached. Check the network and try again."
+    return f"{display_name} validation failed without exposing provider diagnostics."

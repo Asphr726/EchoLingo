@@ -17,12 +17,7 @@ from ...models import (
     TranslationKind,
     TranslationRequest,
 )
-
-
-_REGION_HOSTS = {
-    "singapore": "ap-southeast-1.maas.aliyuncs.com",
-    "beijing": "cn-beijing.maas.aliyuncs.com",
-}
+from .. import dashscope
 
 _LANGUAGE_NAMES = {
     "auto": "auto",
@@ -46,10 +41,12 @@ class CloudQwenMtBackend:
         timeout_s: float = 30.0,
         client: httpx.AsyncClient | None = None,
     ) -> None:
-        if region not in _REGION_HOSTS:
+        if region not in dashscope.REGIONS:
             raise ValueError("Qwen-MT region must be singapore or beijing")
-        self.api_key = api_key or os.getenv("DASHSCOPE_API_KEY")
-        self.workspace_id = workspace_id or os.getenv("DASHSCOPE_WORKSPACE_ID")
+        self.api_key = (api_key or os.getenv("DASHSCOPE_API_KEY") or "").strip() or None
+        self.workspace_id = (
+            (workspace_id or os.getenv("DASHSCOPE_WORKSPACE_ID") or "").strip() or None
+        )
         self.region = region
         self.interactive_model = interactive_model
         self.quality_model = quality_model
@@ -65,19 +62,23 @@ class CloudQwenMtBackend:
         )
 
     @property
+    def dashscope_endpoint(self) -> dashscope.DashScopeEndpoint:
+        return dashscope.resolve_endpoint(self.region, self.workspace_id)
+
+    @property
     def base_url(self) -> str:
-        host = _REGION_HOSTS[self.region]
-        return f"https://{self.workspace_id}.{host}/compatible-mode/v1"
+        return self.dashscope_endpoint.compatible_base_url
+
+    def describe_endpoint(self) -> dict[str, object]:
+        return self.dashscope_endpoint.describe()
 
     def _authorize(self) -> None:
         if not self.transcript_upload_allowed:
             raise PolicyDeniedError(
                 "Cloud translation requires explicit transcript upload consent"
             )
-        if not self.api_key or not self.workspace_id:
-            raise AuthenticationError(
-                "DASHSCOPE_API_KEY and DASHSCOPE_WORKSPACE_ID are required"
-            )
+        if not self.api_key:
+            raise AuthenticationError("DASHSCOPE_API_KEY is required")
 
     async def set_glossary(self, terms: tuple[GlossaryTerm, ...]) -> None:
         self.glossary = terms
@@ -118,17 +119,11 @@ class CloudQwenMtBackend:
         return payload
 
     def _raise_status(self, response: httpx.Response) -> None:
-        region_name = "Singapore" if self.region == "singapore" else "Beijing"
+        endpoint = self.dashscope_endpoint
         if response.status_code == 401:
-            raise AuthenticationError(
-                "Qwen-MT rejected the API key (HTTP 401). Verify that the key is active "
-                f"in the {region_name} Model Studio region."
-            )
+            raise AuthenticationError(dashscope.unauthorized_message("Qwen-MT", endpoint))
         if response.status_code == 403:
-            raise AuthenticationError(
-                "Qwen-MT access was denied (HTTP 403). Verify that the API key and "
-                f"workspace ID belong to the same {region_name} workspace."
-            )
+            raise AuthenticationError(dashscope.forbidden_message("Qwen-MT", endpoint))
         if response.status_code == 429:
             raise RateLimitError("Cloud Qwen-MT rate limit exceeded")
         response.raise_for_status()

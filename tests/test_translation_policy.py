@@ -153,3 +153,20 @@ async def test_streaming_coordinator_translates_only_new_stable_source() -> None
     assert first_outputs[-1].committed_text == "ZH:first"
     assert second_outputs[-1].committed_text == "ZH:first ZH:second"
     assert coordinator.context.snapshot()[-1].source == "second"
+
+
+def test_policy_without_provisional_only_translates_stable_and_final() -> None:
+    policy = AdaptiveRetranslationPolicy(provisional_enabled=False, clock_ns=lambda: 0)
+    partial = transcript(TranscriptKind.PARTIAL, "hello there,", 1, 0, unstable="hello there,")
+    assert policy.observe(partial, now_ns=5_000_000_000) is None
+    stable = transcript(
+        TranscriptKind.STABLE, "Hello there, everyone.", 2, 10, committed="Hello there, everyone."
+    )
+    decision = policy.observe(stable, now_ns=6_000_000_000)
+    assert decision is not None and decision.source_committed
+    final = transcript(
+        TranscriptKind.FINAL, "Hello there, everyone. Bye.", 3, 20,
+        committed="Hello there, everyone. Bye.",
+    )
+    decision = policy.observe(final, now_ns=7_000_000_000)
+    assert decision is not None and decision.source_text == "Bye."

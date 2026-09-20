@@ -127,12 +127,17 @@ class AdaptiveRetranslationPolicy:
         latency_budget_ms: float = 800.0,
         minimum_delta_chars: int = 8,
         maximum_editable_chars: int = 256,
+        provisional_enabled: bool = True,
         clock_ns: Callable[[], int] = time.monotonic_ns,
     ) -> None:
         self.stable_prefix_ms = stable_prefix_ms
         self.latency_budget_ms = latency_budget_ms
         self.minimum_delta_chars = minimum_delta_chars
         self.maximum_editable_chars = maximum_editable_chars
+        # Request/response translators (DeepL, Google, Azure) bill per
+        # character with no streaming benefit, so the unstable tail is not
+        # sent to them; only stable units and finals are translated.
+        self.provisional_enabled = provisional_enabled
         self._clock_ns = clock_ns
         self.committed_source = ""
         self._previous_partial = ""
@@ -198,6 +203,8 @@ class AdaptiveRetranslationPolicy:
             self._last_request_ns = now
             return TranslationDecision(event.revision_id, remainder, committed, True, True, "final")
 
+        if not self.provisional_enabled:
+            return None
         partial = self.provisional_source(event)
         if self._first_partial_ns is None:
             self._first_partial_ns = now
@@ -259,11 +266,16 @@ class StreamingTranslationCoordinator:
         context_segments: int = 5,
         glossary: tuple[GlossaryTerm, ...] = (),
         domain: str | None = None,
+        provisional_enabled: bool | None = None,
     ) -> None:
         self.backend = backend
         self.source_lang = source_lang
         self.target_lang = target_lang
-        self.policy = policy or AdaptiveRetranslationPolicy()
+        if provisional_enabled is None:
+            provisional_enabled = bool(getattr(backend, "streaming_partials", True))
+        self.policy = policy or AdaptiveRetranslationPolicy(
+            provisional_enabled=provisional_enabled
+        )
         self.context = ContextWindow(context_segments)
         self.target = TargetCommitPolicy()
         self.glossary = glossary

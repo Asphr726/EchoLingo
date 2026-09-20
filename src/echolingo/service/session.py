@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 
+from ..backends import registry
 from ..config import load_config
 from ..alignment import MockAlignmentService, QwenForcedAlignmentService
 from ..enhancement import make_processor
@@ -69,6 +70,10 @@ def desktop_config(payload: dict[str, Any]):
     config.translation.provider = payload.get(
         "translation_provider", config.translation.provider
     )
+    if payload.get("cloud_asr_preference"):
+        config.asr.cloud_preference = str(payload["cloud_asr_preference"])
+    if payload.get("cloud_translation_preference"):
+        config.translation.cloud_preference = str(payload["cloud_translation_preference"])
     if "alignment_enabled" in payload:
         config.alignment.enabled = bool(payload["alignment_enabled"])
     if "alignment_provider" in payload:
@@ -84,10 +89,27 @@ def desktop_config(payload: dict[str, Any]):
     return config
 
 
-def route_payload(decision) -> dict[str, Any]:
+def route_payload(decision, config=None) -> dict[str, Any]:
+    """Serialize a route with the registry's locality, model and display names."""
     route = asdict(decision)
     route["status"] = decision.status.value
     route["reasons"] = list(decision.reasons)
+    for kind, provider_id in (
+        ("asr", decision.asr_provider),
+        ("translation", decision.translation_provider),
+    ):
+        spec = registry.find(kind, provider_id)
+        if spec is None:
+            continue
+        route[f"{kind}_locality"] = spec.locality.value
+        route[f"{kind}_display_name"] = spec.display_name
+        model = None
+        if config is not None and spec.model_for is not None:
+            try:
+                model = spec.model_for(config)
+            except Exception:  # pragma: no cover - defensive: never break a route reply
+                model = None
+        route[f"{kind}_model"] = model
     return route
 
 
@@ -174,7 +196,7 @@ class DesktopInferenceSession:
         plan = RuntimeRouter(config, capabilities).plan()
         return {
             "session_id": str(payload["session_id"]),
-            "route": route_payload(plan.decision),
+            "route": route_payload(plan.decision, config),
             "services_to_start": list(plan.services_to_start),
         }
 
@@ -217,6 +239,9 @@ class DesktopInferenceSession:
                 source_lang=config.asr.language,
                 target_lang=config.translation.target_language,
                 context_segments=config.translation.context_segments,
+                provisional_enabled=registry.get(
+                    "translation", decision.translation_provider
+                ).streaming_partials,
             )
         alignment_capture = None
         if config.alignment.enabled and config.alignment.provider != "none":
@@ -240,7 +265,7 @@ class DesktopInferenceSession:
         pipeline = StreamingPipelineSession(
             core_pipeline, session_id=session_id, language=config.asr.language
         )
-        route = route_payload(decision)
+        route = route_payload(decision, config)
         instance = cls(
             pipeline, events, route, alignment_capture, input_rate_adapter
         )

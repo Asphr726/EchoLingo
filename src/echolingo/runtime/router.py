@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..backends import registry
+from ..backends.registry import ProviderSpec
 from ..config.schema import AppConfig
 from ..errors import BackendUnavailableError
-from ..models import DeploymentStatus
+from ..models import BackendLocality, DeploymentStatus
 from .calibration import CalibrationRecord
 from .capabilities import RuntimeCapabilities
 
@@ -61,12 +63,48 @@ class RuntimeRouter:
             <= self.config.runtime.translation_first_delta_ms_max
         )
 
-    def _cloud_available(self) -> bool:
+    def _cloud_provider_available(self, spec: ProviderSpec) -> bool:
         return bool(
             self.capabilities.network_available
-            and self.capabilities.credentials.get("dashscope_api_key")
-            and self.capabilities.credentials.get("dashscope_workspace_id")
+            and registry.required_credentials_present(spec, self.capabilities.credentials)
         )
+
+    def _cloud_available(self) -> bool:
+        """Backwards-compatible alias: is the preferred cloud ASR usable?"""
+        spec = registry.find("asr", self.config.asr.cloud_preference)
+        return spec is not None and self._cloud_provider_available(spec)
+
+    def _preferred_cloud(self, kind: str, preference: str, language: str) -> ProviderSpec | None:
+        """The explicit preference if usable, else the first validated cloud adapter."""
+        preferred = registry.find(kind, preference)
+        candidates = [preferred] if preferred is not None else []
+        candidates.extend(
+            spec for spec in registry.cloud_specs(kind)
+            if spec.auto_route_eligible and spec is not preferred
+        )
+        for spec in candidates:
+            if self._cloud_provider_available(spec) and spec.supports_language(language):
+                return spec
+        return None
+
+    def _check_explicit(self, spec: ProviderSpec, language: str, *, require_healthy: bool) -> None:
+        if spec.locality is BackendLocality.CLOUD:
+            if not self.capabilities.network_available:
+                raise BackendUnavailableError(f"{spec.display_name}: network unavailable")
+            if not registry.required_credentials_present(spec, self.capabilities.credentials):
+                raise BackendUnavailableError(f"{spec.display_name}: credentials are not configured")
+            if not spec.supports_language(language):
+                raise BackendUnavailableError(
+                    f"{spec.display_name} does not support source language {language!r}"
+                )
+        elif spec.local_service_id is not None:
+            ready = (
+                self._local_service_available(spec.local_service_id)
+                if require_healthy
+                else self._local_runtime_available(spec.local_service_id)
+            )
+            if not ready:
+                raise BackendUnavailableError(f"{spec.display_name} runtime service is unavailable")
 
     def _local_service_available(self, service: str) -> bool:
         return bool(self.capabilities.local_services.get(service))
@@ -83,16 +121,9 @@ class RuntimeRouter:
         self, reasons: list[str], *, require_healthy: bool
     ) -> tuple[str, bool]:
         requested = self.config.asr.provider
+        language = self.config.asr.language
         if requested != "auto":
-            if requested == "qwen_cloud" and not self._cloud_available():
-                raise BackendUnavailableError("Cloud Qwen ASR credentials or network unavailable")
-            local_ready = (
-                self._local_service_available("qwen_asr")
-                if require_healthy
-                else self._local_runtime_available("qwen_asr")
-            )
-            if requested == "qwen_local" and not local_ready:
-                raise BackendUnavailableError("Local Qwen ASR runtime service is unavailable")
+            self._check_explicit(registry.get("asr", requested), language, require_healthy=require_healthy)
             return requested, False
 
         quality = "qwen3-asr-1.7b"
@@ -110,13 +141,11 @@ class RuntimeRouter:
                 ):
                     reasons.append(f"{model} passed local ASR calibration")
                     return "qwen_local", False
-        if (
-            self.config.inference.mode != "local"
-            and self.config.privacy.audio_upload_allowed
-            and self._cloud_available()
-        ):
-            reasons.append("local ASR did not meet SLA; cloud is configured")
-            return "qwen_cloud", False
+        if self.config.inference.mode != "local" and self.config.privacy.audio_upload_allowed:
+            cloud = self._preferred_cloud("asr", self.config.asr.cloud_preference, language)
+            if cloud is not None:
+                reasons.append(f"local ASR did not meet SLA; {cloud.display_name} is configured")
+                return cloud.id, False
         local_ready = (
             self._local_service_available("qwen_asr")
             if require_healthy
@@ -134,15 +163,9 @@ class RuntimeRouter:
         if requested == "none":
             return "none", False
         if requested != "auto":
-            if requested == "qwen_cloud" and not self._cloud_available():
-                raise BackendUnavailableError("Cloud Qwen-MT credentials or network unavailable")
-            local_ready = (
-                self._local_service_available("hymt")
-                if require_healthy
-                else self._local_runtime_available("hymt")
+            self._check_explicit(
+                registry.get("translation", requested), "auto", require_healthy=require_healthy
             )
-            if requested == "hymt_local" and not local_ready:
-                raise BackendUnavailableError("Local Hy-MT runtime service is unavailable")
             return requested, False
 
         quality = "hymt2-7b"
@@ -160,13 +183,15 @@ class RuntimeRouter:
                 ):
                     reasons.append(f"{model} passed local translation calibration")
                     return "hymt_local", False
-        if (
-            self.config.inference.mode != "local"
-            and self.config.privacy.transcript_upload_allowed
-            and self._cloud_available()
-        ):
-            reasons.append("local translation did not meet SLA; cloud is configured")
-            return "qwen_cloud", False
+        if self.config.inference.mode != "local" and self.config.privacy.transcript_upload_allowed:
+            cloud = self._preferred_cloud(
+                "translation", self.config.translation.cloud_preference, "auto"
+            )
+            if cloud is not None:
+                reasons.append(
+                    f"local translation did not meet SLA; {cloud.display_name} is configured"
+                )
+                return cloud.id, False
         local_ready = (
             self._local_service_available("hymt")
             if require_healthy
@@ -184,9 +209,8 @@ class RuntimeRouter:
         translation, mt_degraded = self._select_translation(
             reasons, require_healthy=require_healthy
         )
-        local = {"qwen_local", "simulstreaming", "hymt_local", "none", "mock"}
-        asr_cloud = asr == "qwen_cloud"
-        mt_cloud = translation == "qwen_cloud"
+        asr_cloud = registry.get("asr", asr).locality is BackendLocality.CLOUD
+        mt_cloud = registry.get("translation", translation).locality is BackendLocality.CLOUD
         if asr_cloud and mt_cloud:
             status = DeploymentStatus.CLOUD
         elif asr_cloud != mt_cloud and translation != "none":
@@ -196,7 +220,6 @@ class RuntimeRouter:
         degraded = asr_degraded or mt_degraded
         if degraded:
             status = DeploymentStatus.DEGRADED
-        assert asr in local or asr_cloud
         return RouteDecision(asr, translation, status, degraded, tuple(reasons))
 
     def select(self) -> RouteDecision:
@@ -207,13 +230,11 @@ class RuntimeRouter:
         """Resolve a cold-start route before local services are launched."""
         decision = self._select(require_healthy=False)
         services: list[str] = []
-        if decision.asr_provider == "qwen_local" and not self._local_service_available(
-            "qwen_asr"
+        for kind, provider_id in (
+            ("asr", decision.asr_provider),
+            ("translation", decision.translation_provider),
         ):
-            services.append("qwen_asr")
-        if (
-            decision.translation_provider == "hymt_local"
-            and not self._local_service_available("hymt")
-        ):
-            services.append("hymt")
+            service = registry.get(kind, provider_id).local_service_id
+            if service and service not in services and not self._local_service_available(service):
+                services.append(service)
         return RoutePlan(decision, tuple(services))

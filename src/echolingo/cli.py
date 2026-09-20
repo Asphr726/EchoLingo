@@ -8,6 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .audio import MicrophoneSource, WavReplaySource, list_input_devices
+from .backends import registry
 from .config import load_config
 from .enhancement import make_processor
 from .farfield import generate_proxy_files
@@ -28,7 +29,7 @@ def _add_pipeline_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--language", choices=["en", "zh", "ja", "ko", "auto"])
     parser.add_argument(
         "--asr",
-        choices=["none", "wlk", "qwen_local", "qwen_cloud", "simulstreaming", "mock"],
+        choices=["wlk", *registry.provider_ids("asr")],
     )
     parser.add_argument("--wlk-url")
     parser.add_argument("--model-backend")
@@ -36,7 +37,7 @@ def _add_pipeline_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow-audio-upload", action="store_true")
     parser.add_argument("--allow-transcript-upload", action="store_true")
     parser.add_argument(
-        "--translation", choices=["none", "hymt_local", "qwen_cloud", "mock"]
+        "--translation", choices=registry.provider_ids("translation")
     )
     parser.add_argument("--target-language", choices=["en", "zh", "ja", "ko"])
     parser.add_argument("--run-root", type=Path, default=Path("runs/spike1"))
@@ -149,6 +150,9 @@ async def _run_source(source, args) -> Path:
             source_lang=config.asr.language,
             target_lang=config.translation.target_language,
             context_segments=config.translation.context_segments,
+            provisional_enabled=registry.get(
+                "translation", route.translation_provider
+            ).streaming_partials,
         )
     resolved = config.redacted_dict()
     resolved["route"] = asdict(route)

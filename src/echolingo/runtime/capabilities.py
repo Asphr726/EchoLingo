@@ -11,6 +11,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping
 
+from ..backends import registry
+
 
 @dataclass(slots=True)
 class RuntimeCapabilities:
@@ -151,9 +153,8 @@ class CapabilityDetector:
             "hymt2-7b": self._has_model("hymt2-7b", "hymt2-7b-gguf"),
         }
         credentials = {
-            "dashscope_api_key": bool(self.environ.get("DASHSCOPE_API_KEY")),
-            "dashscope_workspace_id": bool(self.environ.get("DASHSCOPE_WORKSPACE_ID")),
-            "openai_api_key": bool(self.environ.get("OPENAI_API_KEY")),
+            registry.credential_key(field_spec): bool(self.environ.get(field_spec.env_var))
+            for _, field_spec in registry.credential_fields()
         }
         services = {
             "qwen_asr": self._loopback_service(

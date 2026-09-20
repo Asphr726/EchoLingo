@@ -23,14 +23,9 @@ from ...models import (
 )
 from ...networking import AudioRingBuffer, RetryPolicy
 from ...streaming import SentenceUnitSegmenter, join_text, sanitize_committed_text
+from .. import dashscope
 from ._queue import AsrEventQueue
 from .reconcile import TranscriptReconciler
-
-
-_REGION_HOSTS = {
-    "singapore": "ap-southeast-1.maas.aliyuncs.com",
-    "beijing": "cn-beijing.maas.aliyuncs.com",
-}
 
 
 class CloudQwenAsrBackend:
@@ -54,10 +49,12 @@ class CloudQwenAsrBackend:
         reconnect_budget_s: float = 30.0,
         websocket_factory=None,
     ) -> None:
-        if region not in _REGION_HOSTS:
+        if region not in dashscope.REGIONS:
             raise ValueError("Qwen ASR region must be singapore or beijing")
-        self.api_key = api_key or os.getenv("DASHSCOPE_API_KEY")
-        self.workspace_id = workspace_id or os.getenv("DASHSCOPE_WORKSPACE_ID")
+        self.api_key = (api_key or os.getenv("DASHSCOPE_API_KEY") or "").strip() or None
+        self.workspace_id = (
+            (workspace_id or os.getenv("DASHSCOPE_WORKSPACE_ID") or "").strip() or None
+        )
         self.region = region
         self.model = model
         self.language = language
@@ -107,9 +104,18 @@ class CloudQwenAsrBackend:
         self.lag_ms: float | None = None
 
     @property
+    def dashscope_endpoint(self) -> dashscope.DashScopeEndpoint:
+        return dashscope.resolve_endpoint(self.region, self.workspace_id)
+
+    @property
     def endpoint(self) -> str:
-        host = _REGION_HOSTS[self.region]
-        return f"wss://{self.workspace_id}.{host}/api-ws/v1/realtime?model={self.model}"
+        return f"{self.dashscope_endpoint.realtime_url}?model={self.model}"
+
+    def describe_endpoint(self) -> dict[str, object]:
+        return self.dashscope_endpoint.describe()
+
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_key}", **dashscope.REALTIME_HEADERS}
 
     @property
     def buffered_audio_ms(self) -> float:
@@ -121,55 +127,55 @@ class CloudQwenAsrBackend:
 
     async def _open(self):
         if self.websocket_factory is not None:
-            return await self.websocket_factory(
-                self.endpoint, {"Authorization": f"Bearer {self.api_key}"}
-            )
+            return await self.websocket_factory(self.endpoint, self._headers())
         import websockets
 
         return await websockets.connect(
             self.endpoint,
-            additional_headers={"Authorization": f"Bearer {self.api_key}"},
+            additional_headers=self._headers(),
             max_size=8 * 1024 * 1024,
             open_timeout=10,
         )
 
     @staticmethod
-    def connection_error(error: Exception, *, region: str) -> Exception:
+    def connection_error(
+        error: Exception,
+        *,
+        region: str,
+        workspace_id: str | None = None,
+    ) -> Exception:
         status = getattr(error, "status_code", None)
         response = getattr(error, "response", None)
         status = status or getattr(response, "status_code", None)
-        region_name = "Singapore" if region == "singapore" else "Beijing"
+        endpoint = dashscope.resolve_endpoint(region, workspace_id)
         if status == 401:
-            return AuthenticationError(
-                "Qwen Cloud rejected the API key (HTTP 401). Verify the key is active "
-                f"and belongs to the {region_name} Model Studio region."
-            )
+            return AuthenticationError(dashscope.unauthorized_message("Qwen Cloud", endpoint))
         if status == 403:
             return AuthenticationError(
-                "Qwen Realtime ASR access was denied (HTTP 403). Verify that the API key "
-                f"and workspace ID belong to the same {region_name} workspace and that "
-                "Qwen realtime ASR is enabled for it."
+                dashscope.forbidden_message("Qwen realtime ASR", endpoint)
             )
         if isinstance(error, (TimeoutError, asyncio.TimeoutError)):
             return ConnectionError(
-                "Qwen Cloud connection timed out. Check network access and try again."
+                f"Qwen Cloud connection to {endpoint.host} timed out. "
+                "Check network access and try again."
             )
         return ConnectionError(
-            "Qwen Cloud could not be reached. Check the network, region, and workspace ID."
+            f"Qwen Cloud host {endpoint.host} could not be reached "
+            f"({type(error).__name__}). Check the network, region, and workspace ID."
         )
 
     async def _open_with_diagnostics(self):
         try:
             return await self._open()
         except Exception as error:
-            raise self.connection_error(error, region=self.region) from error
+            raise self.connection_error(
+                error, region=self.region, workspace_id=self.workspace_id
+            ) from error
 
     async def probe_connection(self) -> float:
         """Validate the authenticated WebSocket handshake without uploading audio."""
-        if not self.api_key or not self.workspace_id:
-            raise AuthenticationError(
-                "Qwen Cloud requires both an API key and workspace ID."
-            )
+        if not self.api_key:
+            raise AuthenticationError("Qwen Cloud requires a DashScope API key.")
         started_ns = time.monotonic_ns()
         websocket = await self._open_with_diagnostics()
         try:
@@ -206,10 +212,8 @@ class CloudQwenAsrBackend:
     async def start_session(self, config: AsrSessionConfig) -> None:
         if not self.audio_upload_allowed:
             raise PolicyDeniedError("Cloud ASR requires explicit audio upload consent")
-        if not self.api_key or not self.workspace_id:
-            raise AuthenticationError(
-                "DASHSCOPE_API_KEY and DASHSCOPE_WORKSPACE_ID are required"
-            )
+        if not self.api_key:
+            raise AuthenticationError("DASHSCOPE_API_KEY is required")
         self.config = config
         self._segmenter = SentenceUnitSegmenter(config.language)
         self._session_started_ns = time.monotonic_ns()
