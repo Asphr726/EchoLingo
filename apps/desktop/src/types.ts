@@ -60,7 +60,15 @@ export interface LiveMetrics {
   reconnect_count: number;
   buffered_audio_ms: number;
   dropped_audio_ms: number;
+  translation_queue_depth?: number;
+  translation_backlog_ms?: number;
+  translation_first_delta_ms?: number | null;
+  translation_dropped_partials?: number;
+  translation_cancelled_requests?: number;
+  translation_errors?: number;
 }
+
+export type TranslationStatus = "pending" | "streaming" | "done" | "unavailable";
 
 export interface SegmentSummary {
   id: string;
@@ -69,6 +77,20 @@ export interface SegmentSummary {
   end_ms: number;
   original: string;
   translation: string;
+  translation_status?: TranslationStatus;
+}
+
+/** Three text tiers: committed rows (segments), open recognizer-committed
+ *  text not yet closed into a row, and the revisable unstable tail. */
+export interface LiveTranscript {
+  original_committed: string;
+  open_text: string;
+  original_unstable: string;
+  translation_committed: string;
+  translation_editable: string;
+  source_revision_id: number;
+  translation_revision_id: number;
+  translation_source_revision_id: number;
 }
 
 export interface SessionSnapshot {
@@ -79,15 +101,7 @@ export interface SessionSnapshot {
   ended_at: string | null;
   config: StartSessionRequest | null;
   route: RouteStatus | null;
-  live: {
-    original_committed: string;
-    original_unstable: string;
-    translation_committed: string;
-    translation_editable: string;
-    source_revision_id: number;
-    translation_revision_id: number;
-    translation_source_revision_id: number;
-  };
+  live: LiveTranscript;
   previous_segments: SegmentSummary[];
   metrics: LiveMetrics;
   recoverable_error: string | null;
@@ -228,6 +242,7 @@ export const emptySnapshot: SessionSnapshot = {
   route: null,
   live: {
     original_committed: "",
+    open_text: "",
     original_unstable: "",
     translation_committed: "",
     translation_editable: "",

@@ -218,15 +218,25 @@ export function HistoryView() {
               {selected.segments.length === 0 ? (
                 <p className="no-segments">This session ended before a stable segment was committed.</p>
               ) : (
-                selected.segments.map((segment) => (
-                  <article key={segment.id}>
-                    <time>{formatClock(segment.start_ms)}–{formatClock(segment.end_ms)}</time>
-                    <div>
-                      <p>{segment.source_text}</p>
-                      {segment.translated_text && <p className="segment-translation">{segment.translated_text}</p>}
-                    </div>
-                  </article>
-                ))
+                <>
+                  <div className="bilingual-row bilingual-row--header" aria-hidden="true">
+                    <span />
+                    <span>Original · {selected.session.source_language}</span>
+                    <span>Translation · {selected.session.target_language}</span>
+                  </div>
+                  {selected.segments.map((segment) => (
+                    <article className="bilingual-row bilingual-row--history" key={segment.id}>
+                      <time>{formatClock(segment.start_ms)}</time>
+                      <p className="row-original" lang={selected.session.source_language}>{segment.source_text}</p>
+                      <p
+                        className={`row-translation ${segment.translated_text ? "" : "row-translation--placeholder"}`}
+                        lang={selected.session.target_language}
+                      >
+                        {segment.translated_text || "—"}
+                      </p>
+                    </article>
+                  ))}
+                </>
               )}
             </div>
           </>

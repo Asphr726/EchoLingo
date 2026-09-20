@@ -9,10 +9,10 @@ import {
   Stop,
   Waveform,
 } from "@phosphor-icons/react";
-import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, type ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api } from "../lib/bridge";
-import { useApp } from "../state/AppContext";
-import type { StartSessionRequest } from "../types";
+import { useApp, useLiveMetrics } from "../state/AppContext";
+import type { SegmentSummary, StartSessionRequest } from "../types";
 
 const languages = [
   ["en", "English"],
@@ -249,18 +249,101 @@ function Field({
   );
 }
 
+const languageLabel = (code: string | undefined) =>
+  languages.find(([value]) => value === code)?.[1] ?? code ?? "";
+
+export function segmentTranslationLabel(segment: SegmentSummary): string | null {
+  if (segment.translation) return null;
+  switch (segment.translation_status) {
+    case "unavailable":
+      return "Translation unavailable";
+    case "streaming":
+      return "Translating…";
+    default:
+      return "Translating…";
+  }
+}
+
+const SegmentRow = memo(function SegmentRow({
+  segment,
+  sourceLanguage,
+  targetLanguage,
+}: {
+  segment: SegmentSummary;
+  sourceLanguage?: string;
+  targetLanguage?: string;
+}) {
+  const placeholder = segmentTranslationLabel(segment);
+  const streaming = segment.translation_status === "streaming";
+  return (
+    <article className="bilingual-row" data-status={segment.translation_status ?? "pending"}>
+      <time>{formatTime(segment.start_ms)}</time>
+      <p className="row-original" lang={sourceLanguage}>{segment.original}</p>
+      {placeholder ? (
+        <p className={`row-translation row-translation--placeholder ${segment.translation_status === "unavailable" ? "row-translation--unavailable" : ""}`} lang={targetLanguage}>
+          {placeholder}
+        </p>
+      ) : (
+        <p className={`row-translation ${streaming ? "row-translation--streaming" : ""}`} lang={targetLanguage}>
+          {segment.translation}
+        </p>
+      )}
+    </article>
+  );
+});
+
+function LiveRow({
+  openText,
+  unstableText,
+  provisionalTranslation,
+  sourceLanguage,
+  targetLanguage,
+}: {
+  openText: string;
+  unstableText: string;
+  provisionalTranslation: string;
+  sourceLanguage?: string;
+  targetLanguage?: string;
+}) {
+  const joiner = sourceLanguage === "zh" || sourceLanguage === "ja" ? "" : " ";
+  return (
+    <article className="bilingual-row bilingual-row--live" aria-label="Live, not yet committed">
+      <span className="live-marker">Live</span>
+      <p className="row-original" lang={sourceLanguage}>
+        {openText && <span className="text-open">{openText}</span>}
+        {openText && unstableText ? joiner : ""}
+        {unstableText && <span className="text-unstable">{unstableText}</span>}
+      </p>
+      <p className="row-translation row-translation--provisional" lang={targetLanguage}>
+        {provisionalTranslation || (openText || unstableText ? "…" : "")}
+      </p>
+    </article>
+  );
+}
+
+function SpeechIndicator() {
+  const metrics = useLiveMetrics();
+  return (
+    <div className={`speech-indicator ${metrics.speech_detected ? "speech-indicator--active" : ""}`}>
+      <Waveform size={17} weight="bold" aria-hidden="true" />
+      {metrics.speech_detected ? "Speech detected" : "Waiting for speech"}
+    </div>
+  );
+}
+
 function TranscriptStage() {
   const { snapshot } = useApp();
   const feedRef = useRef<HTMLDivElement>(null);
   const [following, setFollowing] = useState(true);
-  const pendingOriginal = snapshot.live.original_unstable.trim();
-  const pendingTranslation = pendingOriginal
-    ? snapshot.live.translation_editable.trim()
-    : "";
+  const openText = snapshot.live.open_text.trim();
+  const unstableText = snapshot.live.original_unstable.trim();
+  const provisionalTranslation = openText || unstableText ? snapshot.live.translation_editable.trim() : "";
   const segments = snapshot.previous_segments;
-  const hasCopy = segments.length > 0 || pendingOriginal || pendingTranslation;
+  const hasCopy = segments.length > 0 || openText || unstableText;
   const lastSegment = segments.at(-1);
-  const contentToken = `${segments.length}:${lastSegment?.translation ?? ""}:${pendingOriginal}:${pendingTranslation}`;
+  const contentToken = `${segments.length}:${lastSegment?.translation ?? ""}:${openText}:${unstableText}:${provisionalTranslation}`;
+  const sourceLanguage = snapshot.config?.source_language;
+  const targetLanguage = snapshot.config?.target_language;
 
   const scrollToLive = () => {
     const feed = feedRef.current;
@@ -278,13 +361,14 @@ function TranscriptStage() {
     <section className="transcript-stage" aria-label="Live transcript">
       <div className="transcript-heading">
         <div>
-          <span className="section-kicker">Current</span>
-          <h2>Live subtitles</h2>
+          <span className="section-kicker">Live subtitles</span>
+          <h2>
+            {languageLabel(sourceLanguage)}
+            <span className="language-arrow" aria-hidden="true">→</span>
+            {languageLabel(targetLanguage)}
+          </h2>
         </div>
-        <div className={`speech-indicator ${snapshot.metrics.speech_detected ? "speech-indicator--active" : ""}`}>
-          <Waveform size={17} weight="bold" aria-hidden="true" />
-          {snapshot.metrics.speech_detected ? "Speech detected" : "Waiting for speech"}
-        </div>
+        <SpeechIndicator />
       </div>
       {!hasCopy ? (
         <div className="transcript-empty">
@@ -292,7 +376,7 @@ function TranscriptStage() {
           <strong>{snapshot.phase === "LISTENING" ? "Listening to the room" : "Ready for a lecture"}</strong>
           <span>
             {snapshot.phase === "LISTENING"
-              ? "Far-field audio is flowing. The first stable words will appear here."
+              ? "Far-field audio is flowing. The first words will appear here as they are recognized."
               : "Choose your audio source and start a session. No audio leaves this device without permission."}
           </span>
         </div>
@@ -301,41 +385,32 @@ function TranscriptStage() {
           <div
             className="live-transcript-feed"
             ref={feedRef}
-            aria-live="polite"
             onScroll={(event) => {
               const feed = event.currentTarget;
               setFollowing(feed.scrollHeight - feed.scrollTop - feed.clientHeight < 48);
             }}
           >
+            <div className="bilingual-row bilingual-row--header" aria-hidden="true">
+              <span />
+              <span>Original · {languageLabel(sourceLanguage)}</span>
+              <span>Translation · {languageLabel(targetLanguage)}</span>
+            </div>
             {segments.map((segment) => (
-              <article className="live-segment" key={segment.id}>
-                <time>{formatTime(segment.start_ms)}</time>
-                <div className="live-segment-copy">
-                  <p lang={snapshot.config?.source_language}>{segment.original}</p>
-                  {segment.translation ? (
-                    <p className="segment-translation" lang={snapshot.config?.target_language}>
-                      {segment.translation}
-                    </p>
-                  ) : (
-                    <span className="translation-pending">Translating…</span>
-                  )}
-                </div>
-              </article>
+              <SegmentRow
+                key={segment.id}
+                segment={segment}
+                sourceLanguage={sourceLanguage}
+                targetLanguage={targetLanguage}
+              />
             ))}
-            {(pendingOriginal || pendingTranslation) && (
-              <article className="live-segment live-segment--editable">
-                <span className="live-marker">Live</span>
-                <div className="live-segment-copy">
-                  {pendingOriginal && (
-                    <p lang={snapshot.config?.source_language}>{pendingOriginal}</p>
-                  )}
-                  {pendingTranslation && (
-                    <p className="segment-translation" lang={snapshot.config?.target_language}>
-                      {pendingTranslation}
-                    </p>
-                  )}
-                </div>
-              </article>
+            {(openText || unstableText) && (
+              <LiveRow
+                openText={openText}
+                unstableText={unstableText}
+                provisionalTranslation={provisionalTranslation}
+                sourceLanguage={sourceLanguage}
+                targetLanguage={targetLanguage}
+              />
             )}
           </div>
           {!following && (
@@ -398,8 +473,8 @@ function RoutePanel() {
 }
 
 function AudioPanel() {
-  const { snapshot } = useApp();
-  const rms = snapshot.metrics.input_rms_dbfs;
+  const metrics = useLiveMetrics();
+  const rms = metrics.input_rms_dbfs;
   const level = rms == null ? 0 : Math.min(1, Math.max(0, (rms + 60) / 60));
   return (
     <section className="inspector-section">
@@ -411,28 +486,40 @@ function AudioPanel() {
         <span style={{ transform: `scaleX(${level})` }} />
       </div>
       <dl className="metric-grid">
-        <div><dt>VAD probability</dt><dd>{percent(snapshot.metrics.vad_probability)}</dd></div>
-        <div><dt>Speech</dt><dd>{snapshot.metrics.speech_detected ? "Detected" : "No"}</dd></div>
-        <div><dt>Buffered</dt><dd>{formatMs(snapshot.metrics.buffered_audio_ms)}</dd></div>
-        <div><dt>Dropped</dt><dd>{formatMs(snapshot.metrics.dropped_audio_ms)}</dd></div>
+        <div><dt>VAD probability</dt><dd>{percent(metrics.vad_probability)}</dd></div>
+        <div><dt>Speech</dt><dd>{metrics.speech_detected ? "Detected" : "No"}</dd></div>
+        <div><dt>Buffered</dt><dd>{formatMs(metrics.buffered_audio_ms)}</dd></div>
+        <div><dt>Dropped</dt><dd>{formatMs(metrics.dropped_audio_ms)}</dd></div>
       </dl>
     </section>
   );
 }
 
 function LatencyPanel() {
-  const { snapshot } = useApp();
-  const metrics = snapshot.metrics;
+  const metrics = useLiveMetrics();
+  const backlog = metrics.translation_queue_depth ?? 0;
   return (
     <section className="inspector-section">
       <span className="section-kicker">Latency</span>
       <dl className="latency-list">
         <div><dt>First partial</dt><dd>{formatMs(metrics.asr_first_partial_latency_ms)}</dd></div>
-        <div><dt>ASR stable</dt><dd>{formatMs(metrics.asr_commit_latency_ms)}</dd></div>
+        <div><dt>Sentence commit</dt><dd>{formatMs(metrics.asr_commit_latency_ms)}</dd></div>
         <div><dt>Translation</dt><dd>{formatMs(metrics.translation_latency_ms)}</dd></div>
+        <div><dt>First delta</dt><dd>{formatMs(metrics.translation_first_delta_ms)}</dd></div>
         <div><dt>End to end</dt><dd>{formatMs(metrics.end_to_end_latency_ms)}</dd></div>
-        <div><dt>Cloud roundtrip</dt><dd>{formatMs(metrics.cloud_roundtrip_latency_ms)}</dd></div>
-        <div><dt>Network jitter</dt><dd>{formatMs(metrics.network_jitter_ms)}</dd></div>
+        <div>
+          <dt>Translation backlog</dt>
+          <dd>{backlog === 0 ? "clear" : `${backlog} · ${formatMs(metrics.translation_backlog_ms)}`}</dd>
+        </div>
+        {(metrics.translation_errors ?? 0) > 0 && (
+          <div><dt>Translation errors</dt><dd>{metrics.translation_errors}</dd></div>
+        )}
+        {metrics.cloud_roundtrip_latency_ms != null && (
+          <div><dt>Cloud roundtrip</dt><dd>{formatMs(metrics.cloud_roundtrip_latency_ms)}</dd></div>
+        )}
+        {metrics.network_jitter_ms != null && (
+          <div><dt>Network jitter</dt><dd>{formatMs(metrics.network_jitter_ms)}</dd></div>
+        )}
       </dl>
     </section>
   );

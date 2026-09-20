@@ -13,6 +13,7 @@ import { api, subscribeUiEvents } from "../lib/bridge";
 import type {
   AudioDevice,
   CaptionPreferences,
+  LiveMetrics,
   SessionSnapshot,
   StartSessionRequest,
   UiEventEnvelope,
@@ -56,9 +57,17 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** Events from another session (e.g. alignment of a finished session) never
+ *  touch the current one. Snapshot replacement is always accepted. */
+function belongsToCurrentSession(snapshot: SessionSnapshot, event: UiEventEnvelope): boolean {
+  if (event.kind === "session_state" || !event.session_id || !snapshot.session_id) return true;
+  return event.session_id === snapshot.session_id;
+}
+
 export function applyUiEvent(snapshot: SessionSnapshot, event: UiEventEnvelope): SessionSnapshot {
   const payload = event.payload as Record<string, unknown>;
   if (event.kind === "session_state") return event.payload as SessionSnapshot;
+  if (!belongsToCurrentSession(snapshot, event)) return snapshot;
   if (event.kind === "backend_health") {
     const service = String(payload.service ?? "inference backend");
     const state = String(payload.state ?? "starting");
@@ -75,37 +84,49 @@ export function applyUiEvent(snapshot: SessionSnapshot, event: UiEventEnvelope):
   }
   if (event.kind === "transcript_revision") {
     const kind = String(payload.kind ?? "partial");
+    // Alignment refines stored timings only; errors are diagnostics.
+    if (kind === "alignment_update" || kind === "error") return snapshot;
     const text = String(payload.text ?? "");
     const committed = String(payload.committed_text ?? "");
     const revision = Number(payload.revision_id ?? snapshot.live.source_revision_id);
     const live = { ...snapshot.live, source_revision_id: revision };
     if (kind === "partial") {
       live.original_unstable = String(payload.unstable_text ?? text);
+      live.open_text = String(payload.stable_text ?? "");
     } else {
-      live.original_committed = committed || text;
+      if (committed) live.original_committed = committed;
+      live.open_text = "";
       live.original_unstable = "";
       live.translation_editable = "";
     }
     return { ...snapshot, live };
   }
   if (event.kind === "translation_revision") {
+    const kind = String(payload.kind ?? "partial");
+    const sourceCommitted = Boolean(payload.source_committed);
     const sourceRevision = Number(
       payload.source_revision_id ?? snapshot.live.translation_source_revision_id,
     );
-    const editable = String(payload.editable_text ?? payload.text ?? "");
+    const text = String(payload.text ?? "");
+    const editable = String(payload.editable_text ?? "") || text;
     const live = {
       ...snapshot.live,
       translation_revision_id: Number(
         payload.revision_id ?? snapshot.live.translation_revision_id,
       ),
       translation_source_revision_id: sourceRevision,
-      translation_committed:
-        String(payload.committed_text ?? "") || snapshot.live.translation_committed,
-      translation_editable:
-        snapshot.live.original_unstable || sourceRevision >= snapshot.live.source_revision_id
-          ? editable
-          : "",
     };
+    if (sourceCommitted) {
+      // Row translations arrive through segment_committed; the live tail is
+      // never touched by a committed span.
+      if (kind === "final" && payload.committed_text) {
+        live.translation_committed = String(payload.committed_text);
+      }
+      return { ...snapshot, live };
+    }
+    if (kind === "error") return snapshot;
+    const hasLiveSource = Boolean(snapshot.live.original_unstable || snapshot.live.open_text);
+    live.translation_editable = hasLiveSource ? editable : "";
     return { ...snapshot, live };
   }
   if (event.kind === "segment_committed") {
@@ -127,8 +148,25 @@ export function applyUiEvent(snapshot: SessionSnapshot, event: UiEventEnvelope):
   return snapshot;
 }
 
+/** Keep live text that arrived between a command's emit and its reply. */
+export function mergeCommandSnapshot(current: SessionSnapshot, next: SessionSnapshot): SessionSnapshot {
+  if (
+    current.session_id === next.session_id &&
+    current.state_revision >= next.state_revision &&
+    current.phase === next.phase
+  ) {
+    return current;
+  }
+  return next;
+}
+
+const MetricsContext = createContext<LiveMetrics>(emptySnapshot.metrics);
+
 export function AppProvider({ children }: PropsWithChildren) {
   const [snapshot, setSnapshot] = useState<SessionSnapshot>(emptySnapshot);
+  // Metrics tick ~10 times per second; keeping them out of the snapshot
+  // means transcript rows do not re-render on every level-meter update.
+  const [metrics, setMetrics] = useState<LiveMetrics>(emptySnapshot.metrics);
   const [draft, setDraft] = useState<StartSessionRequest>(defaultDraft);
   const [devices, setDevices] = useState<AudioDevice[]>([]);
   const [caption, setCaption] = useState<CaptionPreferences>(defaultCaptionPreferences);
@@ -150,6 +188,7 @@ export function AppProvider({ children }: PropsWithChildren) {
       .then(([nextSnapshot, nextOnboarding, nextDevices, nextCaption, nextDefaults]) => {
         if (!active) return;
         setSnapshot(nextSnapshot);
+        setMetrics(nextSnapshot.metrics);
         setOnboardingComplete(nextOnboarding);
         setDraft({
           ...nextDefaults,
@@ -169,6 +208,13 @@ export function AppProvider({ children }: PropsWithChildren) {
       .catch((failure) => active && setError(message(failure)))
       .finally(() => active && setLoading(false));
     subscribeUiEvents((event) => {
+      if (event.kind === "metrics") {
+        setMetrics((current) => ({ ...current, ...(event.payload as Partial<LiveMetrics>) }));
+        return;
+      }
+      if (event.kind === "session_state") {
+        setMetrics((event.payload as SessionSnapshot).metrics);
+      }
       setSnapshot((current) => applyUiEvent(current, event));
       if (event.kind === "settings_changed") {
         setCaption(event.payload as CaptionPreferences);
@@ -202,7 +248,9 @@ export function AppProvider({ children }: PropsWithChildren) {
     setActionPending(true);
     setError(null);
     try {
-      setSnapshot(await action());
+      const next = await action();
+      setMetrics(next.metrics);
+      setSnapshot((current) => mergeCommandSnapshot(current, next));
     } catch (failure) {
       setError(message(failure));
     } finally {
@@ -289,11 +337,19 @@ export function AppProvider({ children }: PropsWithChildren) {
       updateCaption,
     ],
   );
-  return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
+  return (
+    <AppContext.Provider value={value}>
+      <MetricsContext.Provider value={metrics}>{children}</MetricsContext.Provider>
+    </AppContext.Provider>
+  );
 }
 
 export function useApp() {
   const context = useContext(AppContext);
   if (!context) throw new Error("useApp must be used inside AppProvider");
   return context;
+}
+
+export function useLiveMetrics(): LiveMetrics {
+  return useContext(MetricsContext);
 }
