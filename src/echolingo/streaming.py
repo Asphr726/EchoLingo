@@ -102,6 +102,20 @@ DANGLING_WORDS = frozenset(
     }
 )
 DEFERRED_EDGE_EXPIRY_MS = 3_000.0
+# Common words a restarted recognizer segment capitalizes mid-sentence
+# ("…or Added together", "So At a high level"); they are lowercased again
+# unless the session has shown them capitalized mid-sentence (names).
+_COMMON_WORDS = DANGLING_WORDS | frozenset(
+    {
+        "also", "so", "then", "that", "this", "these", "those", "it", "is", "are",
+        "was", "were", "be", "been", "we", "you", "they", "there", "here", "what",
+        "which", "who", "how", "when", "where", "why", "not", "no", "yes", "all",
+        "one", "two", "some", "more", "most", "other", "same", "like", "okay",
+        "right", "well", "now", "actually", "basically", "really", "can", "could",
+        "will", "would", "should", "have", "has", "had", "do", "does", "did",
+    }
+)
+_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'’-]*")
 # "…like a. Very small…": a period inside a unit right after a function word
 # is a recognizer artefact; drop it when the unit closes.
 _DANGLING_PERIOD_RE = re.compile(
@@ -206,6 +220,10 @@ class SentenceUnitSegmenter:
         self.language = language
         self.rules = rules or UnitClosureRules()
         self._chunks: list[_Chunk] = []
+        # Session vocabulary for tidy_joins: words seen in lowercase, and
+        # capitalized words seen mid-sentence (likely names).
+        self._seen_lower: set[str] = set()
+        self._seen_title_mid: set[str] = set()
         # Index of the chunk whose trailing period is held back as a likely
         # window-edge artefact (see DANGLING_WORDS), or None.
         self._deferred_chunk: int | None = None
@@ -389,7 +407,55 @@ class SentenceUnitSegmenter:
         self._chunks = [_Chunk(tail, remainder_start, last_end)] if tail else []
         if self.language not in UNSPACED_LANGUAGES:
             head = _DANGLING_PERIOD_RE.sub(r"\1\2", head)
+            head = self.tidy_joins(head)
         return TranscriptUnit(head, start_ms, end_ms, reason)
+
+    def tidy_joins(self, text: str) -> str:
+        """Repair recognizer segment joins inside one unit.
+
+        A restarted segment repeats or capitalizes its first word ("also
+        Also, CMYK", "or Added together"). A repeated word is dropped (its
+        trailing punctuation kept) and a capitalized common word after a
+        non-final word is lowercased. Acronyms, "I" and words the session has
+        shown capitalized mid-sentence are left alone.
+        """
+        tokens = text.split(" ")
+        out: list[str] = []
+        for token in tokens:
+            match = _WORD_RE.match(token)
+            if out and match:
+                word = match.group(0)
+                rest = token[len(word):]
+                previous = out[-1]
+                previous_match = _WORD_RE.match(previous)
+                previous_word = previous_match.group(0) if previous_match else ""
+                previous_rest = previous[len(previous_word):] if previous_match else previous
+                sentence_break = previous.rstrip("\"')]}”’").endswith(tuple(SENTENCE_END_CHARS))
+                if (
+                    not sentence_break
+                    and previous_word
+                    and not previous_rest.strip()
+                    and word[0].isupper()
+                    and word.lower() == previous_word.lower()
+                ):
+                    out[-1] = previous_word + rest
+                    continue
+                title = len(word) > 1 and word[0].isupper() and word[1:].islower()
+                if (
+                    title
+                    and not sentence_break
+                    and word not in {"I", "I'm", "I'll", "I've", "I'd"}
+                    and word not in self._seen_title_mid
+                    and (word.lower() in _COMMON_WORDS or word.lower() in self._seen_lower)
+                ):
+                    token = word.lower() + rest
+                elif title and not sentence_break:
+                    self._seen_title_mid.add(word)
+            out.append(token)
+        for word in _WORD_RE.findall(" ".join(out)):
+            if word.islower():
+                self._seen_lower.add(word)
+        return " ".join(out)
 
     def _time_at(self, index: int, total: int) -> float | None:
         if index >= total:

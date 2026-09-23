@@ -56,6 +56,59 @@ Sidecar diagnostics are appended to `logs/sidecar.log` inside the app data
 directory (shown under **Settings → Advanced**); values of credentials are
 never written there.
 
+## AI assistant: session notes and titles
+
+History can turn a recorded session into structured study notes and names
+each session automatically (docs/adr/0006).
+
+1. Add a key for one chat provider under **Settings → Cloud providers**:
+   Qwen (Alibaba Model Studio — the Beijing region has free quota), OpenAI,
+   DeepSeek, Google Gemini, Groq, OpenRouter, SiliconFlow, or a custom
+   OpenAI-compatible endpoint (Ollama, LM Studio, vLLM).
+2. In **Settings → AI assistant** choose that provider and, optionally, a
+   model (the default is shown as the placeholder; long lectures need a model
+   with a large context window, e.g. `qwen-plus`, `gpt-4o-mini`,
+   `gemini-2.0-flash`).
+3. Turn on **Send transcripts and attached files to this model**. Nothing is
+   sent before this consent is given; audio never leaves the Mac for notes or
+   titles. **Test** sends one fixed prompt and no transcript.
+4. With **Name sessions automatically when they end** on, a session with at
+   least 30 words gets an AI title in its target language right after Stop.
+   Titles you rename yourself are never replaced.
+
+**Creating notes.** Open a session in History → **AI notes** → **Create
+notes**. EchoLingo asks whether to add course materials: PDF, PowerPoint
+(.pptx), Word (.docx), Markdown, LaTeX, CSV or plain text, up to 5 files of
+25 MB each. Text is extracted on this Mac (scanned PDFs without a text layer
+are reported and skipped); only the extracted text is sent, so every provider
+accepts it. Notes are written in the session's translation language, stream
+in as they are generated, render Markdown and LaTeX, and are saved with the
+session: reopening it shows them without calling the model again. **Export
+.md**, **Copy** and **Regenerate** are on the notes toolbar; each section
+heading carries a time range that jumps to that part of the transcript.
+
+Sessions longer than about 20 minutes are written in 12–15 minute parts that
+continue one document, followed by the title and overview.
+
+| Error | Meaning | What to do |
+| --- | --- | --- |
+| `privacy_policy_denied` | consent is off | enable it in Settings → AI assistant |
+| `not_configured` | no provider or key | choose a provider and save its key |
+| `authentication_failed` | key rejected | check the key (and the Qwen region) in Cloud providers |
+| `rate_limited` | quota or rate limit | wait, or pick another provider |
+| `context_too_long` | the model's context window is too small | choose a larger-context model |
+
+## Lecture context (recognition and translation)
+
+The **Lecture context** panel on the Live screen takes the topic, names and
+terms of the next session, one per line (`term = translation` adds a glossary
+pair); **Import from slides…** fills it from course materials. **Settings →
+Translation → Glossary** keeps terms for every session. The local Qwen
+recognizer receives the context in its prompt; cloud recognizers receive it
+as their hint/keyterm parameter; translation receives the topic as background
+and the glossary pairs that occur in each sentence. Context reaches cloud
+providers only under the same upload switches as audio and transcripts.
+
 ## Command-line sessions
 
 ```bash

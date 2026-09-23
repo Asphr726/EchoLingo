@@ -343,7 +343,7 @@ def test_segmenter_ignores_and_cleans_interior_periods_after_function_words() ->
         end_ms=4000,
     )
     assert [unit.text for unit in units] == [
-        "It might look like the Very small difference when you look at it closely."
+        "It might look like the very small difference when you look at it closely."
     ]
 
 
@@ -376,3 +376,21 @@ def test_wlk_mapper_does_not_promote_abbreviations_or_function_word_periods() ->
     mapper.map_message({"lines": [], "buffer_transcription": buffer}, 3000)
     events = mapper.map_message({"lines": [], "buffer_transcription": buffer + " again"}, 4000)
     assert [e.text for e in events if e.kind == TranscriptKind.STABLE] == []
+
+
+def test_segmenter_tidies_recognizer_segment_joins() -> None:
+    segmenter = SentenceUnitSegmenter("en")
+    segmenter.append("We keep the colors added in RGB and the Gaussian filter here.", start_ms=0, end_ms=2000)
+    assert segmenter.tidy_joins("There's of course also Also, CMYK for printing.") == (
+        "There's of course also, CMYK for printing."
+    )
+    assert segmenter.tidy_joins("So At a high level, red, green and blue are Added together.") == (
+        "So at a high level, red, green and blue are added together."
+    )
+    # Names, acronyms, "I" and real sentence starts stay as they are.
+    assert segmenter.tidy_joins("We use the Gaussian and RGB. I think So far so good.") == (
+        "We use the Gaussian and RGB. I think so far so good."
+    )
+    assert segmenter.tidy_joins("Then Béla Julesz showed that. Textures pop out.") == (
+        "Then Béla Julesz showed that. Textures pop out."
+    )
