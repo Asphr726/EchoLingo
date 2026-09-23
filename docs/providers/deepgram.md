@@ -4,9 +4,9 @@ Provider id `deepgram` · adapter `src/echolingo/backends/asr/deepgram.py`
 (`DeepgramAsrBackend`, built on `CloudStreamingAsrBase`) · tests
 `tests/test_deepgram_backend.py` (fake WebSocket, no network).
 
-Status: unit tests PASS (mock transport); live validation
-`PENDING CREDENTIALS`; not eligible for the Auto route until EN/ZH/JA/KO
-latency and accuracy evidence is recorded in `docs/benchmark.md`.
+Status: unit tests pass (mock transport); live validation is pending
+credentials; not eligible for the Auto route until EN/ZH/JA/KO latency and
+accuracy have been measured.
 
 ## Getting a key
 
@@ -15,8 +15,8 @@ latency and accuracy evidence is recorded in `docs/benchmark.md`.
    usage is billed per audio minute after that.
 2. Create a project API key (**API Keys → Create a New API Key**). The key
    needs the default *Member* scope; nothing else is required for streaming.
-3. In EchoLingo open **Settings → Models → Cloud credentials → Deepgram**,
-   paste the key and choose **Save to Keychain**. The desktop shell injects it
+3. In EchoLingo open **Settings → Cloud providers → Deepgram**, paste the
+   key and choose **Save** (it is stored in the macOS Keychain). The desktop shell injects it
    into the sidecar as `DEEPGRAM_API_KEY`; the adapter never logs, persists
    or places it in a URL. Setting `DEEPGRAM_API_KEY` in the process
    environment is a development fallback only.
@@ -32,8 +32,11 @@ latency and accuracy evidence is recorded in `docs/benchmark.md`.
   (`send_batch_ms`). Capture, enhancement, AGC, VAD and resampling stay local;
   VAD never drops audio before upload.
 - `KeepAlive` and `CloseStream` control frames.
+- On Nova-3 models, the terms from the lecture context and the glossary as
+  repeated `keyterm` query parameters (at most 50 terms of at most 50
+  characters). Other models receive no terms.
 
-Nothing else: no transcript history, no context text, no diagnostics. Without
+Nothing else: no transcript history, no topic text, no diagnostics. Without
 the privacy flag `start_session` raises `PolicyDeniedError` before a socket
 is opened. Deepgram's data-retention terms apply to the audio it receives;
 check the console's project settings if you need retention disabled.
@@ -42,7 +45,7 @@ Region: Deepgram serves `api.deepgram.com` from US infrastructure; there is
 no EU/CN endpoint selector in the streaming API. `HTTPS_PROXY`/`NO_PROXY`
 from the environment are honoured by the `websockets` client.
 
-## What "Test connection" does
+## What "Test" does
 
 `probe_connection` opens the same `wss://api.deepgram.com/v1/listen?...`
 URL the session would use and closes it as soon as the handshake succeeds. No
@@ -92,7 +95,7 @@ Japanese; whether Nova-3 accepts `zh`/`ko` as *monolingual* streaming
 languages could not be verified offline when this adapter was written. A
 wrong guess would fail every ZH/KO session at connect time (HTTP 400), so the
 adapter prefers the model that is known to work. Once the Deepgram console
-(or a live **Test connection** with `ECHOLINGO_DEEPGRAM_MODEL=nova-3` and a
+(or a live **Test** with `ECHOLINGO_DEEPGRAM_MODEL=nova-3` and a
 ZH/KO session language) confirms support, delete the two entries; the table
 is the only place to edit and `tests/test_deepgram_backend.py` pins the
 behaviour. `auto` on a non-Nova-3 model means Deepgram's default (English):

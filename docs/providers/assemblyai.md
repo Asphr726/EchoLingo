@@ -15,9 +15,9 @@
 
 1. Sign up at <https://www.assemblyai.com/dashboard> and copy the API key
    shown on the dashboard home page.
-2. In EchoLingo open **Settings → Models → Cloud credentials → AssemblyAI**,
-   paste the key and choose **Save to Keychain**.
-3. Choose **Test connection**.
+2. In EchoLingo open **Settings → Cloud providers → AssemblyAI**, paste the
+   key and choose **Save** (it is stored in the macOS Keychain).
+3. Choose **Test**.
 
 Free accounts include starter credit. Streaming is billed per session hour
 (connection time, not speech time), so a session that stays open during a long
@@ -29,9 +29,12 @@ break still costs money. Pause the session instead of leaving it connected.
   AssemblyAI as it is captured. Capture, enhancement, AGC, VAD, resampling and
   the audio ring stay local; VAD annotations are not sent and never gate the
   upload.
-* **Nothing else.** No transcript, glossary, context or session history is
-  uploaded by this adapter. The `AsrSessionConfig.context` field is ignored.
-* **Test connection** performs the authenticated WebSocket handshake only and
+* **Hint terms.** The terms from the lecture context and the glossary travel
+  as `keyterms_prompt` (at most 100 terms of at most 50 characters, 2000
+  UTF-8 bytes in total). The topic line itself is not sent.
+* **Nothing else.** No transcript, translation or session history is uploaded
+  by this adapter.
+* **Test** performs the authenticated WebSocket handshake only and
   sends no audio and no messages. It reports `model`, `host` and the
   handshake latency.
 
@@ -121,5 +124,5 @@ NUMBA_CACHE_DIR=/tmp/echolingo-numba-cache conda run -n echolingo-spike1 \
   pytest -q -p no:cacheprovider tests/test_assemblyai_backend.py
 ```
 
-Live latency/accuracy measurements against real audio remain
-`PENDING_CREDENTIALS` in `docs/benchmark.md`.
+Live latency/accuracy measurements against real audio are still pending;
+they need a funded account.

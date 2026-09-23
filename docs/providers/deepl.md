@@ -12,7 +12,7 @@ endpoint). Translation only; DeepL has no streaming ASR.
    verification but is not charged).
 2. Copy the **Authentication Key for DeepL API** from
    <https://www.deepl.com/your-account/keys>.
-3. In EchoLingo open **Settings → Cloud → DeepL**, paste the key, pick the
+3. In EchoLingo open **Settings → Cloud providers → DeepL**, paste the key, pick the
    **Plan** (API Free / API Pro) and choose **Save**. The key is stored in the
    macOS Keychain and reaches the sidecar only as the `DEEPL_API_KEY`
    environment variable for the lifetime of a session. On the command line
@@ -44,8 +44,9 @@ refuses to start otherwise (`privacy_policy_denied`). Per request, over HTTPS
 to the host above:
 
 - the source text of one **stable** transcript unit (`text`);
-- the source text of the previous two stable units as DeepL `context`, joined
-  by newlines, capped at 600 characters. Target-language text is never sent,
+- the lecture topic (at most 200 characters) and the source text of the
+  previous two stable units as DeepL `context`, joined by newlines, capped at
+  600 characters. Target-language text is never sent,
   so nothing translated can be echoed back. DeepL documents `context` as
   not translated and, at the time of writing, not counted toward billing;
   check the DeepL API reference for the current terms;
@@ -100,13 +101,13 @@ matters.
 
 ## What "Test" does
 
-**Settings → Cloud → DeepL → Test** builds the adapter from the saved key and
+**Settings → Cloud providers → DeepL → Test** builds the adapter from the saved key and
 plan, forces transcript consent for the probe only, and translates the fixed
 sentence "Welcome to the lecture." from English to Chinese. It sends nothing
 from the microphone or the session history. A success reports the model name
 (`deepl-<model_type>`) and the round-trip latency of that one request; the
 probe is a configuration check, not a latency benchmark (EN/ZH/JA/KO figures
-stay `PENDING CREDENTIALS` in `docs/benchmark.md`). The same host rule
+have not been measured yet). The same host rule
 applies: a `:fx` key is probed against `api-free.deepl.com`.
 
 ## Errors
@@ -133,5 +134,5 @@ replaces it with `[redacted]`.
 - Unit tests: `NUMBA_CACHE_DIR=/tmp/echolingo-numba-cache conda run -n
   echolingo-spike1 pytest -q tests/test_deepl_backend.py` (mock transport,
   no network) — PASS.
-- Live probe and EN/ZH/JA/KO latency/accuracy: `PENDING CREDENTIALS`; DeepL
-  is not `auto_route_eligible` until `docs/benchmark.md` records them.
+- Live probe and EN/ZH/JA/KO latency/accuracy: pending credentials; DeepL
+  is not `auto_route_eligible` until they have been measured.

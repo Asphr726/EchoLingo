@@ -2,8 +2,9 @@
 
 One adapter (`src/echolingo/backends/translation/openai_chat.py`) serves every
 translation provider that speaks the OpenAI chat completions API. Pick a preset
-in **Settings → Translation** (or `[translation] provider = "<preset>"`), store
-its key, enable **Settings → Privacy → Transcript upload**, and the route is
+as the translation provider on the Live screen or in **Settings → Models →
+Provider preferences** (or `[translation] provider = "<preset>"`), store its
+key, enable **Settings → Privacy → Transcript upload**, and the route is
 live. ASR keeps routing independently: local Qwen3-ASR with a cloud chat
 translator is a supported Hybrid combination.
 
@@ -20,12 +21,12 @@ translator is a supported Hybrid combination.
 Defaults live in `CHAT_PRESETS` in `src/echolingo/backends/registry.py`; the
 exported `configs/providers.json` is what the desktop Settings window reads.
 None of these presets is in the Auto route yet: `auto_route_eligible` needs
-the EN/ZH/JA/KO latency and accuracy evidence described in `docs/benchmark.md`.
+measured EN/ZH/JA/KO latency and accuracy evidence.
 
 ## Getting a key
 
-Product credentials go into the OS secure store from **Settings → Models →
-Cloud credentials → Save to Keychain**; the desktop shell injects them into
+Product credentials go into the OS secure store from the provider's card in
+**Settings → Cloud providers → Save**; the desktop shell injects them into
 the sidecar as environment variables. Setting the env var yourself is a
 development fallback only. Never commit a key.
 
@@ -65,8 +66,8 @@ named variable).
 Small, fast instruction-tuned models are the right choice: captions are
 retranslated on every stable revision, so first-delta latency matters more
 than the last point of quality. The preset defaults are starting points, not
-measurements: EN/ZH/JA/KO latency and accuracy for these presets are
-`PENDING_CREDENTIALS` in `docs/benchmark.md` until run with real keys.
+measurements: EN/ZH/JA/KO latency and accuracy for these presets have not
+been measured with real keys yet.
 
 ## Custom endpoint
 
@@ -102,8 +103,9 @@ nothing leaving the process boundary.
 ## What leaves the machine
 
 - The text of the span being translated, a glossary when one is configured,
-  and up to `background_spans` (default 2, at most 600 characters) of the
-  *previous source-language* transcript as context. Earlier translations are
+  the lecture topic as background (at most 400 characters), and up to
+  `background_spans` (default 2, at most 600 characters) of the *previous
+  source-language* transcript as context. Earlier translations are
   never sent: chat models copy target text from the prompt back as the answer.
 - Nothing is sent until **Transcript upload** is enabled. Audio never reaches
   a chat provider under any setting.
@@ -115,7 +117,7 @@ nothing leaving the process boundary.
 
 ## What "Test" does
 
-**Settings → Test connection** builds the adapter from the stored credentials,
+**Test** on the provider's card in **Settings → Cloud providers** builds the adapter from the stored credentials,
 temporarily grants transcript consent and translates the fixed sentence
 "Welcome to the lecture." from English to Chinese with a non-streaming
 request. It uploads no session history and no audio. A successful test proves

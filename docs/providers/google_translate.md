@@ -15,7 +15,7 @@ Translation only; the model name reported in events is `nmt`.
    Under **API restrictions** restrict the key to **Cloud Translation API**
    only; leave application restrictions unset (the sidecar has no HTTP
    referrer and no fixed IP). Keys look like `AIza…` (39 characters).
-3. In EchoLingo open **Settings → Cloud → Google Cloud Translation**, paste
+3. In EchoLingo open **Settings → Cloud providers → Google Cloud Translation**, paste
    the key and choose **Save**. The key is stored in the macOS Keychain and
    reaches the sidecar only as the `GOOGLE_TRANSLATE_API_KEY` environment
    variable for the lifetime of a session. On the command line
@@ -88,13 +88,13 @@ enforcement matters.
 
 ## What "Test" does
 
-**Settings → Cloud → Google Cloud Translation → Test** builds the adapter
+**Settings → Cloud providers → Google Cloud Translation → Test** builds the adapter
 from the saved key, forces transcript consent for the probe only, and
 translates the fixed sentence "Welcome to the lecture." from English to
 Chinese. It sends nothing from the microphone or the session history. A
 success reports the model name (`nmt`) and the round-trip latency of that one
 request; the probe is a configuration check, not a latency benchmark
-(EN/ZH/JA/KO figures stay `PENDING CREDENTIALS` in `docs/benchmark.md`).
+(EN/ZH/JA/KO figures have not been measured yet).
 
 ## Errors
 
@@ -121,6 +121,6 @@ key (`AIza…`) is replaced with `[redacted]`.
 - Unit tests: `NUMBA_CACHE_DIR=/tmp/echolingo-numba-cache conda run -n
   echolingo-spike1 pytest -q tests/test_google_translate_backend.py` (mock
   transport, no network) — PASS (25 tests).
-- Live probe and EN/ZH/JA/KO latency/accuracy: `PENDING CREDENTIALS`; Google
-  Cloud Translation is not `auto_route_eligible` until `docs/benchmark.md`
-  records them.
+- Live probe and EN/ZH/JA/KO latency/accuracy: pending credentials; Google
+  Cloud Translation is not `auto_route_eligible` until they have been
+  measured.

@@ -7,7 +7,7 @@ credential group: `gladia` in `src/echolingo/backends/registry.py`.
 ## Getting a key
 
 1. Sign in at <https://app.gladia.io/> and create an API key.
-2. In EchoLingo, open Settings → Providers → Gladia and paste the key. The
+2. In EchoLingo, open Settings → Cloud providers → Gladia and paste the key. The
    desktop shell stores it in the OS secure store and injects it into the
    sidecar as `GLADIA_API_KEY`; the environment variable is a development
    fallback only.
@@ -21,11 +21,13 @@ the current quota); live minutes beyond the allowance require a paid plan.
 ## What leaves the machine
 
 - The session configuration (encoding, sample rate, model, language) via
-  `POST https://api.gladia.io/v2/live` with the `x-gladia-key` header.
+  `POST https://api.gladia.io/v2/live` with the `x-gladia-key` header. When
+  the lecture context or the glossary has terms, they are added as custom
+  vocabulary (at most 100 terms of at most 100 characters).
 - Raw 16 kHz PCM16 audio as binary WebSocket frames, only after
   `start_session` with `audio_upload_allowed=True`. Gladia processes the audio
-  on its own servers; no transcript or glossary text is uploaded by this
-  adapter. Nothing else (session context, custom vocabulary) is sent.
+  on its own servers; no transcript, translation or topic text is uploaded by
+  this adapter.
 - Capture, enhancement, AGC, VAD, resampling and the local audio ring stay on
   the machine. Server VAD events are annotations only; local audio is never
   dropped.
@@ -111,5 +113,4 @@ selector. `HTTPS_PROXY` / `NO_PROXY` are honoured for both the REST init
 
 Unit tests: `tests/test_gladia_backend.py` (mock transport and fake socket,
 no live network). Inclusion in the Auto route (`auto_route_eligible`) is
-pending measured EN/ZH/JA/KO latency and accuracy evidence in
-`docs/benchmark.md`.
+pending measured EN/ZH/JA/KO latency and accuracy evidence.

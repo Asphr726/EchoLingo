@@ -27,7 +27,7 @@ quotas:
 ## Setup
 
 1. Create a key in the console of the region you want to use.
-2. Settings → Cloud → Qwen Cloud: paste the key, optionally the workspace ID,
+2. Settings → Cloud providers → Qwen Cloud: paste the key, optionally the workspace ID,
    choose the Region, **Save**, then **Test**. The result shows the region and
    host that were used and whether the call was workspace-scoped.
 3. Enable **Audio upload** for cloud recognition and/or **Transcript upload**
@@ -36,8 +36,11 @@ quotas:
 ## What leaves the machine
 
 Cloud recognition uploads the enhanced 16 kHz mono stream after the local
-audio front end; nothing else. Qwen-MT receives the source sentence, glossary
-terms and up to ten previous source/target pairs as translation memory.
+audio front end, and the lecture context (topic and hint terms, at most 1000
+characters) as the recognition `corpus` text; nothing else. Qwen-MT receives
+the source sentence, the glossary pairs, the lecture topic
+as `domains`, and up to ten previous source/target pairs as translation
+memory.
 
 ## Errors
 

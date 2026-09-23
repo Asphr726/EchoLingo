@@ -1,37 +1,67 @@
-# Spike 1 third-party component review
+# Third-party components
 
-Status checked on 2026-08-30. Python versions are pinned in `pyproject.toml`;
-desktop Rust versions are locked in `Cargo.lock`.
+EchoLingo builds on the open-source models, runtimes and libraries below.
+Python versions are pinned in `pyproject.toml`, Rust versions are locked in
+`Cargo.lock` and JavaScript versions in `package-lock.json`. The full license
+text of each component ships with that component.
 
-| Component | Role | License | Languages | Platforms / status |
-|---|---|---|---|---|
-| Qwen3-ASR 0.6B/1.7B | primary ASR, aligner | Apache-2.0 | 52 languages/dialects; aligner includes zh/en/ja/ko | Active in 2026; official streaming is vLLM-only and has no streaming timestamps |
-| WhisperLiveKit 0.2.24 | streaming policy and model process | Apache-2.0 | backend-dependent | Active release; macOS/Linux/Windows, backend-dependent acceleration |
-| SimulStreaming | Whisper baseline | MIT | Whisper language set | CPU possible but not realtime; large-v3 recommends a CUDA-class GPU |
-| python-sounddevice 0.5.5 | PortAudio capture | MIT | n/a | macOS/Linux/Windows |
-| pywebrtc-audio 0.1.0 | NS, AGC, auxiliary speech probability | Apache-2.0 | language-agnostic DSP | Wheels for macOS arm64/x86, Linux arm64/x86, Windows x86; Python 3.10–3.14 |
-| Silero VAD 6.2 | primary VAD | MIT | trained on 6,000+ languages | ONNX, CPU, 8/16 kHz, cross-platform |
-| ONNX Runtime 1.29.0 | VAD inference | MIT | n/a | macOS/Linux/Windows wheels |
-| python-samplerate 0.2.4 | ASR-boundary resampling | MIT wrapper / BSD libsamplerate | n/a | Current cross-platform wheels |
-| DeepFilterNet 0.5.6 | optional offline enhancement A/B | MIT/Apache-2.0 | language-agnostic DSP | Upstream active, but Python/native release is old; not a live default |
-| Google FLEURS | four-language smoke data | CC-BY-4.0 | zh/en/ja/ko and more | Fixed revision/sample IDs and attribution required |
-| OpenSLR SLR26 | simulated RIR data | Apache-2.0 | language-agnostic | 16 kHz simulated room impulse responses |
-| Hy-MT2 1.8B/7B | local translation | Apache-2.0 | includes zh/en/ja/ko | Active 2026 release; Transformers/vLLM/SGLang/GGUF routes, runtime benchmark required |
-| Alibaba Cloud Qwen3 ASR realtime | cloud ASR service | commercial service terms | includes zh/en/ja/ko | Dedicated Beijing/Singapore WebSocket endpoints; provider-managed runtime |
-| Alibaba Cloud Qwen-MT Flash/Plus | cloud translation service | commercial service terms | 92 languages | Flash supports incremental output; Plus is quality/cumulative output |
-| HTTPX 0.28 | async Qwen-MT/local service transport | BSD-3-Clause | n/a | Cross-platform Python HTTP/SSE client |
-| pypdf 6.x | local text extraction from PDF note attachments (AI notes, context import) | BSD-3-Clause | language-agnostic (text layer only; scanned PDFs yield no text) | Pure Python, cross-platform; bundled in the sidecar via `--collect-submodules pypdf`; PPTX/DOCX use the standard library (zipfile + ElementTree) |
-| keyring-rs 4.2 | secure cloud credential abstraction | MIT OR Apache-2.0 | n/a | Current native macOS Keychain, Windows Credential Manager and Linux Secret Service adapters |
-| hf-hub 1.0 | pinned model download, retry and progress | Apache-2.0 | n/a | Current async Rust client; content-addressed cache and cross-platform filesystem support; Rust 1.88+ |
-| llama.cpp / llama-server | Hy-MT2 GGUF runtime | MIT | model-dependent | Active; OpenAI-compatible local server with Apple Metal, CUDA and CPU paths |
-| PyInstaller 6.22.2 | self-contained Python sidecar packaging | GPL-2.0-or-later with distribution exception | n/a | Released 2026-08-17; Python 3.8+, native macOS/Windows/Linux builds; not a cross-compiler |
+## Models
 
-Primary sources: QwenLM/Qwen3-ASR, ufal/SimulStreaming,
-QuentinFuxa/WhisperLiveKit, spatialaudio/python-sounddevice,
-strands-labs/pywebrtc-audio, snakers4/silero-vad,
-tuxu/python-samplerate, Rikorose/DeepFilterNet, Google FLEURS, and OpenSLR.
-Cloud protocol sources: Alibaba Cloud Model Studio realtime ASR interaction
-flow and Qwen-MT API reference. Hy-MT2 source: Tencent's official model cards.
-Desktop runtime sources: the official keyring-rs, hf-hub, llama.cpp and
-PyInstaller repositories/documentation. AI notes source: the py-pdf/pypdf
-repository (BSD-3-Clause `LICENSE`).
+The models are not bundled with EchoLingo. You download them from Hugging
+Face in **Settings → Models**, except the Silero VAD file, which is packaged
+with the app.
+
+| Model | Role | License |
+|---|---|---|
+| [Qwen3-ASR 0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) | local speech recognition | Apache-2.0 |
+| [Qwen3-ForcedAligner 0.6B](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B) | word-level timestamps after class (optional) | Apache-2.0 |
+| [Hy-MT2 1.8B GGUF](https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF) (Q4_K_M) | local translation | Apache-2.0 |
+| [Silero VAD](https://github.com/snakers4/silero-vad) | speech detection (annotation only) | MIT |
+
+## Local inference service (Python)
+
+| Component | Role | License |
+|---|---|---|
+| WhisperLiveKit 0.2.24 | streaming recognition framework around Qwen3-ASR | Apache-2.0 |
+| qwen-asr | Qwen3-ASR and ForcedAligner model code | Apache-2.0 |
+| PyTorch, Transformers | model execution | BSD-style (PyTorch), Apache-2.0 (Transformers) |
+| nagisa | Japanese word segmentation for forced alignment | MIT |
+| pywebrtc-audio 0.1.0 | noise suppression and automatic gain control | Apache-2.0 |
+| ONNX Runtime 1.29.0 | Silero VAD inference | MIT |
+| python-samplerate 0.2.4 | resampling to 16 kHz | MIT (wrapper), BSD (libsamplerate) |
+| python-sounddevice 0.5.5 | audio capture for command-line sessions | MIT |
+| HTTPX, websockets | cloud provider and local service connections | BSD-3-Clause |
+| pypdf 6.x | text extraction from PDF files for AI notes and context import (PPTX and DOCX use the Python standard library) | BSD-3-Clause |
+| PyInstaller 6.22.2 | packages the inference service into a self-contained executable | GPL-2.0-or-later with the bootloader exception, which allows distributing the packaged program under its own license |
+
+An optional Whisper-based local recognizer (SimulStreaming, MIT) is available
+in source builds through the `whisper` extra; it is not part of the packaged
+app.
+
+## Translation runtime
+
+| Component | Role | License |
+|---|---|---|
+| [llama.cpp](https://github.com/ggml-org/llama.cpp) (`llama-server`) | runs the Hy-MT2 GGUF model with Apple Metal acceleration | MIT |
+
+## Desktop app
+
+| Component | Role | License |
+|---|---|---|
+| [Tauri 2](https://tauri.app) and its dialog plugin | desktop shell | MIT OR Apache-2.0 |
+| React 19 | user interface | MIT |
+| react-markdown, remark-gfm, remark-math, rehype-katex, KaTeX | rendering AI notes and formulas | MIT |
+| Phosphor Icons | icons | MIT |
+| cpal 0.17 | microphone capture (system audio uses Apple's ScreenCaptureKit) | Apache-2.0 |
+| keyring-rs 4.2 | API keys in the macOS Keychain | MIT OR Apache-2.0 |
+| hf-hub 1.0 | pinned, verified model downloads | Apache-2.0 |
+| SQLx (SQLite) | session history | MIT OR Apache-2.0 |
+
+## Cloud services
+
+Cloud recognition, cloud translation and the AI assistant are optional and
+are used only after you add your own key and allow the upload. Each service
+(Alibaba Cloud Model Studio, OpenAI, Deepgram, AssemblyAI, Gladia, DeepL,
+Google Cloud Translation, Azure AI Translator and the OpenAI-compatible chat
+providers) is governed by its own terms of service and privacy policy. See
+[cloud-setup.md](cloud-setup.md).

@@ -11,10 +11,10 @@ Cloud ASR adapter for the OpenAI Realtime API in transcription mode
 1. Create an API key at <https://platform.openai.com/api-keys>. The key's
    project must have access to the Realtime API and to the transcription model
    you select.
-2. In EchoLingo open **Settings → Models → Cloud credentials → OpenAI**, paste
-   the key and choose **Save to Keychain**. The desktop shell injects it into
+2. In EchoLingo open **Settings → Cloud providers → OpenAI**, paste the key
+   and choose **Save** (it is stored in the macOS Keychain). The desktop shell injects it into
    the sidecar as `OPENAI_API_KEY`; the adapter never persists or logs it.
-3. Choose **Test connection** (see below).
+3. Choose **Test** (see below).
 4. Enable **Settings → Privacy → Audio upload** and select *OpenAI realtime
    transcription (cloud)* as the ASR provider. Translation routes
    independently and may stay local (Hybrid).
@@ -64,7 +64,9 @@ than being refused.
   `input_audio_buffer.append` frames. Capture, enhancement, AGC, local VAD
   annotation and the replay ring stay on the machine.
 - The `session.update` message: model, language, VAD and noise-reduction
-  settings. No session context, glossary or transcript history is sent.
+  settings, plus the lecture context (topic and hint terms from the context
+  and the glossary, at most 1000 characters) as the transcription `prompt`.
+  No transcript history or translation is sent.
 - Nothing is stored by EchoLingo on OpenAI's side; audio retention on the
   provider is governed by the OpenAI API data-usage policy for the account.
 - The connection test sends no audio and no session configuration.
@@ -121,15 +123,15 @@ Error text never contains the key, the URL or raw handshake bodies. Provider
 messages that quote a (masked) `sk-…` key are redacted before they reach the
 UI or logs.
 
-## What "Test connection" does
+## What "Test" does
 
 The probe opens the authenticated WebSocket (`Authorization: Bearer`,
 `OpenAI-Beta: realtime=v1`), measures the handshake latency and closes the
 socket. It uploads no audio and sends no `session.update`; the result reports
 `model` and `host` (`api.openai.com`). A successful test is a configuration
-check, not a latency benchmark: EN/ZH/JA/KO latency and accuracy evidence for
-`docs/benchmark.md` (required for Auto-route eligibility) remains
-`PENDING_CREDENTIALS` until measured with a funded account.
+check, not a latency benchmark: EN/ZH/JA/KO latency and accuracy evidence
+(required for Auto-route eligibility) is still pending until measured with a
+funded account.
 
 ## Region notes
 

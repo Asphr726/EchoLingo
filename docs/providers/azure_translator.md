@@ -22,7 +22,7 @@ different resource and is not used.
 4. Open the resource, then **Resource Management → Keys and Endpoint**. Copy
    **KEY 1** (KEY 2 is a spare for rotation) and note the **Location/Region**
    value.
-5. In EchoLingo open **Settings → Cloud → Azure AI Translator**, paste the
+5. In EchoLingo open **Settings → Cloud providers → Azure AI Translator**, paste the
    key, type the **Resource region** exactly as the portal shows it (lower
    case, no spaces: `eastasia`) and choose **Save**. The key is stored in the
    macOS Keychain and reaches the sidecar only as the `AZURE_TRANSLATOR_KEY`
@@ -120,14 +120,13 @@ Qwen-MT when term enforcement matters.
 
 ## What "Test" does
 
-**Settings → Cloud → Azure AI Translator → Test** builds the adapter from the
+**Settings → Cloud providers → Azure AI Translator → Test** builds the adapter from the
 saved key, region and endpoint, forces transcript consent for the probe only,
 and translates the fixed sentence "Welcome to the lecture." from English to
 Chinese (`zh-Hans`). It sends nothing from the microphone or the session
 history. A success reports the model name (`translator-v3`) and the
 round-trip latency of that one request; the probe is a configuration check,
-not a latency benchmark (EN/ZH/JA/KO figures stay `PENDING CREDENTIALS` in
-`docs/benchmark.md`).
+not a latency benchmark (EN/ZH/JA/KO figures have not been measured yet).
 
 ## Errors
 
@@ -162,5 +161,5 @@ full URL.
 - Unit tests: `NUMBA_CACHE_DIR=/tmp/echolingo-numba-cache conda run -n
   echolingo-spike1 pytest -q tests/test_azure_translator_backend.py` (mock
   transport, no network) — PASS.
-- Live probe and EN/ZH/JA/KO latency/accuracy: `PENDING CREDENTIALS`; Azure
-  is not `auto_route_eligible` until `docs/benchmark.md` records them.
+- Live probe and EN/ZH/JA/KO latency/accuracy: pending credentials; Azure
+  is not `auto_route_eligible` until they have been measured.
