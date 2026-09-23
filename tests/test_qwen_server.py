@@ -299,7 +299,7 @@ async def test_context_middleware_sets_and_resets_the_session_context() -> None:
     assert qwen_server.session_asr_context() == ""
 
 
-def test_korean_keeps_the_upstream_eager_rollover() -> None:
+def test_eager_upstream_mode_still_available_for_listed_languages() -> None:
     streamer = _streamer(echolingo_eager_upstream=True, segment_punct_rollover=True)
     assert streamer.segment_punct_rollover is True
     event = _feed(streamer, "오늘은 색 공간에 대해 이야기하겠습니다.", 110)
@@ -309,8 +309,18 @@ def test_korean_keeps_the_upstream_eager_rollover() -> None:
     assert streamer.edge_marks_stripped == 0
 
 
+def test_korean_edge_periods_are_not_committed_by_default() -> None:
+    streamer = _streamer(echolingo_punct_roll_min_steps=100)
+    assert streamer.segment_punct_rollover is False
+    # The model invents a period at the window edge; the next decode revises it.
+    assert not _feed(streamer, "그래서 이 색 공간은.", 110)["segment_rollover"]
+    event = _feed(streamer, "그래서 이 색 공간은 우리가 보는 방식과", 122)
+    assert event["segment_rollover_reason"] == "punctuation"
+    assert not streamer.completed_text.endswith(".")
+
+
 def test_eager_languages_come_from_the_policy_and_environment() -> None:
     policy = qwen_server.decode_policy_from_environment({})
-    assert policy["echolingo_eager_roll_languages"] == "ko"
+    assert policy["echolingo_eager_roll_languages"] == ""
     policy = qwen_server.decode_policy_from_environment({"ECHOLINGO_QWEN_EAGER_ROLL_LANGUAGES": "KO, JA"})
     assert policy["echolingo_eager_roll_languages"] == "ko, ja"

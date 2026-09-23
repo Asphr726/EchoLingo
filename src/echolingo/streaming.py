@@ -79,10 +79,8 @@ UNSPACED_LANGUAGES = frozenset({"zh", "ja"})
 # "words" (a zh/ja segment is one word). For spaced languages it closes a
 # unit about one decode after a real sentence end instead of waiting for the
 # next segment roll; an invented window-edge period can never be promoted
-# because nothing agreed follows it. Korean is excluded: promotion raised its
-# CER (0.062 → 0.091 mean over 4/3 runs, docs/benchmark.md) and its
-# word-level upstream commits already close sentences.
-CHARACTER_HOLD_BACK = {"zh": 8, "ja": 8, "en": 12}
+# because nothing agreed follows it.
+CHARACTER_HOLD_BACK = {"zh": 8, "ja": 8, "en": 12, "ko": 8}
 
 SENTENCE_END_CHARS = frozenset(".?!。？！…")
 CLAUSE_END_CHARS = frozenset(",;:，；：、")

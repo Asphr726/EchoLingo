@@ -52,12 +52,12 @@ DECODE_POLICY_DEFAULTS: dict[str, Any] = {
     "echolingo_pause_roll_min_steps": 50,
     "echolingo_pause_roll_steps": 10,
     "echolingo_strip_edge_punct": True,
-    # Languages that keep the upstream eager punctuation rollover: Korean
-    # sentence-final endings (-습니다., -요.) make the model's edge periods
-    # reliable, and a roll one decode later starts the next segment inside a
-    # word (KO CER 0.062 -> 0.076 over 4/6 runs), while English suffers from
-    # invented edge periods (docs/benchmark.md).
-    "echolingo_eager_roll_languages": "ko",
+    # Languages that keep the upstream eager punctuation rollover (commits the
+    # model's window-edge period verbatim). Empty by default: every language,
+    # Korean included, gets the delayed/pause-confirmed rolls so invented
+    # periods never split a sentence. A comma-separated list (e.g. "ko")
+    # restores the old behaviour for A/B runs.
+    "echolingo_eager_roll_languages": "",
 }
 
 _ENVIRONMENT_KEYS = {
@@ -323,7 +323,7 @@ def install_streaming_policy(
         echolingo_pause_roll_min_steps = 50
         echolingo_pause_roll_steps = 10
         echolingo_strip_edge_punct = True
-        echolingo_eager_roll_languages = "ko"
+        echolingo_eager_roll_languages = ""
         _echolingo_streamer_class: type | None = None
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
