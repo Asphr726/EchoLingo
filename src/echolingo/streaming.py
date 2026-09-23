@@ -72,10 +72,15 @@ def longest_common_prefix_length(left: str, right: str) -> int:
 # these languages is joined without a separator and committed by characters.
 UNSPACED_LANGUAGES = frozenset({"zh", "ja"})
 
-# Character-level local agreement for scripts the upstream streamer cannot
-# commit word by word (it splits on whitespace, so a zh/ja segment is one
-# "word"). Korean is space-delimited, so upstream word commits already work.
-CHARACTER_HOLD_BACK = {"zh": 8, "ja": 8}
+# Character-level local agreement on the recognizer's unstable buffer: a
+# complete sentence that two consecutive hypotheses agree on, followed by at
+# least this many agreed characters, is promoted to committed text at once.
+# zh/ja need it because the upstream streamer commits whole whitespace
+# "words" (a zh/ja segment is one word). For spaced languages it closes a
+# unit about one decode after a real sentence end instead of waiting for the
+# next segment roll; an invented window-edge period can never be promoted
+# because nothing agreed follows it.
+CHARACTER_HOLD_BACK = {"zh": 8, "ja": 8, "en": 12, "ko": 8}
 
 SENTENCE_END_CHARS = frozenset(".?!。？！…")
 CLAUSE_END_CHARS = frozenset(",;:，；：、")
@@ -579,7 +584,7 @@ class WlkEventMapper:
         # Only whole sentences are promoted: a finished sentence inside the
         # agreed prefix is far less likely to be rewritten than a clause the
         # recognizer is still shaping, and units close on the same marks.
-        candidate = self._last_sentence_end(buffer, candidate)
+        candidate = self._last_sentence_end(buffer, candidate, self.language, self.segmenter)
         if candidate <= len(self._buffer_promoted):
             return []
         promoted = buffer[len(self._buffer_promoted):candidate]
@@ -593,13 +598,31 @@ class WlkEventMapper:
         return self._close_units(units, now, audio_cursor_ms)
 
     @staticmethod
-    def _last_sentence_end(text: str, limit: int) -> int:
+    def _last_sentence_end(
+        text: str,
+        limit: int,
+        language: str = "zh",
+        segmenter: "SentenceUnitSegmenter | None" = None,
+    ) -> int:
+        spaced = language not in UNSPACED_LANGUAGES
         for index in range(min(limit, len(text)) - 1, -1, -1):
-            if text[index] in SENTENCE_END_CHARS:
-                end = index + 1
-                while end < len(text) and end < limit and text[end] in _CLOSING_CHARS:
-                    end += 1
-                return end
+            if text[index] not in SENTENCE_END_CHARS:
+                continue
+            end = index + 1
+            while end < len(text) and end < limit and text[end] in _CLOSING_CHARS:
+                end += 1
+            if spaced:
+                # A spaced-language sentence end must be followed by a space
+                # ("3.5" and "e.g." are not ends) and must not be an
+                # abbreviation or a period after a function word.
+                if end >= len(text) or not text[end].isspace():
+                    continue
+                if text[index] == "." and segmenter is not None and (
+                    segmenter._looks_like_abbreviation(text, index)
+                    or segmenter._dangling_before(text, index)
+                ):
+                    continue
+            return end
         return 0
 
     def _reconcile_promoted(self, delta: str) -> str:

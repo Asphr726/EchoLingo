@@ -345,3 +345,34 @@ def test_segmenter_ignores_and_cleans_interior_periods_after_function_words() ->
     assert [unit.text for unit in units] == [
         "It might look like the Very small difference when you look at it closely."
     ]
+
+
+def test_wlk_mapper_promotes_an_agreed_english_sentence_without_waiting_for_a_commit() -> None:
+    mapper = WlkEventMapper("session", "en", "qwen", "streaming")
+
+    def message(buffer: str) -> dict:
+        return {"lines": [], "buffer_transcription": buffer}
+
+    # An edge period with nothing agreed after it is never promoted.
+    assert not [e for e in mapper.map_message(message("So he was puzzling about what makes some."), 4000) if e.kind == TranscriptKind.STABLE]
+    assert not [e for e in mapper.map_message(message("So he was puzzling about what makes some textures pop"), 5000) if e.kind == TranscriptKind.STABLE]
+    # Two consecutive hypotheses agree on a full sentence plus following text.
+    mapper.map_message(message("So he was puzzling about what makes some textures pop out. Okay so let's"), 6000)
+    events = mapper.map_message(message("So he was puzzling about what makes some textures pop out. Okay so let's do"), 7000)
+    stable = [e.text for e in events if e.kind == TranscriptKind.STABLE]
+    assert stable == ["So he was puzzling about what makes some textures pop out."]
+    # The later upstream commit of the same words is not duplicated.
+    events = mapper.map_message(
+        {"lines": [{"text": "So he was puzzling about what makes some textures pop out. Okay", "start": 0, "end": 7}], "buffer_transcription": "so let's do another"},
+        8000,
+    )
+    assert [e.text for e in events if e.kind == TranscriptKind.STABLE] == []
+    assert mapper.segmenter.open_text == "Okay"
+
+
+def test_wlk_mapper_does_not_promote_abbreviations_or_function_word_periods() -> None:
+    mapper = WlkEventMapper("session", "en", "qwen", "streaming")
+    buffer = "We use a Gaussian, e.g. the one on the slide, and the. Next we filter it"
+    mapper.map_message({"lines": [], "buffer_transcription": buffer}, 3000)
+    events = mapper.map_message({"lines": [], "buffer_transcription": buffer + " again"}, 4000)
+    assert [e.text for e in events if e.kind == TranscriptKind.STABLE] == []
