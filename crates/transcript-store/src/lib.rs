@@ -3,7 +3,7 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{FromRow, SqlitePool};
+use sqlx::{Connection, FromRow, SqliteConnection, SqlitePool};
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
@@ -11,6 +11,19 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub const SCHEMA_VERSION: u32 = 2;
+
+/// Earlier SHA-384 checksums of migrations whose SQL is unchanged apart from
+/// comments. sqlx refuses to open a database whose recorded checksum differs
+/// from the embedded migration, so a database migrated by such a build has
+/// its record updated before migrating. Never edit an applied migration;
+/// `migration_checksums_are_pinned` fails when one changes.
+const EQUIVALENT_MIGRATION_CHECKSUMS: &[(i64, &str)] = &[
+    // 0002 before a comment-only edit of its header line.
+    (
+        2,
+        "7446a9d26e15eb75ce6267630f90fff76a870f2968e9d7aac2ac9c7727957b99394722e31a38dadefd6028add30cebea",
+    ),
+];
 
 /// Where a session title came from (`sessions.title_source`).
 pub const TITLE_SOURCE_DEFAULT: &str = "default";
@@ -210,6 +223,44 @@ pub enum ExportFormat {
     Notes,
 }
 
+/// Rewrites recorded checksums listed in `EQUIVALENT_MIGRATION_CHECKSUMS` to
+/// the embedded ones. A fresh database has no `_sqlx_migrations` table yet.
+/// Runs on its own connection, closed before migrating: a pooled connection
+/// that read the old schema could keep that snapshot after the migration.
+async fn reconcile_migration_checksums(
+    connection: &mut SqliteConnection,
+    migrator: &sqlx::migrate::Migrator,
+) -> Result<(), sqlx::Error> {
+    let recorded: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_all(&mut *connection)
+    .await?;
+    if recorded.is_empty() {
+        return Ok(());
+    }
+    for (version, legacy) in EQUIVALENT_MIGRATION_CHECKSUMS {
+        let Some(migration) = migrator.iter().find(|migration| migration.version == *version)
+        else {
+            continue;
+        };
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = ? AND checksum = ?")
+            .bind(migration.checksum.as_ref())
+            .bind(version)
+            .bind(decode_hex(legacy))
+            .execute(&mut *connection)
+            .await?;
+    }
+    Ok(())
+}
+
+fn decode_hex(text: &str) -> Vec<u8> {
+    (0..text.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&text[index..index + 2], 16).expect("valid hex"))
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct TranscriptStore {
     pool: SqlitePool,
@@ -227,11 +278,15 @@ impl TranscriptStore {
             .foreign_keys(true)
             .journal_mode(SqliteJournalMode::Wal)
             .busy_timeout(Duration::from_secs(5));
+        let migrator = sqlx::migrate!();
+        let mut connection = SqliteConnection::connect_with(&options).await?;
+        reconcile_migration_checksums(&mut connection, &migrator).await?;
+        connection.close().await?;
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
             .connect_with(options)
             .await?;
-        sqlx::migrate!().run(&pool).await?;
+        migrator.run(&pool).await?;
         Ok(Self { pool })
     }
 
@@ -843,6 +898,79 @@ mod tests {
             reopened.session(default_id).await.unwrap().title_source,
             TITLE_SOURCE_AI
         );
+    }
+
+    fn encode_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn migration_checksums_are_pinned() {
+        // Shipped databases record these; changing an applied migration, even a
+        // comment, stops EchoLingo from opening history. Add a new migration.
+        let pinned = [
+            (1, "b6fc78047afd1f65d08094abc1ccaec2f7e12f31fa602e1f70562d668a3dc9c82fc55b3b6928e9833774531887de89f1"),
+            (2, "3c98e2e3ffd5d4191c9a4b785ee232fe3c97ed11965ce8336d6c274ae2571fd6ce1f77aab8f7ea8cee88d4a77dd97ad1"),
+        ];
+        let migrator = sqlx::migrate!();
+        let actual: Vec<(i64, String)> = migrator
+            .iter()
+            .map(|migration| (migration.version, encode_hex(&migration.checksum)))
+            .collect();
+        let expected: Vec<(i64, String)> = pinned
+            .iter()
+            .map(|(version, checksum)| (*version, checksum.to_string()))
+            .collect();
+        assert_eq!(actual, expected);
+        assert_eq!(migrator.iter().count(), SCHEMA_VERSION as usize);
+    }
+
+    #[tokio::test]
+    async fn opens_a_database_recorded_with_an_equivalent_checksum() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.sqlite");
+        let draft = session_draft(Uuid::new_v4());
+        {
+            let store = TranscriptStore::open(&path).await.unwrap();
+            store.create_session(&draft).await.unwrap();
+            // As recorded by a build that shipped 0002 before its comment edit.
+            sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 2")
+                .bind(decode_hex(EQUIVALENT_MIGRATION_CHECKSUMS[0].1))
+                .execute(&store.pool)
+                .await
+                .unwrap();
+            store.pool.close().await;
+        }
+
+        let store = TranscriptStore::open(&path).await.unwrap();
+        assert!(store.session(draft.id).await.is_ok());
+        let recorded: Vec<u8> =
+            sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 2")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        let current = sqlx::migrate!();
+        let current = current.iter().find(|migration| migration.version == 2).unwrap();
+        assert_eq!(recorded, current.checksum.as_ref());
+    }
+
+    #[tokio::test]
+    async fn still_refuses_an_unknown_migration_checksum() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.sqlite");
+        {
+            let store = TranscriptStore::open(&path).await.unwrap();
+            sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 2")
+                .bind(vec![0_u8; 48])
+                .execute(&store.pool)
+                .await
+                .unwrap();
+            store.pool.close().await;
+        }
+        assert!(matches!(
+            TranscriptStore::open(&path).await,
+            Err(StoreError::Migration(_))
+        ));
     }
 
     #[tokio::test]
