@@ -446,6 +446,12 @@ class CloudStreamingAsrBase:
             )
             return
         self._note_delivery()
+        if self._segmenter is not None:
+            # A period held back after a function word closes once the audio
+            # has moved on without more text (see SentenceUnitSegmenter).
+            await self._emit_units(
+                self._segmenter.expire(self.ring.latest_end_ms), delta.provider_event_id
+            )
         if kind == "text":
             if delta.confirmed is not None and (
                 delta.chunk_id is not None or delta.confirmed != self._provider_confirmed
@@ -543,6 +549,7 @@ class CloudStreamingAsrBase:
             )
             event.start_ms = unit.start_ms
             event.end_ms = unit.end_ms
+            event.closure_reason = unit.reason
             # The desktop shell reads commit latency from STABLE rows.
             event.commit_latency_ms = self._latency_since_audio(
                 unit.end_ms, event.emitted_at_monotonic_ns

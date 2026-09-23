@@ -292,3 +292,56 @@ def test_wlk_mapper_never_commits_wrong_script_hallucination() -> None:
     flushed = mapper.flush_events(6_000)
     assert [event.text for event in flushed if event.kind == TranscriptKind.STABLE] == ["今年は戦後八十年です。"]
     assert "Human" not in flushed[-1].text
+
+
+def test_segmenter_holds_a_period_after_a_function_word_until_more_text() -> None:
+    segmenter = SentenceUnitSegmenter("en")
+    assert segmenter.append("Okay, so we take these spot detectors and let's just.", start_ms=0, end_ms=4000) == []
+    # More speech arrived: the period was a window-edge artefact.
+    units = segmenter.append(" Line them up in one line to build a bar detector.", start_ms=4000, end_ms=8000)
+    assert [unit.text for unit in units] == [
+        "Okay, so we take these spot detectors and let's just Line them up in one line to build a bar detector."
+    ]
+    assert units[0].reason == "sentence"
+    assert segmenter.deferred_edges_merged == 1
+
+
+def test_segmenter_closes_a_held_period_when_the_audio_moves_on() -> None:
+    segmenter = SentenceUnitSegmenter("en")
+    assert segmenter.append("Let me show you one of the.", start_ms=0, end_ms=3000) == []
+    # Commits lag the audio: expiry counts from when the period was held.
+    assert segmenter.expire(9000) == []
+    assert segmenter.expire(11000) == []
+    units = segmenter.expire(12100)
+    assert [(unit.text, unit.reason) for unit in units] == [("Let me show you one of the.", "sentence")]
+    assert segmenter.open_text == ""
+
+
+def test_segmenter_keeps_ordinary_sentence_ends_and_reports_reasons() -> None:
+    segmenter = SentenceUnitSegmenter("en")
+    units = segmenter.append("Thank you for coming to the lecture today.", start_ms=0, end_ms=2000)
+    assert [(unit.text, unit.reason) for unit in units] == [("Thank you for coming to the lecture today.", "sentence")]
+    # "that" and "it" legitimately end sentences: no deferral.
+    assert segmenter.append("I really believe that.", start_ms=2000, end_ms=3000)[0].reason == "sentence"
+    flushed = SentenceUnitSegmenter("en")
+    flushed.append("a trailing clause without an end", start_ms=0, end_ms=1000)
+    assert flushed.flush().reason == "flush"
+    capped = SentenceUnitSegmenter("en")
+    unit = capped.append("word " * 40, start_ms=0, end_ms=20_000)[0]
+    assert unit.reason == "cap"
+    # Unspaced languages never defer.
+    zh = SentenceUnitSegmenter("zh")
+    text = "我们今天来看一下纹理感知的实验的。"
+    assert zh.append(text, start_ms=0, end_ms=1000)[0].text == text
+
+
+def test_segmenter_ignores_and_cleans_interior_periods_after_function_words() -> None:
+    segmenter = SentenceUnitSegmenter("en")
+    units = segmenter.append(
+        "It might look like the. Very small difference when you look at it closely.",
+        start_ms=0,
+        end_ms=4000,
+    )
+    assert [unit.text for unit in units] == [
+        "It might look like the Very small difference when you look at it closely."
+    ]

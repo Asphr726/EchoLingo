@@ -84,6 +84,25 @@ _NO_SPACE_BEFORE = SENTENCE_END_CHARS | CLAUSE_END_CHARS | _CLOSING_CHARS
 _ABBREVIATIONS = frozenset(
     {"mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc", "e.g", "i.e", "no", "fig", "eq"}
 )
+# A period right after one of these words almost never ends an English
+# sentence ("…what makes some." / "…as fast as you."); it is usually a
+# recognizer's window-edge artefact. Words that legitimately end sentences
+# ("you", "it", "that", "this", "some") are deliberately absent.
+DANGLING_WORDS = frozenset(
+    {
+        "the", "a", "an", "of", "to", "in", "on", "at", "for", "with", "from", "by",
+        "into", "onto", "about", "via", "per", "than", "and", "or", "but", "nor",
+        "because", "although", "though", "whereas", "unless", "if", "my", "your",
+        "his", "her", "its", "our", "their", "let's", "just", "very", "such", "whose",
+    }
+)
+DEFERRED_EDGE_EXPIRY_MS = 3_000.0
+# "…like a. Very small…": a period inside a unit right after a function word
+# is a recognizer artefact; drop it when the unit closes.
+_DANGLING_PERIOD_RE = re.compile(
+    r"\b(" + "|".join(sorted((re.escape(word) for word in DANGLING_WORDS), key=len, reverse=True)) + r")\.(\s+\S)",
+    re.IGNORECASE,
+)
 
 
 _SYMBOL_RUN_RE = re.compile(r"(?:([^\w\s])\s*)(?:\1\s*){2,}")
@@ -145,6 +164,8 @@ class TranscriptUnit:
     text: str
     start_ms: float | None
     end_ms: float | None
+    # sentence | clause | cap | flush
+    reason: str = "sentence"
 
 
 @dataclass(slots=True)
@@ -180,6 +201,13 @@ class SentenceUnitSegmenter:
         self.language = language
         self.rules = rules or UnitClosureRules()
         self._chunks: list[_Chunk] = []
+        # Index of the chunk whose trailing period is held back as a likely
+        # window-edge artefact (see DANGLING_WORDS), or None.
+        self._deferred_chunk: int | None = None
+        # Audio cursor when the held-back period was first seen by expire();
+        # commits lag the audio, so expiry is measured from here.
+        self._deferred_since_ms: float | None = None
+        self.deferred_edges_merged = 0
 
     @property
     def open_text(self) -> str:
@@ -204,6 +232,10 @@ class SentenceUnitSegmenter:
     ) -> list[TranscriptUnit]:
         if not delta.strip():
             return []
+        if self._deferred_chunk is not None:
+            # More speech followed the held-back period without a pause:
+            # it was an artefact, so the sentence continues.
+            self._drop_deferred_period()
         if not self._chunks:
             delta = delta.lstrip()
         elif not delta[0].isspace() and self.language not in UNSPACED_LANGUAGES:
@@ -211,37 +243,70 @@ class SentenceUnitSegmenter:
             if previous and not previous[-1].isspace() and delta[0] not in _NO_SPACE_BEFORE:
                 delta = " " + delta
         self._chunks.append(_Chunk(delta, start_ms, end_ms))
+        return self._close_ready()
+
+    def _close_ready(self) -> list[TranscriptUnit]:
         units: list[TranscriptUnit] = []
         while True:
             text = self.open_text
-            split = self._closure_index(text)
-            if split is None:
+            closure = self._closure_index(text)
+            if closure is None:
                 break
-            units.append(self._close(split))
+            split, reason = closure
+            units.append(self._close(split, reason))
         return units
 
     def flush(self) -> TranscriptUnit | None:
+        self._deferred_chunk = None
         text = self.open_text
         if not text:
             self._chunks = []
             return None
-        return self._close(len(text))
+        return self._close(len(text), "flush")
 
-    def _closure_index(self, text: str) -> int | None:
+    def expire(self, audio_cursor_ms: float | None) -> list[TranscriptUnit]:
+        """Close a held-back sentence once the audio moved on without more text."""
+        if self._deferred_chunk is None or audio_cursor_ms is None:
+            return []
+        if self._deferred_since_ms is None:
+            self._deferred_since_ms = audio_cursor_ms
+            return []
+        if audio_cursor_ms - self._deferred_since_ms < DEFERRED_EDGE_EXPIRY_MS:
+            return []
+        self._deferred_chunk = None
+        self._deferred_since_ms = None
+        text = self.open_text
+        return [self._close(len(text), "sentence")] if text else []
+
+    def _drop_deferred_period(self) -> None:
+        index = self._deferred_chunk
+        self._deferred_chunk = None
+        self._deferred_since_ms = None
+        if index is None or index >= len(self._chunks):
+            return
+        chunk = self._chunks[index]
+        body = chunk.text.rstrip()
+        if body.endswith("."):
+            trailing = chunk.text[len(body):]
+            self._chunks[index] = _Chunk(body[:-1] + trailing, chunk.start_ms, chunk.end_ms)
+            self.deferred_edges_merged += 1
+
+    def _closure_index(self, text: str) -> tuple[int, str] | None:
         rules = self.rules
         boundary = self._sentence_boundary(text, rules.sentence_min_chars)
         if boundary is not None:
-            return boundary
+            return boundary, "sentence"
         duration_ms = self._open_duration_ms()
         over_length = len(text) >= rules.max_chars
         over_time = duration_ms is not None and duration_ms >= rules.max_duration_ms
         if len(text) >= rules.clause_min_chars:
             clause = self._clause_boundary(text, rules.clause_min_chars)
             if clause is not None and clause == len(text):
-                return clause
+                return clause, "clause"
         if over_length or over_time:
+            self._deferred_chunk = None
             clause = self._clause_boundary(text, rules.cap_clause_min_chars)
-            return clause if clause is not None else len(text)
+            return (clause, "cap") if clause is not None else (len(text), "cap")
         return None
 
     def _open_duration_ms(self) -> float | None:
@@ -264,8 +329,26 @@ class SentenceUnitSegmenter:
                 continue
             if char == "." and self._looks_like_abbreviation(text, index):
                 continue
+            if char == "." and self._dangling_before(text, index):
+                if end == len(text):
+                    # Hold the unit open: the next delta decides (see append).
+                    if self._deferred_chunk != len(self._chunks) - 1:
+                        self._deferred_since_ms = None
+                    self._deferred_chunk = len(self._chunks) - 1
+                    return None
+                # A committed "…of the. Next" never ends a sentence.
+                continue
             return end
         return None
+
+    def _dangling_before(self, text: str, dot_index: int) -> bool:
+        if self.language in UNSPACED_LANGUAGES:
+            return False
+        words = text[:dot_index].split()
+        if not words:
+            return False
+        word = words[-1].lower().strip("\"'([“‘")
+        return word in DANGLING_WORDS
 
     @staticmethod
     def _looks_like_abbreviation(text: str, dot_index: int) -> bool:
@@ -287,7 +370,9 @@ class SentenceUnitSegmenter:
                 best = index + 1
         return best
 
-    def _close(self, split: int) -> TranscriptUnit:
+    def _close(self, split: int, reason: str = "sentence") -> TranscriptUnit:
+        self._deferred_chunk = None
+        self._deferred_since_ms = None
         raw = self._raw_text()
         leading = len(raw) - len(raw.lstrip())
         raw_split = split + leading
@@ -297,7 +382,9 @@ class SentenceUnitSegmenter:
         remainder_start = end_ms if end_ms is not None else start_ms
         last_end = self._chunks[-1].end_ms if self._chunks else None
         self._chunks = [_Chunk(tail, remainder_start, last_end)] if tail else []
-        return TranscriptUnit(head, start_ms, end_ms)
+        if self.language not in UNSPACED_LANGUAGES:
+            head = _DANGLING_PERIOD_RE.sub(r"\1\2", head)
+        return TranscriptUnit(head, start_ms, end_ms, reason)
 
     def _time_at(self, index: int, total: int) -> float | None:
         if index >= total:
@@ -431,6 +518,7 @@ class WlkEventMapper:
                 )
                 events.extend(self._close_units(units, now, audio_cursor_ms))
 
+        events.extend(self._close_units(self.segmenter.expire(audio_cursor_ms), now, audio_cursor_ms))
         buffer = str(message.get("buffer_transcription") or "").strip()
         if buffer != self._buffer:
             self._buffer = buffer
@@ -546,6 +634,7 @@ class WlkEventMapper:
             event.start_ms = unit.start_ms if unit.start_ms is not None else self._last_unit_end_ms
             event.end_ms = unit.end_ms
             event.timestamp_quality = TimestampQuality.INTERPOLATED
+            event.closure_reason = unit.reason
             if event.end_ms is not None and self._audio_origin_ns is not None:
                 audio_end_ns = self._audio_origin_ns + int(event.end_ms * 1_000_000)
                 event.commit_latency_ms = max(0.0, (now - audio_end_ns) / 1_000_000.0)

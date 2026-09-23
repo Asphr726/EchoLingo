@@ -5,13 +5,22 @@ development (Conda) and packaged (PyInstaller) layouts so the two never drift.
 WhisperLiveKit exposes chunking, hold-back and context sizes on its CLI, but the
 windowed backend's repetition guard and punctuation-based segment rollover are
 fixed at construction time. Both matter for lectures: the 0.6B model can lock
-into "it's like, it's like, ..." loops on noisy far-field audio, and rolling
-segments at sentence boundaries instead of a hard 15 s cap produces commits
-that line up with sentences.
+into "it's like, it's like, ..." loops on noisy far-field audio.
+
+Segment rollover (docs/adr/0006): the upstream "punctuation rollover" rolled
+whenever the latest hypothesis ended in ``.!?``, but the model invents such a
+mark at almost every decode-window edge, so sentences were committed in
+fragments. ``EchoLingoSegmentedStreamer`` rolls only on a pause-confirmed
+sentence end, strips the invented edge mark on forced (step-cap) rolls, and
+releases rolled text in the same decode step. A per-connection lecture context
+(``X-EchoLingo-Asr-Context`` header) is added to the Qwen3-ASR system prompt to
+bias names and terms.
 """
 
 from __future__ import annotations
 
+import contextvars
+import dataclasses
 import logging
 import os
 import sys
@@ -23,11 +32,25 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+from .qwen_segment_policy import (
+    ASR_CONTEXT_HEADER,
+    PauseRollTracker,
+    decode_asr_context,
+    strip_edge_punct,
+)
+
 DECODE_POLICY_DEFAULTS: dict[str, Any] = {
     "repetition_penalty": 1.1,
     "no_repeat_ngram_size": 0,
-    "segment_punct_rollover": True,
+    # Upstream eager rollover on any trailing ".!?" (window-edge marks are
+    # invented) stays off; EchoLingo's pause-confirmed rollover replaces it.
+    "segment_punct_rollover": False,
     "segment_punct_min_steps": 100,
+    "echolingo_pause_roll": True,
+    "echolingo_confirmed_roll": True,
+    "echolingo_pause_roll_min_steps": 50,
+    "echolingo_pause_roll_steps": 10,
+    "echolingo_strip_edge_punct": True,
 }
 
 _ENVIRONMENT_KEYS = {
@@ -35,7 +58,53 @@ _ENVIRONMENT_KEYS = {
     "no_repeat_ngram_size": ("ECHOLINGO_QWEN_NO_REPEAT_NGRAM_SIZE", int, 0, 8),
     "segment_punct_rollover": ("ECHOLINGO_QWEN_SEGMENT_PUNCT_ROLLOVER", bool, None, None),
     "segment_punct_min_steps": ("ECHOLINGO_QWEN_SEGMENT_PUNCT_MIN_STEPS", int, 20, 400),
+    "echolingo_pause_roll": ("ECHOLINGO_QWEN_PAUSE_ROLL", bool, None, None),
+    "echolingo_confirmed_roll": ("ECHOLINGO_QWEN_CONFIRMED_ROLL", bool, None, None),
+    "echolingo_pause_roll_min_steps": ("ECHOLINGO_QWEN_PAUSE_ROLL_MIN_STEPS", int, 10, 400),
+    "echolingo_pause_roll_steps": ("ECHOLINGO_QWEN_PAUSE_ROLL_STEPS", int, 3, 60),
+    "echolingo_strip_edge_punct": ("ECHOLINGO_QWEN_STRIP_EDGE_PUNCT", bool, None, None),
 }
+
+# Lecture context of the WebSocket session being set up; the online processor
+# builds its streamer synchronously inside the endpoint (and reset paths run in
+# tasks/threads that copy this context), so a ContextVar reaches it.
+_SESSION_ASR_CONTEXT: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "echolingo_asr_context", default=""
+)
+
+
+class AsrContextMiddleware:
+    """Pure ASGI middleware: decode the per-session lecture context header."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "websocket":
+            await self.app(scope, receive, send)
+            return
+        context = ""
+        header = ASR_CONTEXT_HEADER.encode("latin-1")
+        for name, value in scope.get("headers") or ():
+            if name.lower() == header:
+                context = decode_asr_context(value.decode("latin-1"))
+                break
+        if context:
+            logger.info("session ASR context: %d chars", len(context))
+        token = _SESSION_ASR_CONTEXT.set(context)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _SESSION_ASR_CONTEXT.reset(token)
+
+
+def session_asr_context() -> str:
+    return _SESSION_ASR_CONTEXT.get()
+
+
+def _merge_context(base: str | None, session: str | None) -> str:
+    parts = [part.strip() for part in (base, session) if part and part.strip()]
+    return "\n\n".join(parts)
 
 WARMUP_ENVIRONMENT_KEY = "ECHOLINGO_QWEN_WARMUP_SECONDS"
 
@@ -114,6 +183,102 @@ def warmup_streaming_session(asr: Any, seconds: float) -> bool:
     return True
 
 
+def make_segmented_streamer_class(base: type) -> type:
+    """Subclass the upstream segmented streamer with EchoLingo's roll policy."""
+
+    @dataclasses.dataclass
+    class EchoLingoSegmentedStreamer(base):  # type: ignore[misc,valid-type]
+        echolingo_pause_roll: bool = True
+        echolingo_confirmed_roll: bool = True
+        echolingo_pause_roll_min_steps: int = 50
+        echolingo_pause_roll_steps: int = 10
+        echolingo_strip_edge_punct: bool = True
+        rolls_by_reason: dict = dataclasses.field(default_factory=dict)
+        edge_marks_stripped: int = 0
+        _pause_tracker: Any = dataclasses.field(default=None, repr=False)
+        _pause_confirmed_roll: bool = dataclasses.field(default=False, repr=False)
+
+        def __post_init__(self) -> None:
+            super().__post_init__()
+            # The eager upstream rule rolls on invented window-edge marks.
+            self.segment_punct_rollover = False
+            self._pause_tracker = PauseRollTracker(
+                min_steps=self.echolingo_pause_roll_min_steps,
+                pause_steps=self.echolingo_pause_roll_steps,
+                confirmed_rolls=self.echolingo_confirmed_roll,
+            )
+
+        def update_from_hypothesis(self, hypothesis_tokens: Any, **kwargs: Any) -> dict[str, Any]:
+            event = super().update_from_hypothesis(hypothesis_tokens, **kwargs)
+            if event.get("segment_rollover"):
+                # A step-cap roll happened inside the upstream update.
+                reason = str(event.get("segment_rollover_reason") or "cap")
+                self._note_roll(reason)
+                self._pause_tracker.reset()
+                self._release_rolled_text(event)
+                return event
+            if not self.echolingo_pause_roll or kwargs.get("is_flush"):
+                return event
+            reason = self._pause_tracker.observe(
+                str(event.get("segment_hypothesis") or ""),
+                new_steps=int(kwargs.get("new_cached_steps") or 0),
+                cached_steps=int(kwargs.get("cached_steps") or 0),
+            )
+            if reason is None:
+                return event
+            # A pause-confirmed end keeps its mark; after a confirmed interior
+            # boundary the hypothesis tail may end in a new edge mark (strip).
+            self._pause_confirmed_roll = reason == "pause"
+            try:
+                segment_final = self.roll_segment()
+            finally:
+                self._pause_confirmed_roll = False
+            self._pause_tracker.reset()
+            self._note_roll(reason)
+            event.update(
+                {
+                    "segment_rollover": True,
+                    "segment_rollover_reason": reason,
+                    "segment_final_text": segment_final.final_text,
+                    "segments_finalized": int(self.segments_finalized),
+                    "dropped_cached_steps_total": int(self.dropped_cached_steps_total),
+                    "completed_text_after_roll": self.completed_text,
+                    "active_cached_steps_after_roll": self._active_cached_steps(),
+                }
+            )
+            self._release_rolled_text(event)
+            return event
+
+        def roll_segment(self) -> Any:
+            before = self.completed_text
+            final = super().roll_segment()
+            if self.echolingo_strip_edge_punct and not self._pause_confirmed_roll:
+                stripped = strip_edge_punct(final.final_text)
+                if stripped != final.final_text.rstrip():
+                    self.edge_marks_stripped += 1
+                    self.completed_text = _join_segments(before, stripped)
+                    final = dataclasses.replace(final, final_text=stripped)
+            return final
+
+        def _release_rolled_text(self, event: dict[str, Any]) -> None:
+            # The upstream event carries pre-roll committed text, so rolled
+            # words would only surface one decode (~1 s) later.
+            event["committed"] = self.completed_text
+            event["unstable"] = ""
+
+        def _note_roll(self, reason: str) -> None:
+            self.rolls_by_reason[reason] = self.rolls_by_reason.get(reason, 0) + 1
+            logger.debug("segment rollover: %s (%s)", reason, self.rolls_by_reason)
+
+    EchoLingoSegmentedStreamer.__name__ = "EchoLingoSegmentedStreamer"
+    return EchoLingoSegmentedStreamer
+
+
+def _join_segments(*segments: str) -> str:
+    kept = [segment.strip() for segment in segments if segment and segment.strip()]
+    return " ".join(kept).strip()
+
+
 def install_streaming_policy(
     policy: Mapping[str, Any],
     *,
@@ -125,10 +290,52 @@ def install_streaming_policy(
     base = streaming.Qwen3StreamingASR
 
     class EchoLingoQwen3StreamingASR(base):  # type: ignore[misc,valid-type]
+        # Declared here so ``apply_decode_policy`` (hasattr-based) accepts them.
+        echolingo_pause_roll = True
+        echolingo_confirmed_roll = True
+        echolingo_pause_roll_min_steps = 50
+        echolingo_pause_roll_steps = 10
+        echolingo_strip_edge_punct = True
+        _echolingo_streamer_class: type | None = None
+
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
             apply_decode_policy(self, policy)
             warmup_streaming_session(self, warmup_seconds)
+
+        def build_streamer(self, whisper_language: str | None = None) -> Any:
+            upstream = super().build_streamer(whisper_language)
+            cls = type(self)._echolingo_streamer_class
+            if cls is None:
+                cls = make_segmented_streamer_class(type(upstream))
+                type(self)._echolingo_streamer_class = cls
+            values = {
+                field.name: getattr(upstream, field.name)
+                for field in dataclasses.fields(upstream)
+                if field.init
+            }
+            context = _merge_context(getattr(self, "base_context", ""), session_asr_context())
+            if context != (getattr(self, "base_context", "") or ""):
+                from qwen3_asr_causal.streamer import qwen_asr_prompt_text
+
+                prompt = self.qwen_tokenizer.encode(
+                    qwen_asr_prompt_text(
+                        context=context, language=self.qwen_language(whisper_language)
+                    ),
+                    add_special_tokens=False,
+                )
+                values["config"] = dataclasses.replace(
+                    upstream.config, prompt_prefix_template=prompt
+                )
+                values["segment_prompt_base_context"] = context
+            values.update(
+                echolingo_pause_roll=bool(self.echolingo_pause_roll),
+                echolingo_confirmed_roll=bool(self.echolingo_confirmed_roll),
+                echolingo_pause_roll_min_steps=int(self.echolingo_pause_roll_min_steps),
+                echolingo_pause_roll_steps=int(self.echolingo_pause_roll_steps),
+                echolingo_strip_edge_punct=bool(self.echolingo_strip_edge_punct),
+            )
+            return cls(**values)
 
     EchoLingoQwen3StreamingASR.__name__ = base.__name__
     EchoLingoQwen3StreamingASR.__qualname__ = base.__qualname__
@@ -156,9 +363,12 @@ def main(argv: list[str] | None = None) -> int:
     install_streaming_policy(
         decode_policy_from_environment(), warmup_seconds=warmup_seconds
     )
-    from whisperlivekit.basic_server import main as server_main
+    from whisperlivekit import basic_server
 
-    result = server_main()
+    # uvicorn re-imports "whisperlivekit.basic_server:app" from sys.modules,
+    # so the middleware registered here is the one that serves requests.
+    basic_server.app.add_middleware(AsrContextMiddleware)
+    result = basic_server.main()
     return int(result or 0)
 
 
