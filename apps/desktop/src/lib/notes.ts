@@ -1,4 +1,4 @@
-/** State and copy for the AI notes panel (docs/adr/0006), kept free of React
+/** State and copy for the AI notes panel, kept free of React
  *  so every state is unit tested. */
 
 import type {
@@ -27,6 +27,21 @@ export function setupNeed(status: AssistantStatus | null): SetupNeed | null {
   if (!status.key_available) return "key";
   if (!status.consent) return "consent";
   return null;
+}
+
+/** Window event sent after the assistant's preferences change outside the
+ *  view showing them (for example consent granted from a dialog). Views that
+ *  cache `assistant_status` or the runtime preferences refetch on it. */
+export const ASSISTANT_CHANGED_EVENT = "echolingo:assistant-changed";
+
+export function announceAssistantChanged(): void {
+  if (typeof window !== "undefined") window.dispatchEvent(new Event(ASSISTANT_CHANGED_EVENT));
+}
+
+export function onAssistantChanged(handler: () => void): () => void {
+  if (typeof window === "undefined") return () => undefined;
+  window.addEventListener(ASSISTANT_CHANGED_EVENT, handler);
+  return () => window.removeEventListener(ASSISTANT_CHANGED_EVENT, handler);
 }
 
 /** Markdown the panel shows: the running job's text, else saved notes, else

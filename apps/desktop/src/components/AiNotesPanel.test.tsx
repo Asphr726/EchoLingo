@@ -73,7 +73,13 @@ function renderMarkup(state: SessionNotesState, assistant: AssistantStatus | nul
 describe("AiNotesPanel states", () => {
   it("asks for setup with the specific missing piece", () => {
     expect(render({ notes: null, job: null }, { ...ready, key_available: false })).toContain("Add a key for Qwen (Alibaba Model Studio)");
-    expect(render({ notes: null, job: null }, { ...ready, consent: false })).toContain("Open AI assistant settings");
+    // Consent is asked in place instead of a detour through Settings: the
+    // cover's button starts creating notes and the dialog asks first.
+    const consent = render({ notes: null, job: null }, { ...ready, consent: false });
+    expect(consent).toContain("Allow transcripts to go to Qwen (Alibaba Model Studio)");
+    expect(consent).toContain("Create notes");
+    expect(consent).toContain("(asks to send text to Qwen (Alibaba Model Studio) first)");
+    expect(consent).not.toContain("Open AI assistant settings");
     expect(render({ notes: null, job: null }, { ...ready, provider_group: "", configured: false })).toContain("Set up the AI assistant");
   });
 
@@ -120,6 +126,13 @@ describe("AiNotesPanel states", () => {
     expect(html).toContain("Allow transcripts to go to Qwen (Alibaba Model Studio)");
     expect(html).toContain("Enable consent in Settings → AI assistant.");
     expect(html).not.toContain("Try again");
+  });
+
+  it("keeps Regenerate clickable and marks it when consent is missing", () => {
+    const html = render({ notes, job: null }, { ...ready, consent: false });
+    expect(html).toMatch(/<button class="button button--small" type="button" title="Regenerate \(asks to send text to Qwen \(Alibaba Model Studio\) first\)">/);
+    expect(html).toContain('class="gate-lock"');
+    expect(render({ notes, job: null })).not.toContain('class="gate-lock"');
   });
 
   it("tolerates malformed stored provenance", () => {

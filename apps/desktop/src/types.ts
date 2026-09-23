@@ -34,7 +34,7 @@ export interface StartSessionRequest {
   cloud_asr_preference: string;
   /** Cloud translator used by the Auto route, as above. */
   cloud_translation_preference: string;
-  /** Per-lecture topic and terms (docs/adr/0006), at most 2000 chars. */
+  /** Per-lecture topic and terms, at most 2000 chars. */
   session_context: string;
   /** Standing terminology: one `term = translation` or `term` per line. */
   glossary: string;
@@ -153,7 +153,7 @@ export interface RuntimePreferences {
   assistant: AssistantPreferences;
 }
 
-/** AI assistant used for session notes and titles (docs/adr/0006). */
+/** AI assistant used for session notes and titles. */
 export interface AssistantPreferences {
   /** Credential group id of an OpenAI-compatible chat provider, "" = off. */
   provider_group: string;
@@ -526,3 +526,59 @@ export const defaultSessionDefaults: StartSessionRequest = {
     transcript_upload_allowed: false,
   },
 };
+
+// ---------------------------------------------------------------------------
+// Click-to-consent. A control that needs a privacy flag stays clickable and
+// asks through `requestConsent`; nothing is uploaded until it resolves true.
+
+/** A party that would receive data, named the way the user knows it. */
+export interface ConsentRecipient {
+  /** Company, e.g. "Deepgram". */
+  vendor: string;
+  /** Provider as listed in the provider selects, e.g. "Deepgram streaming (cloud)". */
+  providerLabel: string;
+}
+
+/** Session upload flags (`PrivacyPolicy`), one row per missing flag. */
+export interface SessionConsentRequest {
+  kind: "session";
+  audio?: ConsentRecipient;
+  transcript?: ConsentRecipient;
+  /** What this particular action sends, when it is narrower than a session. */
+  note?: string;
+}
+
+/** What the AI assistant is about to be used for. */
+export type AssistantPurpose = "notes" | "title" | "import";
+
+/** The assistant's transcript consent (`AssistantPreferences.transcript_upload_allowed`). */
+export interface AssistantConsentRequest {
+  kind: "assistant";
+  /** Provider display name, e.g. "Qwen (Alibaba Model Studio)". */
+  vendor: string;
+  /** Model name; "" when the shell reports none. */
+  model: string;
+  purpose: AssistantPurpose;
+}
+
+/** Consent cannot help: the assistant has no provider or no key yet. */
+export interface SetupMissingRequest {
+  kind: "setup-missing";
+  need: "provider" | "key";
+  vendor?: string;
+  purpose: AssistantPurpose;
+}
+
+export type ConsentRequest = SessionConsentRequest | AssistantConsentRequest | SetupMissingRequest;
+
+/** How a consent request was answered. "declined" is the dialog's quiet
+ *  button, after which an action may go on without the upload (slide import
+ *  extracts on this Mac); "cancelled" is Esc, Close, the backdrop or a newer
+ *  request, after which nothing goes on. */
+export type ConsentAnswer = "granted" | "declined" | "cancelled";
+
+/** The rows of a session request the user left checked. */
+export interface ConsentSelection {
+  audio: boolean;
+  transcript: boolean;
+}

@@ -2,6 +2,7 @@ import {
   ArrowDown,
   ClosedCaptioning,
   CloudArrowUp,
+  Lock,
   LockKey,
   Microphone,
   Pause,
@@ -9,7 +10,7 @@ import {
   Stop,
   Waveform,
 } from "@phosphor-icons/react";
-import { memo, type ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, type ReactNode, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { api } from "../lib/bridge";
 import {
   effectiveProviderId,
@@ -20,7 +21,7 @@ import {
   providerVendor,
   supportsLanguage,
 } from "../lib/providers";
-import { useApp, useLiveMetrics } from "../state/AppContext";
+import { sessionConsentRequest, sessionConsentSummary, useApp, useLiveMetrics } from "../state/AppContext";
 import type { SegmentSummary, StartSessionRequest } from "../types";
 import { LectureContextPanel } from "./LectureContextPanel";
 import { ProviderSelect } from "./ProviderSelect";
@@ -40,12 +41,14 @@ export function LiveView() {
     draft,
     loading,
     pause,
+    requestConsent,
     resume,
     setDraft,
     snapshot,
     start,
     stop,
   } = useApp();
+  const consentNoteId = useId();
   const locked = !["IDLE", "COMPLETED"].includes(snapshot.phase);
   const microphones = devices.filter((device) => device.kind === "microphone");
   const needsAudioUpload = catalogNeedsAudioUpload(catalog, draft);
@@ -55,9 +58,16 @@ export function LiveView() {
     selectedAsr && !supportsLanguage(selectedAsr, draft.source_language)
       ? `${selectedAsr.display_name} does not support ${languageName(draft.source_language)} as the source language.`
       : null;
-  const privacyBlocked =
-    (needsAudioUpload && !draft.privacy.audio_upload_allowed) ||
-    (needsTranscriptUpload && !draft.privacy.transcript_upload_allowed);
+  // Uploads the chosen route needs and the privacy flags do not allow yet.
+  // Start stays clickable and asks for them in the consent dialog.
+  const consentNeeded = sessionConsentRequest(catalog, draft);
+
+  const startSession = async () => {
+    const request = sessionConsentRequest(catalog, draft);
+    // The grant is applied to the draft `start` reads before it resolves.
+    if (request && !(await requestConsent(request))) return;
+    await start();
+  };
 
   const update = <K extends keyof StartSessionRequest>(
     key: K,
@@ -171,11 +181,18 @@ export function LiveView() {
               <button
                 className="button button--primary"
                 type="button"
-                disabled={loading || actionPending || privacyBlocked || microphones.length === 0 && draft.audio_source === "microphone"}
-                onClick={() => void start()}
+                disabled={loading || actionPending || microphones.length === 0 && draft.audio_source === "microphone"}
+                aria-describedby={consentNeeded ? consentNoteId : undefined}
+                onClick={() => void startSession()}
               >
                 <Play size={17} weight="fill" aria-hidden="true" />
                 Start
+                {consentNeeded && (
+                  <>
+                    <Lock className="gate-lock" size={13} weight="bold" aria-hidden="true" />
+                    <span className="visually-hidden"> (asks to allow cloud upload first)</span>
+                  </>
+                )}
               </button>
             )}
             {snapshot.phase === "LISTENING" && (
@@ -213,9 +230,15 @@ export function LiveView() {
             {snapshot.startup_status}
           </p>
         )}
-        {privacyBlocked && (
-          <p className="field-error" role="alert">
-            Enable the required upload permission before starting this cloud route.
+        {consentNeeded && !locked && (
+          <p className="consent-notice" id={consentNoteId}>
+            <Lock size={13} weight="bold" aria-hidden="true" />
+            <span>
+              This route {sessionConsentSummary(consentNeeded)}. Start asks for your permission first.{" "}
+              <button className="text-button text-button--inline" type="button" onClick={() => void requestConsent(consentNeeded)}>
+                Review now
+              </button>
+            </span>
           </p>
         )}
         {!locked && languageUnsupported && (
@@ -355,7 +378,7 @@ function SpeechIndicator() {
 }
 
 function TranscriptStage() {
-  const { snapshot } = useApp();
+  const { draft, snapshot } = useApp();
   const feedRef = useRef<HTMLDivElement>(null);
   const [following, setFollowing] = useState(true);
   const openText = snapshot.live.open_text.trim();
@@ -365,8 +388,9 @@ function TranscriptStage() {
   const hasCopy = segments.length > 0 || openText || unstableText;
   const lastSegment = segments.at(-1);
   const contentToken = `${segments.length}:${lastSegment?.translation ?? ""}:${openText}:${unstableText}:${provisionalTranslation}`;
-  const sourceLanguage = snapshot.config?.source_language;
-  const targetLanguage = snapshot.config?.target_language;
+  // Before a session has a config, the heading shows the languages Start will use.
+  const sourceLanguage = snapshot.config?.source_language ?? draft.source_language;
+  const targetLanguage = snapshot.config?.target_language ?? draft.target_language;
 
   const scrollToLive = () => {
     const feed = feedRef.current;

@@ -2,10 +2,10 @@
  *  settings" from History, "Add a key in Cloud providers" from Settings).
  *
  *  A request is a cancelable `echolingo:navigate` window event whose detail
- *  is a `NavigationTarget`. The main window handles it (and calls
- *  `preventDefault()`); until it does, the request falls back to pressing the
- *  matching primary-navigation button. The settings section is remembered
- *  here so a freshly mounted Settings view opens on it. */
+ *  is a `NavigationTarget`. The main window switches view on it, and an open
+ *  Settings view switches section; a handler calls `preventDefault()` so the
+ *  caller can tell the request was taken. The settings section is also
+ *  remembered here so a freshly mounted Settings view opens on it. */
 
 export type AppView = "live" | "history" | "settings";
 
@@ -17,19 +17,34 @@ export interface NavigationTarget {
 
 export const NAVIGATE_EVENT = "echolingo:navigate";
 
+const views: readonly AppView[] = ["live", "history", "settings"];
+
 let pendingSection: string | null = null;
 
-export function requestNavigation(target: NavigationTarget): void {
-  if (typeof window === "undefined") return;
-  pendingSection = target.section ?? null;
+export function isAppView(value: unknown): value is AppView {
+  return typeof value === "string" && (views as readonly string[]).includes(value);
+}
+
+/** Asks the main window to show `target`. Returns true when a view took it. */
+export function requestNavigation(target: NavigationTarget): boolean {
+  if (typeof window === "undefined") return false;
+  pendingSection = target.view === "settings" ? target.section ?? null : null;
   const event = new CustomEvent<NavigationTarget>(NAVIGATE_EVENT, { detail: target, cancelable: true });
-  const handled = !window.dispatchEvent(event);
-  if (handled) return;
-  const label = target.view.toLowerCase();
-  const button = Array.from(document.querySelectorAll<HTMLButtonElement>(".rail-link")).find(
-    (candidate) => candidate.textContent?.trim().toLowerCase() === label,
-  );
-  button?.click();
+  return !window.dispatchEvent(event);
+}
+
+/** Calls `handler` for every valid navigation request; returns the
+ *  unsubscribe function (an effect cleanup). */
+export function onNavigate(handler: (target: NavigationTarget) => void): () => void {
+  if (typeof window === "undefined") return () => undefined;
+  const listener = (event: Event) => {
+    const detail = (event as CustomEvent<NavigationTarget | undefined>).detail;
+    if (!detail || !isAppView(detail.view)) return;
+    event.preventDefault();
+    handler(detail);
+  };
+  window.addEventListener(NAVIGATE_EVENT, listener);
+  return () => window.removeEventListener(NAVIGATE_EVENT, listener);
 }
 
 /** The section requested by the last navigation. Reading has no side

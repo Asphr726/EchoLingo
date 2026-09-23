@@ -1,4 +1,4 @@
-/** Pure helpers for rendering AI notes (docs/adr/0006). No React here so the
+/** Pure helpers for rendering AI notes. No React here so the
  *  delimiter conversion, block splitting and heading parsing stay unit
  *  testable in the node test environment. */
 

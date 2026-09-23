@@ -67,7 +67,14 @@ export function providerVendor(
   id: string,
 ): string {
   const spec = findProvider(catalog, kind, id);
-  return spec?.vendor || spec?.display_name || id;
+  return recipientName(spec?.vendor || spec?.display_name || id);
+}
+
+/** A vendor as the recipient in a sentence ("sent to …"). The registry's
+ *  vendor for a self-hosted OpenAI-compatible endpoint is "Custom", which
+ *  does not read as a recipient. */
+export function recipientName(vendor: string): string {
+  return vendor === "Custom" ? "your custom endpoint" : vendor;
 }
 
 /** Whether `spec` can be used for `lang` as source language. An empty

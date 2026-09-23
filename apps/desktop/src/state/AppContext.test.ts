@@ -1,6 +1,29 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { defaultSessionDefaults, emptySnapshot, type UiEventEnvelope } from "../types";
-import { applyUiEvent, withProviderDefaults } from "./AppContext";
+import {
+  type AssistantStatus,
+  defaultSessionDefaults,
+  emptySnapshot,
+  type ProviderCatalog,
+  type StartSessionRequest,
+  type UiEventEnvelope,
+} from "../types";
+import {
+  applyUiEvent,
+  assistantConsentRequest,
+  consentSatisfied,
+  gatedLabel,
+  privacyGrant,
+  sessionConsentRequest,
+  sessionConsentSummary,
+  withProviderDefaults,
+} from "./AppContext";
+
+// The committed catalog is the contract the consent copy is built from.
+const catalog = JSON.parse(
+  readFileSync(fileURLToPath(new URL("../../../../configs/providers.json", import.meta.url)), "utf8"),
+) as ProviderCatalog;
 
 function event(kind: UiEventEnvelope["kind"], payload: unknown): UiEventEnvelope {
   return {
@@ -204,5 +227,92 @@ describe("session defaults from the shell", () => {
     const explicit = withProviderDefaults({ ...defaultSessionDefaults, cloud_translation_preference: "deepl" });
     expect(explicit.cloud_translation_preference).toBe("deepl");
     expect(withProviderDefaults({ ...defaultSessionDefaults, cloud_asr_preference: "" }).cloud_asr_preference).toBe("qwen_cloud");
+  });
+});
+
+describe("consent requests", () => {
+  const draft = (overrides: Partial<StartSessionRequest> = {}): StartSessionRequest => ({
+    ...defaultSessionDefaults,
+    ...overrides,
+  });
+
+  it("needs nothing for the local route, or while Auto may stay local", () => {
+    expect(sessionConsentRequest(catalog, draft({ asr_provider: "qwen_local", translation_provider: "hymt_local" }))).toBeNull();
+    expect(sessionConsentRequest(catalog, draft())).toBeNull();
+  });
+
+  it("names the vendor of each upload the route needs and the flags do not allow", () => {
+    const request = sessionConsentRequest(catalog, draft({ asr_provider: "deepgram", translation_provider: "deepl" }));
+    expect(request).toEqual({
+      kind: "session",
+      audio: { vendor: "Deepgram", providerLabel: "Deepgram streaming (cloud)" },
+      transcript: { vendor: "DeepL", providerLabel: "DeepL (cloud)" },
+    });
+    expect(sessionConsentSummary(request!)).toBe("uploads audio to Deepgram and sends transcript text to DeepL");
+  });
+
+  it("keeps Hybrid routes to the one upload they need", () => {
+    const hybrid = sessionConsentRequest(catalog, draft({ asr_provider: "qwen_local", translation_provider: "deepl" }));
+    expect(hybrid).toEqual({ kind: "session", transcript: { vendor: "DeepL", providerLabel: "DeepL (cloud)" } });
+    const allowed = draft({
+      asr_provider: "deepgram",
+      translation_provider: "deepl",
+      privacy: { audio_upload_allowed: true, transcript_upload_allowed: false },
+    });
+    expect(sessionConsentRequest(catalog, allowed)).toEqual({
+      kind: "session",
+      transcript: { vendor: "DeepL", providerLabel: "DeepL (cloud)" },
+    });
+  });
+
+  it("follows the Cloud mode's Auto preferences", () => {
+    const request = sessionConsentRequest(catalog, draft({ inference_mode: "cloud" }));
+    expect(request?.audio?.vendor).toBe("Alibaba Cloud");
+    expect(request?.transcript?.vendor).toBe("Alibaba Cloud");
+  });
+
+  it("errs on the side of asking before the catalog has loaded", () => {
+    const request = sessionConsentRequest(null, draft({ asr_provider: "deepgram" }));
+    expect(request).toEqual({ kind: "session", audio: { vendor: "deepgram", providerLabel: "deepgram" } });
+  });
+
+  it("grants only the rows the user left checked", () => {
+    const request = sessionConsentRequest(catalog, draft({ asr_provider: "deepgram", translation_provider: "deepl" }))!;
+    expect(privacyGrant(request, { audio: true, transcript: true })).toEqual({
+      audio_upload_allowed: true,
+      transcript_upload_allowed: true,
+    });
+    expect(privacyGrant(request, { audio: false, transcript: true })).toEqual({ transcript_upload_allowed: true });
+    expect(consentSatisfied(request, { audio: false, transcript: true })).toBe(false);
+    expect(consentSatisfied(request, { audio: true, transcript: true })).toBe(true);
+    const transcriptOnly = sessionConsentRequest(catalog, draft({ translation_provider: "deepl" }))!;
+    expect(privacyGrant(transcriptOnly, { audio: true, transcript: true })).toEqual({ transcript_upload_allowed: true });
+    expect(consentSatisfied(transcriptOnly, { audio: false, transcript: true })).toBe(true);
+  });
+
+  it("asks the assistant's consent, or explains the setup consent cannot give", () => {
+    const ready: AssistantStatus = {
+      configured: true,
+      consent: true,
+      provider_group: "openai",
+      model: "gpt-4o-mini",
+      display_name: "OpenAI",
+      key_available: true,
+      auto_title: true,
+    };
+    expect(assistantConsentRequest(ready, "notes")).toBeNull();
+    expect(assistantConsentRequest(null, "notes")).toBeNull();
+    const consent = assistantConsentRequest({ ...ready, consent: false }, "title");
+    expect(consent).toEqual({ kind: "assistant", vendor: "OpenAI", model: "gpt-4o-mini", purpose: "title" });
+    expect(gatedLabel("Generate title", consent!)).toBe("Generate title (asks to send text to OpenAI first)");
+    expect(assistantConsentRequest({ ...ready, key_available: false, consent: false }, "notes")).toEqual({
+      kind: "setup-missing",
+      need: "key",
+      vendor: "OpenAI",
+      purpose: "notes",
+    });
+    expect(
+      assistantConsentRequest({ ...ready, configured: false, provider_group: "", display_name: "" }, "import"),
+    ).toEqual({ kind: "setup-missing", need: "provider", purpose: "import" });
   });
 });

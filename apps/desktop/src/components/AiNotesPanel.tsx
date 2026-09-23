@@ -5,12 +5,13 @@ import {
   CloudArrowUp,
   Copy,
   DownloadSimple,
+  Lock,
   Paperclip,
   Warning,
   WarningCircle,
 } from "@phosphor-icons/react";
 import { save } from "@tauri-apps/plugin-dialog";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type RefObject, useEffect, useMemo, useRef, useState } from "react";
 import { api, previewInitialAttachments, previewOpensAttachmentSheet } from "../lib/bridge";
 import { estimateWords, formatRange, parseNotesDocument } from "../lib/markdown";
 import { requestNavigation } from "../lib/navigation";
@@ -24,6 +25,7 @@ import {
   stageLabel,
   visibleMarkdown,
 } from "../lib/notes";
+import { assistantConsentRequest, gatedLabel, useConsent } from "../state/AppContext";
 import type {
   AssistantJob,
   AssistantStatus,
@@ -58,6 +60,7 @@ export function AiNotesPanel({
   onFocusHandled,
   onJob,
   onJump,
+  scrollRoot,
   segments,
   session,
   state,
@@ -76,7 +79,10 @@ export function AiNotesPanel({
   /** Section to bring into view (returning from the transcript). */
   focusSection: number | null;
   onFocusHandled: () => void;
+  /** The pane that scrolls the notes, for the contents scroll spy. */
+  scrollRoot?: RefObject<HTMLElement | null>;
 }) {
+  const { requestConsent } = useConsent();
   const view = notesView(assistant, state, stateLoading);
   const markdown = visibleMarkdown(state) ?? "";
   const doc = useMemo(() => parseNotesDocument(markdown), [markdown]);
@@ -101,6 +107,8 @@ export function AiNotesPanel({
   useEffect(() => {
     if (sectionCount === 0 || typeof IntersectionObserver === "undefined") return;
     const headings = Array.from(document.querySelectorAll<HTMLElement>(".notes-body [data-section-index]"));
+    // The detail pane scrolls on its own; "near the top" means near its top.
+    const root = scrollRoot?.current ?? headings[0]?.closest<HTMLElement>(".history-detail-pane") ?? null;
     const observer = new IntersectionObserver(
       (entries) => {
         const visible = entries.filter((entry) => entry.isIntersecting);
@@ -108,11 +116,11 @@ export function AiNotesPanel({
         const top = visible.reduce((first, entry) => (entry.boundingClientRect.top < first.boundingClientRect.top ? entry : first));
         setActiveSection(Number((top.target as HTMLElement).dataset.sectionIndex));
       },
-      { rootMargin: "0px 0px -65% 0px" },
+      { root, rootMargin: "0px 0px -65% 0px" },
     );
     headings.forEach((heading) => observer.observe(heading));
     return () => observer.disconnect();
-  }, [sectionCount, session.id, view]);
+  }, [scrollRoot, sectionCount, session.id, view]);
 
   useEffect(() => {
     if (focusSection == null || (view !== "saved" && view !== "generating")) return;
@@ -193,6 +201,15 @@ export function AiNotesPanel({
     }
   };
 
+  /** Opens the attachment sheet, first asking for whatever the assistant
+   *  still needs (consent, or setup it cannot give). */
+  const startCreate = async () => {
+    const gate = assistantConsentRequest(assistant, "notes");
+    if (gate && !(await requestConsent(gate))) return;
+    setSheetOpen(true);
+  };
+  const regenerateGate = assistantConsentRequest(assistant, "notes");
+
   const failure = job?.state === "failed" ? job : null;
   const hasNotes = view === "saved" || view === "generating";
   // Retrying cannot succeed until the setup the shell checks is complete.
@@ -217,7 +234,7 @@ export function AiNotesPanel({
 
       {view === "setup" && assistant && (
         <div className="notes-sheet notes-cover">
-          <SetupCover status={assistant} />
+          <SetupCover status={assistant} onCreate={() => void startCreate()} />
           {errorBlock}
           {actionError && <p className="inline-error" role="alert">{actionError}</p>}
         </div>
@@ -300,12 +317,22 @@ export function AiNotesPanel({
                       <button
                         className="button button--small"
                         type="button"
-                        disabled={Boolean(setupNeed(assistant)) || pending === "create"}
-                        title={setupNeed(assistant) ? "Set up the AI assistant in Settings first" : "Write new notes; the current ones are replaced when the new ones are saved"}
-                        onClick={() => setSheetOpen(true)}
+                        disabled={pending === "create"}
+                        title={
+                          regenerateGate
+                            ? gatedLabel("Regenerate", regenerateGate)
+                            : "Write new notes; the current ones are replaced when the new ones are saved"
+                        }
+                        onClick={() => void startCreate()}
                       >
                         <ArrowClockwise size={14} weight="regular" aria-hidden="true" />
                         Regenerate
+                        {regenerateGate && (
+                          <>
+                            <Lock className="gate-lock" size={12} weight="bold" aria-hidden="true" />
+                            <span className="visually-hidden">{` ${gatedLabel("", regenerateGate).trim()}`}</span>
+                          </>
+                        )}
                       </button>
                     </>
                   )}
@@ -422,7 +449,7 @@ function AttachmentChip({ attachment }: { attachment: NoteAttachmentReport }) {
   );
 }
 
-function SetupCover({ status }: { status: AssistantStatus }) {
+function SetupCover({ onCreate, status }: { status: AssistantStatus; onCreate: () => void }) {
   const need = setupNeed(status);
   const name = status.display_name || "the provider";
   if (need === "key") {
@@ -443,12 +470,15 @@ function SetupCover({ status }: { status: AssistantStatus }) {
       <>
         <h3>Allow transcripts to go to {name}</h3>
         <p>
-          Creating notes sends this session’s transcript, and the text of any files you attach, to {name}. Turn this on
-          in Settings → AI assistant.
+          Creating notes sends this session’s transcript, and the text of any files you attach, to {name}. Audio never
+          leaves this Mac.
         </p>
         <div className="notes-cover-actions">
-          <button className="button button--primary" type="button" onClick={() => openSettings("ai-assistant")}>
-            Open AI assistant settings
+          {/* Asks in the consent dialog, then continues to the attachment sheet. */}
+          <button className="button button--primary" type="button" onClick={onCreate}>
+            Create notes
+            <Lock className="gate-lock" size={13} weight="bold" aria-hidden="true" />
+            <span className="visually-hidden">{` (asks to send text to ${name} first)`}</span>
           </button>
         </div>
       </>
@@ -459,7 +489,7 @@ function SetupCover({ status }: { status: AssistantStatus }) {
       <h3>Set up the AI assistant</h3>
       <p>
         Study notes are written by a language model you choose, with your own API key. Pick a provider and model in
-        Settings; nothing is sent until you allow it there.
+        Settings; nothing is sent until you allow it.
       </p>
       <div className="notes-cover-actions">
         <button className="button button--primary" type="button" onClick={() => openSettings("ai-assistant")}>

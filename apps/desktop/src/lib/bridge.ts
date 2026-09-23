@@ -9,6 +9,7 @@ import type {
   AudioTestResult,
   CaptionPreferences,
   CloudProbeResult,
+  ConsentRequest,
   ContextImportResult,
   CredentialGroupStatus,
   ModelProgress,
@@ -45,6 +46,72 @@ const previewMode = () =>
  *  context) instead of replaying a running session. */
 const previewIdle = () =>
   previewMode() && new URLSearchParams(window.location.search).get("phase") === "idle";
+
+/** A query parameter of the browser preview; null outside it. */
+const previewParam = (key: string) =>
+  previewMode() ? new URLSearchParams(window.location.search).get(key) : null;
+
+/** `&route=cloud` starts the preview on a cloud route (Deepgram + DeepL)
+ *  with both uploads still off, to review the consent gate on Start. */
+const previewCloudRoute = () => previewParam("route") === "cloud";
+
+/** `&assistant=consent`: the assistant is set up but not yet allowed to
+ *  receive transcripts. Granting it in the preview sticks until reload. */
+let previewAssistantConsent: boolean | null = null;
+const previewAssistantConsentValue = (fallback: boolean) => {
+  if (previewAssistantConsent === null && previewParam("assistant") === "consent") previewAssistantConsent = false;
+  return previewAssistantConsent ?? fallback;
+};
+
+/** `?consent=session|assistant|setup` opens the consent dialog on load. */
+export function previewConsentRequest(): ConsentRequest | null {
+  switch (previewParam("consent")) {
+    case "session":
+      return {
+        kind: "session",
+        audio: { vendor: "Deepgram", providerLabel: "Deepgram streaming (cloud)" },
+        transcript: { vendor: "DeepL", providerLabel: "DeepL (cloud)" },
+      };
+    case "assistant":
+      return { kind: "assistant", vendor: "Qwen (Alibaba Model Studio)", model: "qwen-plus", purpose: "notes" };
+    case "setup":
+      return { kind: "setup-missing", need: "key", vendor: "Qwen (Alibaba Model Studio)", purpose: "notes" };
+    default:
+      return null;
+  }
+}
+
+/** `&history=long` pads History with older sessions to review scrolling. */
+function previewLongHistory(query: string): SessionRecord[] {
+  if (previewParam("history") !== "long") return [];
+  const topics = [
+    "Fourier transforms and sampling", "Image pyramids and blending", "Edge detection", "Feature matching with SIFT",
+    "RANSAC and homographies", "Panorama stitching", "Camera models", "Stereo and epipolar geometry",
+    "Structure from motion", "Optical flow", "Neural radiance fields", "Diffusion models for images",
+    "Texture synthesis", "Seam carving", "Morphing faces", "Light fields",
+    "Colour constancy", "HDR imaging", "Deblurring", "Self-supervised learning",
+  ];
+  const needle = query.trim().toLowerCase();
+  return topics
+    .map((topic, index): SessionRecord => ({
+      id: `preview-long-${index}`,
+      title: `CS180 lecture ${topics.length - index}: ${topic}`,
+      title_source: index % 3 === 0 ? "ai" : "user",
+      context: "",
+      status: "completed",
+      started_at: new Date(Date.now() - (4 + index) * 86_400_000).toISOString(),
+      ended_at: new Date(Date.now() - (4 + index) * 86_400_000 + 4_800_000).toISOString(),
+      source_language: "en",
+      target_language: "zh",
+      audio_source: "microphone",
+      audio_profile: "lecture",
+      inference_mode: "auto",
+      asr_backend: "qwen_local",
+      translation_backend: "hymt_local",
+      route_reason: "preview",
+    }))
+    .filter((session) => !needle || session.title.toLowerCase().includes(needle));
+}
 
 /** Files the attachment sheet starts with in `?notes=sheet` previews. */
 export function previewInitialAttachments(): NoteAttachment[] {
@@ -93,7 +160,7 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
             translation_locality: "local",
             translation_health: "connected",
             deployment: "local",
-            reason: "Preview replay of a recorded session",
+            reason: "qwen3-asr-0.6b passed local ASR calibration; tencent/Hy-MT2-1.8B passed local translation calibration",
           },
         }
       : emptySnapshot,
@@ -121,7 +188,7 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
       preload_local_models: true,
       providers: {},
       assistant: previewMode() && previewNotesMode() !== "unconfigured"
-        ? { provider_group: "dashscope", model: "", transcript_upload_allowed: true, auto_title: true }
+        ? { provider_group: "dashscope", model: "", transcript_upload_allowed: previewAssistantConsentValue(true), auto_title: true }
         : defaultAssistantPreferences,
     } satisfies RuntimePreferences,
     get_session_defaults: previewMode()
@@ -129,6 +196,7 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
           ...defaultSessionDefaults,
           session_context: "CS180 Lecture 12: colour spaces and texture perception\nBéla Julesz · Anne Treisman\nsaccade = 眼跳\npre-attentive vision = 前注意视觉",
           glossary: "# Course-wide terms\nconvolution = 卷积\nGaussian pyramid = 高斯金字塔\nAlyosha Efros",
+          ...(previewCloudRoute() ? { asr_provider: "deepgram", translation_provider: "deepl" } : {}),
         }
       : defaultSessionDefaults,
     list_providers: previewCatalog,
@@ -155,6 +223,10 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
   if (name === "update_session_defaults") {
     return args?.defaults as T;
   }
+  if (name === "update_runtime_preferences" && previewMode()) {
+    const next = args?.preferences as RuntimePreferences | undefined;
+    if (next?.assistant) previewAssistantConsent = next.assistant.transcript_upload_allowed;
+  }
   if (name === "update_caption_preferences" || name === "update_runtime_preferences") {
     return args?.preferences as T;
   }
@@ -175,15 +247,23 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
   if (previewMode()) {
     const assistant = previewAssistant();
     switch (name) {
-      case "history_search":
-        return assistant.search(String(args?.query ?? "")) as T;
-      case "history_open":
-        return assistant.open(String(args?.sessionId)) as T;
+      case "history_search": {
+        const query = String(args?.query ?? "");
+        return [...assistant.search(query), ...previewLongHistory(query)] as T;
+      }
+      case "history_open": {
+        const sessionId = String(args?.sessionId);
+        const padded = previewLongHistory("").find((session) => session.id === sessionId);
+        const detail = assistant.open(sessionId);
+        return (padded ? { ...detail, session: padded } : detail) as T;
+      }
       case "history_rename":
       case "history_delete":
         return undefined as T;
-      case "assistant_status":
-        return assistant.status() as T;
+      case "assistant_status": {
+        const status = assistant.status();
+        return { ...status, consent: status.configured && previewAssistantConsentValue(status.consent) } as T;
+      }
       case "assistant_probe":
         return assistant.probe() as T;
       case "get_session_notes":
@@ -497,7 +577,7 @@ export const api = {
   historyExportToPath: (sessionId: string, format: string, path: string) =>
     command<void>("history_export_to_path", { sessionId, format, path }),
 
-  // AI assistant (docs/adr/0006). Transcripts and attachments leave the
+  // AI assistant. Transcripts and attachments leave the
   // device only through these commands, gated in Rust and Python by the
   // assistant's consent flag.
   assistantStatus: () => command<AssistantStatus>("assistant_status"),

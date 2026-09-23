@@ -1,6 +1,6 @@
 import type { ContextImportResult } from "../types";
 
-/** Limits from docs/adr/0006. */
+/** Size limits for the lecture context and the standing glossary, in characters. */
 export const SESSION_CONTEXT_LIMIT = 2000;
 export const GLOSSARY_LIMIT = 4000;
 

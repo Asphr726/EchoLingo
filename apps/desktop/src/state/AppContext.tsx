@@ -7,19 +7,39 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import { api, subscribeUiEvents } from "../lib/bridge";
+import { requestNavigation } from "../lib/navigation";
+import { announceAssistantChanged, setupNeed } from "../lib/notes";
+import {
+  effectiveProviderId,
+  needsAudioUpload,
+  needsTranscriptUpload,
+  providerLabel,
+  providerVendor,
+} from "../lib/providers";
 import type {
+  AssistantPurpose,
+  AssistantStatus,
   AudioDevice,
   CaptionPreferences,
+  ConsentAnswer,
+  ConsentRecipient,
+  ConsentRequest,
+  ConsentSelection,
   LiveMetrics,
+  PrivacyPolicy,
   ProviderCatalog,
+  ProviderKind,
+  SessionConsentRequest,
   SessionSnapshot,
   StartSessionRequest,
   UiEventEnvelope,
 } from "../types";
 import {
+  defaultAssistantPreferences,
   defaultCaptionPreferences,
   defaultSessionDefaults,
   emptySnapshot,
@@ -52,9 +72,36 @@ interface AppContextValue {
   resume: () => Promise<void>;
   stop: () => Promise<void>;
   updateCaption: (next: CaptionPreferences) => Promise<void>;
+  /** Opens the consent dialog; resolves true once the user granted
+   *  everything the request needs (and it has been saved). */
+  requestConsent: (request: ConsentRequest) => Promise<boolean>;
+  /** Like `requestConsent`, but tells a decline ("Not now") from a cancel,
+   *  for actions that can go on without the upload. */
+  askConsent: (request: ConsentRequest) => Promise<ConsentAnswer>;
 }
 
 const AppContext = createContext<AppContextValue | null>(null);
+
+interface ConsentContextValue {
+  /** The request the dialog shows; null when it is closed. */
+  request: ConsentRequest | null;
+  requestConsent: (request: ConsentRequest) => Promise<boolean>;
+  askConsent: (request: ConsentRequest) => Promise<ConsentAnswer>;
+  /** Grants what the user selected (throws when saving fails). */
+  confirm: (selection: ConsentSelection) => Promise<void>;
+  /** Closes without granting: the quiet button declines, anything else
+   *  (Esc, Close, the backdrop) cancels. */
+  dismiss: (answer: Exclude<ConsentAnswer, "granted">) => void;
+}
+
+// Outside the provider (server-rendered tests) nothing can be granted.
+const ConsentContext = createContext<ConsentContextValue>({
+  request: null,
+  requestConsent: async () => false,
+  askConsent: async () => "cancelled",
+  confirm: async () => undefined,
+  dismiss: () => undefined,
+});
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -192,6 +239,90 @@ export function mergeCommandSnapshot(current: SessionSnapshot, next: SessionSnap
   return next;
 }
 
+// ---------------------------------------------------------------------------
+// Consent requests, kept pure so every case is unit tested.
+
+function recipient(
+  catalog: ProviderCatalog | null | undefined,
+  kind: ProviderKind,
+  id: string,
+): ConsentRecipient {
+  return { vendor: providerVendor(catalog, kind, id), providerLabel: providerLabel(catalog, kind, id) };
+}
+
+/** What Start needs the user to allow for this draft: one row per upload
+ *  the effective providers need and the privacy flags do not yet allow.
+ *  Null when the session can start as configured. */
+export function sessionConsentRequest(
+  catalog: ProviderCatalog | null | undefined,
+  draft: StartSessionRequest,
+): SessionConsentRequest | null {
+  const asrId = effectiveProviderId(draft, "asr");
+  const translationId = effectiveProviderId(draft, "translation");
+  const audio =
+    asrId && needsAudioUpload(catalog, draft) && !draft.privacy.audio_upload_allowed
+      ? recipient(catalog, "asr", asrId)
+      : undefined;
+  const transcript =
+    translationId && needsTranscriptUpload(catalog, draft) && !draft.privacy.transcript_upload_allowed
+      ? recipient(catalog, "translation", translationId)
+      : undefined;
+  if (!audio && !transcript) return null;
+  return { kind: "session", ...(audio ? { audio } : {}), ...(transcript ? { transcript } : {}) };
+}
+
+/** "uploads audio to Deepgram and sends transcript text to DeepL". */
+export function sessionConsentSummary(request: SessionConsentRequest): string {
+  const parts = [
+    request.audio ? `uploads audio to ${request.audio.vendor}` : null,
+    request.transcript ? `sends transcript text to ${request.transcript.vendor}` : null,
+  ].filter(Boolean);
+  return parts.join(" and ");
+}
+
+/** What using the assistant for `purpose` needs first: its consent, or the
+ *  setup consent cannot replace. Null when it is ready, or while the status
+ *  is still loading (the shell enforces the gate either way). */
+export function assistantConsentRequest(
+  status: AssistantStatus | null,
+  purpose: AssistantPurpose,
+): ConsentRequest | null {
+  const need = setupNeed(status);
+  if (!status || !need) return null;
+  const vendor = status.display_name || undefined;
+  if (need === "consent") {
+    return { kind: "assistant", vendor: vendor ?? "the AI assistant", model: status.model, purpose };
+  }
+  return { kind: "setup-missing", need, ...(vendor ? { vendor } : {}), purpose };
+}
+
+/** Accessible name for a control that asks first. */
+export function gatedLabel(action: string, request: ConsentRequest): string {
+  switch (request.kind) {
+    case "session":
+      return `${action} (asks to allow cloud upload first)`;
+    case "assistant":
+      return `${action} (asks to send text to ${request.vendor} first)`;
+    default:
+      return request.need === "key"
+        ? `${action} (needs a key for ${request.vendor ?? "the AI assistant"})`
+        : `${action} (set up the AI assistant first)`;
+  }
+}
+
+/** Privacy flags a confirmed session request turns on. */
+export function privacyGrant(request: SessionConsentRequest, selection: ConsentSelection): Partial<PrivacyPolicy> {
+  return {
+    ...(request.audio && selection.audio ? { audio_upload_allowed: true } : {}),
+    ...(request.transcript && selection.transcript ? { transcript_upload_allowed: true } : {}),
+  };
+}
+
+/** True when the selection covers every row the request asked for. */
+export function consentSatisfied(request: SessionConsentRequest, selection: ConsentSelection): boolean {
+  return (!request.audio || selection.audio) && (!request.transcript || selection.transcript);
+}
+
 const MetricsContext = createContext<LiveMetrics>(emptySnapshot.metrics);
 
 export function AppProvider({ children }: PropsWithChildren) {
@@ -207,6 +338,12 @@ export function AppProvider({ children }: PropsWithChildren) {
   const [actionPending, setActionPending] = useState(false);
   const [onboardingComplete, setOnboardingComplete] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [consent, setConsent] = useState<{ request: ConsentRequest; resolve: (answer: ConsentAnswer) => void } | null>(null);
+  const consentRef = useRef(consent);
+  // Start reads the latest draft and revision: a consent grant made just
+  // before it (in the same click) is not rendered yet.
+  const latest = useRef({ draft, revision: snapshot.state_revision });
+  latest.current = { draft, revision: snapshot.state_revision };
 
   useEffect(() => {
     let active = true;
@@ -300,14 +437,15 @@ export function AppProvider({ children }: PropsWithChildren) {
 
   const start = useCallback(
     () =>
-      run(() =>
-        api.start({
-          ...draft,
-          expected_state_revision: snapshot.state_revision,
-          audio_device_id: draft.audio_source === "microphone" ? draft.audio_device_id : null,
-        }),
-      ),
-    [draft, run, snapshot.state_revision],
+      run(() => {
+        const { draft: current, revision } = latest.current;
+        return api.start({
+          ...current,
+          expected_state_revision: revision,
+          audio_device_id: current.audio_source === "microphone" ? current.audio_device_id : null,
+        });
+      }),
+    [run],
   );
   const pause = useCallback(
     () => run(() => api.pause(snapshot.state_revision)),
@@ -341,6 +479,77 @@ export function AppProvider({ children }: PropsWithChildren) {
     }
   }, []);
 
+  const settleConsent = useCallback((answer: ConsentAnswer) => {
+    const pending = consentRef.current;
+    if (!pending) return;
+    consentRef.current = null;
+    setConsent(null);
+    pending.resolve(answer);
+  }, []);
+
+  const askConsent = useCallback(
+    (request: ConsentRequest) =>
+      new Promise<ConsentAnswer>((resolve) => {
+        // A newer request replaces one still open; the older one is cancelled.
+        consentRef.current?.resolve("cancelled");
+        const next = { request, resolve };
+        consentRef.current = next;
+        setConsent(next);
+      }),
+    [],
+  );
+
+  const requestConsent = useCallback(
+    async (request: ConsentRequest) => (await askConsent(request)) === "granted",
+    [askConsent],
+  );
+
+  const confirmConsent = useCallback(
+    async (selection: ConsentSelection) => {
+      const request = consentRef.current?.request;
+      if (!request) return;
+      if (request.kind === "session") {
+        const grant = privacyGrant(request, selection);
+        const current = latest.current.draft;
+        // Saved by the session-defaults autosave like any other draft edit.
+        latest.current = { ...latest.current, draft: { ...current, privacy: { ...current.privacy, ...grant } } };
+        setDraft((draftNow) => ({ ...draftNow, privacy: { ...draftNow.privacy, ...grant } }));
+        settleConsent(consentSatisfied(request, selection) ? "granted" : "declined");
+        return;
+      }
+      if (request.kind === "assistant") {
+        const preferences = await api.runtimePreferences();
+        await api.updateRuntimePreferences({
+          ...preferences,
+          assistant: { ...defaultAssistantPreferences, ...preferences.assistant, transcript_upload_allowed: true },
+        });
+        announceAssistantChanged();
+        settleConsent("granted");
+        return;
+      }
+      // Setup happens in Settings; the action that asked does not go on.
+      requestNavigation({ view: "settings", section: request.need === "key" ? "cloud-providers" : "ai-assistant" });
+      settleConsent("cancelled");
+    },
+    [settleConsent],
+  );
+
+  const dismissConsent = useCallback(
+    (answer: Exclude<ConsentAnswer, "granted">) => settleConsent(answer),
+    [settleConsent],
+  );
+
+  const consentValue = useMemo<ConsentContextValue>(
+    () => ({
+      request: consent?.request ?? null,
+      requestConsent,
+      askConsent,
+      confirm: confirmConsent,
+      dismiss: dismissConsent,
+    }),
+    [askConsent, confirmConsent, consent, dismissConsent, requestConsent],
+  );
+
   const value = useMemo<AppContextValue>(
     () => ({
       snapshot,
@@ -360,6 +569,8 @@ export function AppProvider({ children }: PropsWithChildren) {
       resume,
       stop,
       updateCaption,
+      requestConsent,
+      askConsent,
     }),
     [
       actionPending,
@@ -372,6 +583,8 @@ export function AppProvider({ children }: PropsWithChildren) {
       onboardingComplete,
       completeOnboarding,
       pause,
+      requestConsent,
+      askConsent,
       resume,
       snapshot,
       start,
@@ -381,7 +594,9 @@ export function AppProvider({ children }: PropsWithChildren) {
   );
   return (
     <AppContext.Provider value={value}>
-      <MetricsContext.Provider value={metrics}>{children}</MetricsContext.Provider>
+      <ConsentContext.Provider value={consentValue}>
+        <MetricsContext.Provider value={metrics}>{children}</MetricsContext.Provider>
+      </ConsentContext.Provider>
     </AppContext.Provider>
   );
 }
@@ -394,4 +609,10 @@ export function useApp() {
 
 export function useLiveMetrics(): LiveMetrics {
   return useContext(MetricsContext);
+}
+
+/** The consent dialog's state, and `requestConsent` for components that are
+ *  also rendered outside the provider (it then always answers false). */
+export function useConsent(): ConsentContextValue {
+  return useContext(ConsentContext);
 }

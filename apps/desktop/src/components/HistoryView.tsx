@@ -2,6 +2,7 @@ import {
   ArrowUUpLeft,
   DownloadSimple,
   FileText,
+  Lock,
   MagnifyingGlass,
   PencilSimple,
   Sparkle,
@@ -12,7 +13,8 @@ import { type KeyboardEvent, useCallback, useEffect, useLayoutEffect, useRef, us
 import { save } from "@tauri-apps/plugin-dialog";
 import { api, previewOpensNotesTab, subscribeUiEvents } from "../lib/bridge";
 import { formatClock } from "../lib/markdown";
-import { safeFilename, segmentAtOrAfter, setupNeed } from "../lib/notes";
+import { onAssistantChanged, safeFilename, segmentAtOrAfter } from "../lib/notes";
+import { assistantConsentRequest, gatedLabel, useApp } from "../state/AppContext";
 import type {
   AssistantJob,
   AssistantStatus,
@@ -26,6 +28,15 @@ import { AiNotesPanel } from "./AiNotesPanel";
 const formats = ["markdown", "txt", "json", "srt", "vtt"] as const;
 type Tab = "transcript" | "notes";
 const emptyNotes: SessionNotesState = { notes: null, job: null };
+const assistantUnavailable: AssistantStatus = {
+  configured: false,
+  consent: false,
+  provider_group: "",
+  model: "",
+  display_name: "",
+  key_available: false,
+  auto_title: false,
+};
 
 /** A time chip in the notes pointed at this transcript row. */
 interface JumpTarget {
@@ -34,6 +45,7 @@ interface JumpTarget {
 }
 
 export function HistoryView() {
+  const { requestConsent } = useApp();
   const [query, setQuery] = useState("");
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [selected, setSelected] = useState<SessionDetail | null>(null);
@@ -50,6 +62,7 @@ export function HistoryView() {
   const [jump, setJump] = useState<JumpTarget | null>(null);
   const [focusSection, setFocusSection] = useState<number | null>(null);
   const selectedId = useRef<string | null>(null);
+  const detailRef = useRef<HTMLElement>(null);
   const queryRef = useRef("");
   queryRef.current = query;
   selectedId.current = selected?.session.id ?? null;
@@ -70,6 +83,8 @@ export function HistoryView() {
       setError(null);
       try {
         const detail = await api.historyOpen(session.id);
+        // Another lecture starts at its top, not where the last one was left.
+        if (selectedId.current !== detail.session.id) detailRef.current?.scrollTo({ top: 0 });
         selectedId.current = detail.session.id;
         setSelected(detail);
         setTitle(detail.session.title);
@@ -128,18 +143,23 @@ export function HistoryView() {
 
   useEffect(() => {
     void refresh("");
-    void api.assistantStatus().then(setAssistant).catch(() =>
-      setAssistant({
-        configured: false,
-        consent: false,
-        provider_group: "",
-        model: "",
-        display_name: "",
-        key_available: false,
-        auto_title: false,
-      }),
-    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    const load = () =>
+      void api
+        .assistantStatus()
+        .then((status) => active && setAssistant(status))
+        .catch(() => active && setAssistant(assistantUnavailable));
+    load();
+    // Consent granted from the dialog (or changed in Settings) applies here.
+    const unsubscribe = onAssistantChanged(load);
+    return () => {
+      active = false;
+      unsubscribe();
+    };
   }, []);
 
   useEffect(() => {
@@ -216,6 +236,8 @@ export function HistoryView() {
   const generateTitle = async () => {
     if (!selected) return;
     const sessionId = selected.session.id;
+    const gate = assistantConsentRequest(assistant, "title");
+    if (gate && !(await requestConsent(gate))) return;
     setTitlePending(true);
     setError(null);
     try {
@@ -273,32 +295,36 @@ export function HistoryView() {
   };
 
   const clearFocusSection = useCallback(() => setFocusSection(null), []);
-  const titleNeed = setupNeed(assistant);
+  const titleGate = assistantConsentRequest(assistant, "title");
+  const titleLabel = titlePending ? "Generating a title" : titleGate ? gatedLabel("Generate title", titleGate) : "Generate title";
   const notesRunning = notesState.job?.state === "running";
 
   return (
     <div className="history-layout">
-      <section className="history-list-pane">
-        <form
-          className="search-field"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void refresh();
-          }}
-        >
-          <MagnifyingGlass size={17} weight="bold" aria-hidden="true" />
-          <input
-            aria-label="Search transcript history"
-            placeholder="Search sessions or transcript"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-          />
-          {query && (
-            <button type="button" aria-label="Clear search" onClick={() => { setQuery(""); void refresh(""); }}>
-              <X size={15} weight="bold" aria-hidden="true" />
-            </button>
-          )}
-        </form>
+      <section className="history-list-pane" aria-label="Sessions">
+        <div className="history-search-dock">
+          <form
+            className="search-field"
+            role="search"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void refresh();
+            }}
+          >
+            <MagnifyingGlass size={17} weight="bold" aria-hidden="true" />
+            <input
+              aria-label="Search transcript history"
+              placeholder="Search sessions or transcript"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+            />
+            {query && (
+              <button type="button" aria-label="Clear search" onClick={() => { setQuery(""); void refresh(""); }}>
+                <X size={15} weight="bold" aria-hidden="true" />
+              </button>
+            )}
+          </form>
+        </div>
         <div className="history-list-heading">
           <span className="section-kicker">Sessions</span>
           <span>{sessions.length}</span>
@@ -344,7 +370,7 @@ export function HistoryView() {
         )}
       </section>
 
-      <section className="history-detail-pane">
+      <section className="history-detail-pane" ref={detailRef} aria-label="Session detail">
         {error && <p className="inline-error" role="alert">{error}</p>}
         {!selected ? (
           <div className="detail-empty">
@@ -373,15 +399,16 @@ export function HistoryView() {
               <div className="detail-actions">
                 {selected.session.title_source === "default" && (
                   <button
-                    className="icon-button"
+                    className="icon-button icon-button--gated"
                     type="button"
-                    aria-label={titlePending ? "Generating a title" : "Generate title"}
-                    title={titleNeed ? "Set up the AI assistant in Settings to generate titles" : "Generate title"}
-                    disabled={titlePending || Boolean(titleNeed) || selected.segments.length === 0}
+                    aria-label={titleLabel}
+                    title={titleLabel}
+                    disabled={titlePending || selected.segments.length === 0}
                     aria-busy={titlePending || undefined}
                     onClick={() => void generateTitle()}
                   >
                     <Sparkle size={17} weight={titlePending ? "fill" : "regular"} aria-hidden="true" />
+                    {titleGate && !titlePending && <Lock className="gate-badge" size={9} weight="bold" aria-hidden="true" />}
                   </button>
                 )}
                 <button className="icon-button" type="button" aria-label="Rename session" onClick={() => setRenaming(true)}>
@@ -493,6 +520,7 @@ export function HistoryView() {
                   )
                 }
                 onJump={jumpToTranscript}
+                scrollRoot={detailRef}
                 focusSection={tab === "notes" ? focusSection : null}
                 onFocusHandled={clearFocusSection}
               />

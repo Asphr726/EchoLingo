@@ -1,10 +1,10 @@
-import { ArrowSquareOut, CheckCircle, ClosedCaptioning, CloudArrowUp, Key, LockKey, PlugsConnected, SlidersHorizontal, Sparkle, Warning } from "@phosphor-icons/react";
+import { ArrowSquareOut, CheckCircle, ClosedCaptioning, CloudArrowUp, Key, Lock, LockKey, PlugsConnected, SlidersHorizontal, Sparkle, Warning } from "@phosphor-icons/react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { api, subscribeModelProgress } from "../lib/bridge";
 import { GLOSSARY_LIMIT } from "../lib/context";
-import { clearPendingSection, peekPendingSection } from "../lib/navigation";
-import { assistantPresets, credentialNeed, groupHasKey } from "../lib/notes";
-import { providersForGroup } from "../lib/providers";
+import { clearPendingSection, onNavigate, peekPendingSection } from "../lib/navigation";
+import { assistantPresets, credentialNeed, groupHasKey, onAssistantChanged } from "../lib/notes";
+import { providersForGroup, recipientName } from "../lib/providers";
 import { useApp } from "../state/AppContext";
 import type {
   AssistantPreferences,
@@ -43,6 +43,7 @@ const sections = [
 type Section = (typeof sections)[number];
 
 const sectionSlug = (section: Section) => section.toLowerCase().replace(/\s+/g, "-");
+const sectionForSlug = (slug: string | null | undefined) => sections.find((section) => sectionSlug(section) === slug);
 
 /** `?section=cloud-providers` opens a section directly (browser preview and
  *  screenshots); in-app deep links ("Open AI assistant settings") arrive via
@@ -51,12 +52,41 @@ function initialSection(): Section {
   if (typeof window === "undefined") return "General";
   const pending = peekPendingSection();
   const requested = pending ?? new URLSearchParams(window.location.search).get("section");
-  return sections.find((section) => sectionSlug(section) === requested) ?? "General";
+  return sectionForSlug(requested) ?? "General";
 }
 
 export function SettingsView() {
   const [section, setSection] = useState<Section>(initialSection);
+  const layoutRef = useRef<HTMLDivElement>(null);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  // Counts deep links into a section. The control that followed one is
+  // usually gone with the previous view, so focus moves to the heading.
+  const [arrivals, setArrivals] = useState(() => (sectionForSlug(peekPendingSection()) ? 1 : 0));
   useEffect(() => clearPendingSection(), []);
+  // A deep link while Settings is already open switches the section here;
+  // the main window only switches views.
+  useEffect(
+    () =>
+      onNavigate((target) => {
+        const next = target.view === "settings" ? sectionForSlug(target.section) : undefined;
+        if (!next) return;
+        setSection(next);
+        setArrivals((count) => count + 1);
+        clearPendingSection();
+      }),
+    [],
+  );
+  useEffect(() => {
+    if (arrivals === 0) return;
+    // A frame later: the consent dialog that followed the link has closed
+    // by then, so the page is no longer inert.
+    const frame = requestAnimationFrame(() => headingRef.current?.focus({ preventScroll: true }));
+    return () => cancelAnimationFrame(frame);
+  }, [arrivals]);
+  // Each section opens at its top; the section list stays where it is.
+  useEffect(() => {
+    layoutRef.current?.scrollTo({ top: 0 });
+  }, [section]);
   // Availability per credential group; secret values are never held here.
   const [credentialStatus, setCredentialStatus] = useState<Record<string, CredentialGroupStatus>>({});
   const [credentialError, setCredentialError] = useState<string | null>(null);
@@ -74,9 +104,13 @@ export function SettingsView() {
   });
   useEffect(() => {
     let active = true;
-    api.runtimePreferences().then((value) => active && setRuntime(value)).catch(() => undefined);
+    const load = () => api.runtimePreferences().then((value) => active && setRuntime(value)).catch(() => undefined);
+    void load();
+    // Consent granted from a dialog elsewhere updates the AI assistant toggle.
+    const unsubscribe = onAssistantChanged(() => void load());
     return () => {
       active = false;
+      unsubscribe();
     };
   }, []);
   const updateRuntime = async (next: RuntimePreferences) => {
@@ -145,7 +179,7 @@ export function SettingsView() {
   };
 
   return (
-    <div className="settings-layout">
+    <div className="settings-layout" ref={layoutRef}>
       <nav className="settings-nav" aria-label="Settings sections">
         {sections.map((item) => (
           <button
@@ -161,7 +195,7 @@ export function SettingsView() {
       <section className="settings-content">
         <header className="settings-header">
           <span className="section-kicker">Preferences</span>
-          <h2>{section}</h2>
+          <h2 ref={headingRef} tabIndex={-1}>{section}</h2>
         </header>
 
         {section === "General" && (
@@ -460,7 +494,7 @@ function AssistantSettings({
   const statusKnown = Boolean(credentialStatus[preferences.provider_group]);
   // A custom endpoint needs its base URL; its key is optional.
   const needsKey = Boolean(group?.fields.some((field) => field.required));
-  const vendor = group?.vendor || preset?.display_name || "the provider";
+  const vendor = group?.vendor ? recipientName(group.vendor) : preset?.display_name || "the provider";
   const [model, setModel] = useState(preferences.model);
   const [probe, setProbe] = useState<AssistantProbeResult | null>(null);
   const [probeError, setProbeError] = useState<string | null>(null);
@@ -599,7 +633,7 @@ function AssistantSettings({
           </div>
         )}
       </SettingsGroup>
-      <SettingsGroup title="Consent" description="Nothing is sent to the assistant until you allow it here. Audio never leaves this Mac for notes or titles.">
+      <SettingsGroup title="Consent" description="Nothing is sent to the assistant until you allow it, here or the first time you use it. Audio never leaves this Mac for notes or titles.">
         <PrivacyToggle
           icon={<LockKey size={20} weight="regular" aria-hidden="true" />}
           title="Send transcripts and attached files to this model for notes and titles"
@@ -660,6 +694,7 @@ function CredentialGroupCard({
   status: CredentialGroupStatus | null;
   transcriptUploadAllowed: boolean;
 }) {
+  const { requestConsent } = useApp();
   const [values, setValues] = useState<Record<string, string>>({});
   const [settingsDraft, setSettingsDraft] = useState<Record<string, string>>({});
   const [pending, setPending] = useState<"save" | "clear" | "test" | null>(null);
@@ -691,14 +726,18 @@ function CredentialGroupCard({
   const canSave = !pending && !tooShort && (typedCount > 0 ? !missingRequired : settingsChanged);
 
   const asrId = providers.asr?.id ?? null;
+  const recipient = recipientName(group.vendor);
   const translationId = transcriptUploadAllowed ? providers.translation?.id ?? null : null;
-  const canTest = !pending && !sessionActive && configured && Boolean(asrId || translationId);
+  // A translation-only group can test nothing without transcript upload;
+  // Test then asks for it instead of being disabled.
+  const testNeedsConsent = !asrId && !translationId && Boolean(providers.translation);
+  const canTest = !pending && !sessionActive && configured && Boolean(asrId || providers.translation);
   const testHint = sessionActive
     ? "Stop the current session before testing."
     : !configured
       ? "Save the required credentials first."
-      : !asrId && !translationId
-        ? "Enable transcript upload under Privacy to test translation."
+      : testNeedsConsent
+        ? `Test (asks to allow sending text to ${recipient} first)`
         : undefined;
 
   const save = async () => {
@@ -745,12 +784,29 @@ function CredentialGroupCard({
     }
   };
 
-  const test = async () => {
+  /** Transcript upload for this vendor's translation; one fixed sentence is
+   *  all the test itself sends. */
+  const allowTranslation = () =>
+    providers.translation
+      ? requestConsent({
+          kind: "session",
+          transcript: { vendor: recipient, providerLabel: providers.translation.display_name },
+          note: `This test sends one fixed English sentence to ${recipient}, no lecture text and no audio.`,
+        })
+      : Promise.resolve(false);
+
+  const test = async (includeTranslation = false) => {
+    let translation = translationId;
+    if (!translation && providers.translation && (includeTranslation || testNeedsConsent)) {
+      if (!(await allowTranslation())) return;
+      translation = providers.translation.id;
+    }
+    if (!asrId && !translation) return;
     setPending("test");
     setError(null);
     setProbe(null);
     try {
-      setProbe(await api.probeCloud(asrId, translationId));
+      setProbe(await api.probeCloud(asrId, translation));
     } catch (failure) {
       setError(String(failure));
     } finally {
@@ -823,12 +879,20 @@ function CredentialGroupCard({
       </div>
       <p className="settings-helper">
         {providers.translation
-          ? `Test sends one fixed English sentence to ${group.vendor} when transcript upload is enabled; recognition tests never upload audio.`
+          ? `Test sends one fixed English sentence to ${recipient} when transcript upload is enabled; recognition tests never upload audio.`
           : "Test completes the authenticated handshake only and never uploads audio."}
       </p>
       {tooShort && <p className="settings-error" role="alert">{tooShort.label} must be at least {tooShort.min_len} characters.</p>}
       {error && <p className="settings-error" role="alert">{error}</p>}
-      {probe && <ProbeResult group={group} probe={probe} translationTested={Boolean(translationId)} translationAvailable={Boolean(providers.translation)} />}
+      {probe && (
+        <ProbeResult
+          group={group}
+          probe={probe}
+          translationTested={probe.translation.status !== "skipped"}
+          translationAvailable={Boolean(providers.translation)}
+          onIncludeTranslation={pending || sessionActive ? undefined : () => void test(true)}
+        />
+      )}
       <div className="settings-inline">
         <button className="button button--primary" type="button" disabled={!canSave} onClick={() => void save()}>
           <Key size={18} weight="regular" aria-hidden="true" />
@@ -840,6 +904,12 @@ function CredentialGroupCard({
         <button className="button" type="button" disabled={!canTest} title={testHint} onClick={() => void test()}>
           <PlugsConnected size={18} weight="regular" aria-hidden="true" />
           {pending === "test" ? "Testing…" : "Test"}
+          {testNeedsConsent && canTest && (
+            <>
+              <Lock className="gate-lock" size={12} weight="bold" aria-hidden="true" />
+              <span className="visually-hidden">{` (asks to allow sending text to ${recipient} first)`}</span>
+            </>
+          )}
         </button>
       </div>
     </article>
@@ -848,6 +918,7 @@ function CredentialGroupCard({
 
 function ProbeResult({
   group,
+  onIncludeTranslation,
   probe,
   translationAvailable,
   translationTested,
@@ -856,6 +927,8 @@ function ProbeResult({
   probe: CloudProbeResult;
   translationAvailable: boolean;
   translationTested: boolean;
+  /** Asks for transcript upload, then tests again with translation. */
+  onIncludeTranslation?: () => void;
 }) {
   const showRegion = group.id === "dashscope" && (probe.region || probe.host || probe.workspace_scoped != null);
   return (
@@ -873,12 +946,18 @@ function ProbeResult({
       {probe.message && <small>{probe.message}{probe.code ? ` (${probe.code})` : ""}</small>}
       <small>
         Audio uploaded: {probe.audio_uploaded ? "yes" : "no"}
-        {translationTested
-          ? ` · One fixed sentence was sent to ${group.vendor}.`
-          : translationAvailable
-            ? " · Enable transcript upload to include translation in this test."
-            : ""}
+        {translationTested ? ` · One fixed sentence was sent to ${recipientName(group.vendor)}.` : ""}
       </small>
+      {!translationTested && translationAvailable && (
+        onIncludeTranslation ? (
+          <button className="text-button" type="button" onClick={onIncludeTranslation}>
+            <Lock size={12} weight="bold" aria-hidden="true" />
+            Include translation in the test…
+          </button>
+        ) : (
+          <small>Translation was not tested; it needs transcript upload.</small>
+        )
+      )}
     </div>
   );
 }

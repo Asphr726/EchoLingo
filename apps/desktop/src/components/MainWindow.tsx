@@ -5,14 +5,17 @@ import {
   Waveform,
   X,
 } from "@phosphor-icons/react";
-import { useState } from "react";
-import { useApp } from "../state/AppContext";
+import { useEffect, useState } from "react";
+import { previewConsentRequest } from "../lib/bridge";
+import { type AppView, onNavigate } from "../lib/navigation";
+import { useApp, useConsent } from "../state/AppContext";
+import { ConsentDialog } from "./ConsentDialog";
 import { HistoryView } from "./HistoryView";
 import { LiveView } from "./LiveView";
 import { Onboarding } from "./Onboarding";
 import { SettingsView } from "./SettingsView";
 
-type View = "live" | "history" | "settings";
+type View = AppView;
 
 const views = [
   { id: "live" as const, label: "Live", icon: Waveform },
@@ -26,10 +29,28 @@ export function MainWindow() {
     return requested === "history" || requested === "settings" ? requested : "live";
   });
   const { clearError, error, loading, onboardingComplete, snapshot } = useApp();
+  const consent = useConsent();
+  const { requestConsent } = consent;
   const activeRoute = snapshot.route?.deployment ?? "not routed";
 
+  // Deep links ("Open AI assistant settings") switch the view in place.
+  useEffect(() => onNavigate((target) => setView(target.view)), []);
+
+  // Browser preview only: `?consent=session|assistant|setup` opens a dialog.
+  useEffect(() => {
+    const preview = previewConsentRequest();
+    if (preview) void requestConsent(preview);
+  }, [requestConsent]);
+
+  const dialog = <ConsentDialog request={consent.request} onConfirm={consent.confirm} onDismiss={consent.dismiss} />;
+
   if (!loading && !onboardingComplete) {
-    return <Onboarding />;
+    return (
+      <>
+        <Onboarding />
+        {dialog}
+      </>
+    );
   }
 
   return (
@@ -91,6 +112,7 @@ export function MainWindow() {
           {view === "settings" && <SettingsView />}
         </div>
       </section>
+      {dialog}
     </main>
   );
 }

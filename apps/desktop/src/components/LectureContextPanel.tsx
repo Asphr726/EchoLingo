@@ -3,17 +3,17 @@ import { useEffect, useId, useState } from "react";
 import { api } from "../lib/bridge";
 import { contextLineCount, isEmptyImport, mergeContext, SESSION_CONTEXT_LIMIT } from "../lib/context";
 import { requestNavigation } from "../lib/navigation";
-import { setupNeed } from "../lib/notes";
-import { useApp } from "../state/AppContext";
+import { onAssistantChanged, setupNeed } from "../lib/notes";
+import { assistantConsentRequest, useApp } from "../state/AppContext";
 import type { AssistantStatus } from "../types";
 
 const PLACEHOLDER =
   "Topic, names and terms — one per line. Example: Béla Julesz · saccade · pre-attentive vision = 前注意视觉";
 
-/** Per-lecture topic and terms (docs/adr/0006), sent with the next Start as
+/** Per-lecture topic and terms, sent with the next Start as
  *  `session_context`. Read-only while a session runs. */
 export function LectureContextPanel({ locked }: { locked: boolean }) {
-  const { draft, setDraft, snapshot } = useApp();
+  const { askConsent, draft, setDraft, snapshot } = useApp();
   const value = locked ? snapshot.config?.session_context ?? draft.session_context : draft.session_context;
   const [open, setOpen] = useState(!locked);
   const [assistant, setAssistant] = useState<AssistantStatus | null>(null);
@@ -25,12 +25,16 @@ export function LectureContextPanel({ locked }: { locked: boolean }) {
 
   useEffect(() => {
     let active = true;
-    void api
-      .assistantStatus()
-      .then((status) => active && setAssistant(status))
-      .catch(() => undefined);
+    const load = () =>
+      void api
+        .assistantStatus()
+        .then((status) => active && setAssistant(status))
+        .catch(() => undefined);
+    load();
+    const unsubscribe = onAssistantChanged(load);
     return () => {
       active = false;
+      unsubscribe();
     };
   }, []);
 
@@ -39,14 +43,25 @@ export function LectureContextPanel({ locked }: { locked: boolean }) {
   }, [locked]);
 
   const useLlm = assistant !== null && setupNeed(assistant) === null;
+  // Set up but not yet allowed: Import asks whether to use it this time.
+  const askLlm = assistant !== null && setupNeed(assistant) === "consent";
   const lines = contextLineCount(value);
 
   const importSlides = async () => {
+    let llm = useLlm;
+    const gate = askLlm ? assistantConsentRequest(assistant, "import") : null;
+    if (gate) {
+      const answer = await askConsent(gate);
+      // "Extract on this Mac" imports without the assistant; Esc or Close
+      // cancels the import.
+      if (answer === "cancelled") return;
+      llm = answer === "granted";
+    }
     setImporting(true);
     setError(null);
     setNotice(null);
     try {
-      const result = await api.importContextFiles(useLlm);
+      const result = await api.importContextFiles(llm);
       // The shell answers a cancelled picker with an empty result.
       if (isEmptyImport(result)) return;
       // The native picker is modal, so the draft has not changed meanwhile;
@@ -105,7 +120,9 @@ export function LectureContextPanel({ locked }: { locked: boolean }) {
           <span className="lecture-context-hint">
             {useLlm
               ? `Slide text is sent to ${assistant?.display_name || "the AI assistant"} to pick out terms and translations.`
-              : "Text is extracted on this Mac."}
+              : askLlm
+                ? `Text is extracted on this Mac. ${assistant?.display_name || "The AI assistant"} can also pick out terms if you allow it.`
+                : "Text is extracted on this Mac."}
           </span>
           <span id={countId} className={value.length > SESSION_CONTEXT_LIMIT * 0.9 ? "char-count char-count--near" : "char-count"}>
             {value.length.toLocaleString("en-US")} / {SESSION_CONTEXT_LIMIT.toLocaleString("en-US")}

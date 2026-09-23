@@ -9,8 +9,9 @@ import {
   needsAudioUpload,
   needsTranscriptUpload,
   providerLabel,
-  providerVendor,
   providersForGroup,
+  providerVendor,
+  recipientName,
   supportsLanguage,
 } from "./providers";
 
@@ -68,6 +69,8 @@ describe("providerLabel / providerVendor", () => {
     expect(providerVendor(catalog, "translation", "deepl")).toBe("DeepL");
     expect(providerVendor(catalog, "asr", "qwen_cloud")).toBe("Alibaba Cloud");
     expect(providerVendor(null, "asr", "deepgram")).toBe("deepgram");
+    expect(recipientName("Custom")).toBe("your custom endpoint");
+    expect(recipientName("DeepL")).toBe("DeepL");
   });
 });
 
