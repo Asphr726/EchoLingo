@@ -238,3 +238,253 @@ async def test_sidecar_cloud_probe_is_available_without_a_session(monkeypatch) -
     assert event["payload"]["result"]["audio_uploaded"] is False
     # The legacy shape still means "Qwen Cloud"; the new shape names providers.
     assert calls == [("qwen_cloud", "qwen_cloud"), (None, "deepl")]
+
+
+# --------------------------------------------------------------- AI assistant
+
+
+class ScriptedWebSocket:
+    """Feeds scripted client messages to ``SidecarConnection.run`` and
+    records what the sidecar sends."""
+
+    def __init__(self) -> None:
+        self.incoming: asyncio.Queue[str | None] = asyncio.Queue()
+        self.sent: list[dict] = []
+        self.changed = asyncio.Event()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> str:
+        item = await self.incoming.get()
+        if item is None:
+            raise StopAsyncIteration
+        return item
+
+    async def send(self, value: str) -> None:
+        self.sent.append(json.loads(value))
+        self.changed.set()
+
+    async def close(self, **_kwargs) -> None:
+        await self.incoming.put(None)
+
+    def push(self, message: dict) -> None:
+        self.incoming.put_nowait(json.dumps(message))
+
+    async def wait_for(self, predicate, timeout: float = 2.0) -> dict:
+        async def poll() -> dict:
+            while True:
+                for event in self.sent:
+                    if predicate(event):
+                        return event
+                self.changed.clear()
+                await self.changed.wait()
+
+        return await asyncio.wait_for(poll(), timeout)
+
+
+class ProbeClient:
+    provider = "dashscope"
+    model = "qwen-plus"
+
+    def __init__(self, gate: asyncio.Event | None = None) -> None:
+        self.gate = gate
+        self.started = asyncio.Event()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc) -> None:
+        return None
+
+    async def complete(self, messages, **_kwargs):
+        from echolingo.assistant.llm import ChatResult
+
+        self.started.set()
+        if self.gate is not None:
+            await self.gate.wait()
+        return ChatResult(text="OK", finish_reason="stop", usage={})
+
+
+def assistant_with(client) -> "AssistantService":
+    from echolingo.assistant.service import AssistantService
+
+    return AssistantService(environ={}, client_factory=lambda _llm, _env: client)
+
+
+def result_for(request_id: str):
+    return lambda event: (
+        event["type"] == "assistant_result" and event["payload"]["request_id"] == request_id
+    )
+
+
+async def test_hello_accepted_advertises_assistant_capabilities() -> None:
+    websocket = ScriptedWebSocket()
+    connection = SidecarConnection(websocket, "secret")
+    await connection._command(
+        {
+            "type": "hello",
+            "payload": {"protocol_version": 1, "authentication_token": "secret", "build": "t", "capabilities": []},
+        }
+    )
+    accepted = websocket.sent[-1]
+    assert accepted["type"] == "hello_accepted"
+    assert accepted["payload"]["capabilities"] == ["assistant.v1", "asr_context.v1"]
+
+
+async def test_malformed_assistant_request_fails_without_closing_the_connection() -> None:
+    websocket = ScriptedWebSocket()
+    connection = SidecarConnection(websocket, "secret", assistant=assistant_with(ProbeClient()))
+    runner = asyncio.create_task(connection.run())
+    websocket.push(
+        {
+            "type": "hello",
+            "payload": {"protocol_version": 1, "authentication_token": "secret", "build": "t", "capabilities": []},
+        }
+    )
+    await websocket.wait_for(lambda event: event["type"] == "hello_accepted")
+
+    websocket.push({"type": "assistant_request", "payload": {"request_id": "bad-1", "task": "notes", "payload": "???"}})
+    websocket.push({"type": "assistant_request", "payload": {"request_id": "bad-2", "task": "dance", "payload": {}}})
+    websocket.push({"type": "assistant_request", "payload": "not an object"})
+    websocket.push({"type": "assistant_request"})
+    for request_id in ("bad-1", "bad-2"):
+        failed = await websocket.wait_for(result_for(request_id))
+        assert failed["payload"]["ok"] is False
+        assert failed["payload"]["result"]["code"] == "invalid_request"
+
+    # The same connection still serves requests.
+    websocket.push(
+        {
+            "type": "assistant_request",
+            "payload": {"request_id": "probe-1", "task": "probe", "payload": {"llm": {"group": "dashscope"}}},
+        }
+    )
+    probe = await websocket.wait_for(result_for("probe-1"))
+    assert probe["payload"]["ok"] is True
+    assert probe["payload"]["result"]["model"] == "qwen-plus"
+    assert not any(event["type"] == "error" for event in websocket.sent)
+    assert not runner.done()
+
+    websocket.push({"type": "shutdown"})
+    await asyncio.wait_for(runner, 2)
+
+
+async def test_assistant_cancel_stops_the_task_and_reports_cancelled() -> None:
+    gate = asyncio.Event()
+    client = ProbeClient(gate)
+    websocket = ScriptedWebSocket()
+    connection = SidecarConnection(websocket, "secret", assistant=assistant_with(client))
+    connection.authenticated = True
+    request = {"request_id": "job-1", "task": "probe", "payload": {"llm": {"group": "dashscope"}}}
+    await connection._command({"type": "assistant_request", "payload": request})
+    await asyncio.wait_for(client.started.wait(), 2)
+    # A duplicate id does not start a second job; an unknown cancel is ignored.
+    await connection._command({"type": "assistant_request", "payload": request})
+    await connection._command({"type": "assistant_cancel", "payload": {"request_id": "other"}})
+    await connection._command({"type": "assistant_cancel", "payload": "junk"})
+    assert list(connection.assistant_tasks) == ["job-1"]
+
+    await connection._command({"type": "assistant_cancel", "payload": {"request_id": "job-1"}})
+    await asyncio.gather(*connection.background_tasks, return_exceptions=True)
+    events = []
+    while not connection.events.empty():
+        events.append(connection.events.get_nowait())
+    results = [event for event in events if event["type"] == "assistant_result"]
+    assert len(results) == 1
+    assert results[0]["payload"] == {
+        "request_id": "job-1",
+        "ok": False,
+        "result": {"code": "cancelled", "message": "The assistant task was cancelled."},
+    }
+    assert connection.assistant_tasks == {}
+    assert connection.assistant.running == 0
+
+
+async def test_cancel_before_the_task_runs_still_reports_one_result() -> None:
+    client = ProbeClient()
+    websocket = ScriptedWebSocket()
+    connection = SidecarConnection(websocket, "secret", assistant=assistant_with(client))
+    connection.authenticated = True
+    request = {"request_id": "job-early", "task": "probe", "payload": {"llm": {"group": "dashscope"}}}
+    # No await between the two commands: the task is cancelled before its
+    # first step, so ``handle`` never runs.
+    await connection._command({"type": "assistant_request", "payload": request})
+    await connection._command({"type": "assistant_cancel", "payload": {"request_id": "job-early"}})
+    await asyncio.gather(*connection.background_tasks, return_exceptions=True)
+    await asyncio.sleep(0)
+    events = []
+    while not connection.events.empty():
+        events.append(connection.events.get_nowait())
+    assert not client.started.is_set()
+    assert events == [
+        {
+            "type": "assistant_result",
+            "payload": {
+                "request_id": "job-early",
+                "ok": False,
+                "result": {"code": "cancelled", "message": "The assistant task was cancelled."},
+            },
+        }
+    ]
+    assert connection.assistant_tasks == {}
+
+
+async def test_session_finished_is_queued_after_the_last_session_events() -> None:
+    class FinishingSession:
+        alignment_capture = None
+
+        def __init__(self, events: asyncio.Queue) -> None:
+            self.events = events
+
+        async def finish(self) -> None:
+            self.events.put_nowait({"type": "transcript", "payload": {"text": "last words"}})
+            self.events.put_nowait({"type": "translation", "payload": {"text": "最后"}})
+
+        async def align(self) -> int:
+            return 0
+
+        async def close(self) -> None:
+            return None
+
+    websocket = ScriptedWebSocket()
+    connection = SidecarConnection(websocket, "secret")
+    connection.authenticated = True
+    connection.events.put_nowait({"type": "metrics", "payload": {}})
+    connection.session = FinishingSession(connection.events)
+    await connection._command({"type": "finish_session", "payload": {"session_id": "s-1"}})
+    await asyncio.gather(*connection.background_tasks, return_exceptions=True)
+    assert websocket.sent == []  # nothing bypasses the ordered queue
+    order = []
+    while not connection.events.empty():
+        order.append(connection.events.get_nowait())
+    assert [event["type"] for event in order] == ["metrics", "transcript", "translation", "session_finished"]
+    assert order[-1]["payload"] == {"session_id": "s-1"}
+    assert connection.session is None
+
+
+async def test_sidecar_accepts_large_assistant_messages(monkeypatch, capsys) -> None:
+    from echolingo.service import server
+
+    captured: dict = {}
+
+    class FakeServer:
+        sockets: list = []
+
+        async def serve_forever(self) -> None:
+            return None
+
+    class FakeServe:
+        def __init__(self, _handler, _host, _port, **kwargs) -> None:
+            captured.update(kwargs)
+
+        async def __aenter__(self) -> FakeServer:
+            return FakeServer()
+
+        async def __aexit__(self, *_exc) -> None:
+            return None
+
+    monkeypatch.setattr(server, "serve", FakeServe)
+    await server.run_server("127.0.0.1", 0, "token")
+    assert captured["max_size"] == 8 * 1024 * 1024
+    assert '"status": "ready"' in capsys.readouterr().out

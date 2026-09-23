@@ -1,35 +1,69 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AssistantJob,
+  AssistantProbeResult,
+  AssistantStatus,
   AudioDevice,
   AudioPermissionStatus,
   AudioTestResult,
   CaptionPreferences,
   CloudProbeResult,
+  ContextImportResult,
   CredentialGroupStatus,
   ModelProgress,
+  NoteAttachment,
   ProviderCatalog,
   RuntimePreferences,
   ModelStatus,
   SessionDetail,
+  SessionNotes,
+  SessionNotesState,
   SessionRecord,
   SessionSnapshot,
   StartSessionRequest,
   UiEventEnvelope,
 } from "../types";
 import { defaultAssistantPreferences, defaultCaptionPreferences, defaultSessionDefaults, emptySnapshot } from "../types";
+import { PreviewAssistant, previewAttachments, previewContextImport, previewNotesMode } from "./previewNotes";
 // The committed catalog doubles as the browser-preview fixture. In the
 // desktop runtime the shell serves the same document via `list_providers`.
 import providerCatalogJson from "../../../../configs/providers.json";
 
 const previewCatalog = providerCatalogJson as unknown as ProviderCatalog;
 
-const isTauri = () => "__TAURI_INTERNALS__" in window;
+const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 /** `?preview=live` in a plain browser replays a scripted bilingual session so
  *  the live layout can be designed and reviewed without model runtimes. */
 const previewMode = () =>
-  !isTauri() && new URLSearchParams(window.location.search).get("preview") === "live";
+  typeof window !== "undefined" &&
+  !isTauri() &&
+  new URLSearchParams(window.location.search).get("preview") === "live";
+
+/** `&phase=idle` keeps the preview before Start (session setup, lecture
+ *  context) instead of replaying a running session. */
+const previewIdle = () =>
+  previewMode() && new URLSearchParams(window.location.search).get("phase") === "idle";
+
+/** Files the attachment sheet starts with in `?notes=sheet` previews. */
+export function previewInitialAttachments(): NoteAttachment[] {
+  return previewMode() && previewNotesMode() === "sheet" ? previewAttachments.slice(0, 2) : [];
+}
+
+/** `?notes=…` previews open History on the AI notes tab. */
+export function previewOpensNotesTab(): boolean {
+  return previewMode() && new URLSearchParams(window.location.search).has("notes");
+}
+
+/** True when the preview asks the AI notes panel to open its attachment sheet. */
+export function previewOpensAttachmentSheet(): boolean {
+  return previewMode() && previewNotesMode() === "sheet";
+}
+
+let previewAssistantInstance: PreviewAssistant | null = null;
+const previewAssistant = () =>
+  (previewAssistantInstance ??= new PreviewAssistant((kind, payload, sessionId) => emitPreview(kind, payload, sessionId)));
 
 export async function command<T>(name: string, args?: Record<string, unknown>): Promise<T> {
   if (!isTauri()) {
@@ -40,7 +74,7 @@ export async function command<T>(name: string, args?: Record<string, unknown>): 
 
 function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
   const values: Record<string, unknown> = {
-    get_app_snapshot: previewMode()
+    get_app_snapshot: previewMode() && !previewIdle()
       ? {
           ...emptySnapshot,
           phase: "LISTENING",
@@ -86,23 +120,17 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
     get_runtime_preferences: {
       preload_local_models: true,
       providers: {},
-      assistant: defaultAssistantPreferences,
+      assistant: previewMode() && previewNotesMode() !== "unconfigured"
+        ? { provider_group: "dashscope", model: "", transcript_upload_allowed: true, auto_title: true }
+        : defaultAssistantPreferences,
     } satisfies RuntimePreferences,
-    get_session_defaults: defaultSessionDefaults,
-    history_search: previewMode() ? [previewSessionRecord()] : [],
-    history_open: previewMode()
-      ? ({
-          session: previewSessionRecord(),
-          segments: previewScript.map(([source, target], index) => ({
-            id: `preview-history-${index}`,
-            start_ms: index * 6_500,
-            end_ms: index * 6_500 + 6_000,
-            source_text: source,
-            translated_text: index === 3 ? "" : target,
-            timestamp_quality: "forced",
-          })),
-        } satisfies SessionDetail)
-      : undefined,
+    get_session_defaults: previewMode()
+      ? {
+          ...defaultSessionDefaults,
+          session_context: "CS180 Lecture 12: colour spaces and texture perception\nBéla Julesz · Anne Treisman\nsaccade = 眼跳\npre-attentive vision = 前注意视觉",
+          glossary: "# Course-wide terms\nconvolution = 卷积\nGaussian pyramid = 高斯金字塔\nAlyosha Efros",
+        }
+      : defaultSessionDefaults,
     list_providers: previewCatalog,
     credential_status: previewCatalog.credential_groups.map((group) =>
       previewGroupStatus(group.id, previewMode() && group.id === "dashscope" ? "keychain" : "none"),
@@ -144,6 +172,36 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
       assistant: defaultAssistantPreferences,
     } satisfies RuntimePreferences as T;
   }
+  if (previewMode()) {
+    const assistant = previewAssistant();
+    switch (name) {
+      case "history_search":
+        return assistant.search(String(args?.query ?? "")) as T;
+      case "history_open":
+        return assistant.open(String(args?.sessionId)) as T;
+      case "history_rename":
+      case "history_delete":
+        return undefined as T;
+      case "assistant_status":
+        return assistant.status() as T;
+      case "assistant_probe":
+        return assistant.probe() as T;
+      case "get_session_notes":
+        return assistant.sessionNotes(String(args?.sessionId)) as T;
+      case "pick_note_attachments":
+        return assistant.pick() as T;
+      case "create_session_notes":
+        return assistant.create(String(args?.sessionId)) as T;
+      case "cancel_session_notes":
+        assistant.cancel(String(args?.jobId));
+        return undefined as T;
+      case "generate_session_title":
+        return assistant.title(String(args?.sessionId)) as T;
+      case "import_context_files":
+        return previewContextImport as T;
+    }
+  }
+  if (name === "history_search") return [] as T;
   if (name === "probe_cloud" && previewMode()) {
     return previewProbe(
       (args?.asrProvider as string | null | undefined) ?? null,
@@ -207,8 +265,35 @@ function previewProbe(asrProvider: string | null, translationProvider: string | 
 export async function subscribeUiEvents(
   handler: (event: UiEventEnvelope) => void,
 ): Promise<UnlistenFn> {
-  if (!isTauri()) return previewMode() ? startPreviewFeed(handler) : () => undefined;
+  if (!isTauri()) return previewMode() ? subscribePreview(handler) : () => undefined;
   return listen<UiEventEnvelope>("echolingo://ui-event", ({ payload }) => handler(payload));
+}
+
+// Preview events fan out to every subscriber (the app shell and History),
+// like the shell's event channel does. The scripted live feed runs while at
+// least one subscriber is listening.
+const previewHandlers = new Set<(event: UiEventEnvelope) => void>();
+let previewSequence = 0;
+
+function emitPreview(kind: UiEventEnvelope["kind"], payload: unknown, sessionId: string | null) {
+  const event: UiEventEnvelope = {
+    schema_version: 1,
+    sequence: ++previewSequence,
+    session_id: sessionId,
+    kind,
+    emitted_at_unix_ms: Date.now(),
+    payload,
+  };
+  for (const handler of [...previewHandlers]) handler(event);
+}
+
+function subscribePreview(handler: (event: UiEventEnvelope) => void): UnlistenFn {
+  previewHandlers.add(handler);
+  if (previewHandlers.size === 1 && !previewIdle()) startPreviewFeed();
+  return () => {
+    previewHandlers.delete(handler);
+    if (previewHandlers.size === 0) previewFeedToken += 1;
+  };
 }
 
 // Sentences recorded from a real local replay (Qwen3-ASR 0.6B + Hy-MT2 1.8B).
@@ -221,41 +306,14 @@ const previewScript: Array<[string, string]> = [
   ["If you see this color organization this way, but if you have to pick.", "如果你这样理解这种颜色排列方式，但当你必须做出选择时……"],
 ];
 
-function previewSessionRecord(): SessionRecord {
-  return {
-    id: "preview-session",
-    title: "en → zh lecture",
-    status: "completed",
-    started_at: new Date(Date.now() - 3_600_000).toISOString(),
-    ended_at: new Date().toISOString(),
-    source_language: "en",
-    target_language: "zh",
-    audio_source: "microphone",
-    audio_profile: "lecture",
-    inference_mode: "auto",
-    asr_backend: "qwen_local",
-    translation_backend: "hymt_local",
-    route_reason: "preview",
-  };
-}
-
 let previewFeedToken = 0;
 
-function startPreviewFeed(handler: (event: UiEventEnvelope) => void): UnlistenFn {
+function startPreviewFeed(): void {
   // React StrictMode mounts effects twice in development; only the newest
   // feed stays alive.
   const token = ++previewFeedToken;
-  let sequence = 0;
   const isCancelled = () => token !== previewFeedToken;
-  const emit = (kind: UiEventEnvelope["kind"], payload: unknown) =>
-    handler({
-      schema_version: 1,
-      sequence: ++sequence,
-      session_id: "preview-session",
-      kind,
-      emitted_at_unix_ms: Date.now(),
-      payload,
-    });
+  const emit = (kind: UiEventEnvelope["kind"], payload: unknown) => emitPreview(kind, payload, "preview-session");
   const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
   void (async () => {
     let revision = 0;
@@ -363,9 +421,6 @@ function startPreviewFeed(handler: (event: UiEventEnvelope) => void): UnlistenFn
     }
     window.clearInterval(metricsTimer);
   })();
-  return () => {
-    if (token === previewFeedToken) previewFeedToken += 1;
-  };
 }
 
 export async function subscribeModelProgress(
@@ -441,4 +496,37 @@ export const api = {
     command<string>("history_export", { sessionId, format }),
   historyExportToPath: (sessionId: string, format: string, path: string) =>
     command<void>("history_export_to_path", { sessionId, format, path }),
+
+  // AI assistant (docs/adr/0006). Transcripts and attachments leave the
+  // device only through these commands, gated in Rust and Python by the
+  // assistant's consent flag.
+  assistantStatus: () => command<AssistantStatus>("assistant_status"),
+  /** Sends one fixed prompt, never a transcript. */
+  assistantProbe: () => command<AssistantProbeResult>("assistant_probe"),
+  /** Saved notes plus any running job (with its text so far). */
+  sessionNotes: async (sessionId: string) =>
+    normalizeNotesState(await command<unknown>("get_session_notes", { sessionId })),
+  /** Native picker in the shell; paths never reach the webview. */
+  pickNoteAttachments: () => command<NoteAttachment[]>("pick_note_attachments"),
+  createSessionNotes: (sessionId: string, attachmentIds: string[]) =>
+    command<{ job_id: string }>("create_session_notes", { sessionId, attachmentIds }),
+  cancelSessionNotes: (jobId: string) => command<void>("cancel_session_notes", { jobId }),
+  generateSessionTitle: (sessionId: string) =>
+    command<{ title: string; applied?: boolean }>("generate_session_title", { sessionId }),
+  /** Opens the native picker itself; `useLlm` only when the assistant is
+   *  configured and consented. */
+  importContextFiles: (useLlm: boolean) =>
+    command<ContextImportResult>("import_context_files", { useLlm }),
 };
+
+/** `get_session_notes` returns `{notes, job}`; tolerate a bare
+ *  `SessionNotes | null` from an older shell. */
+export function normalizeNotesState(value: unknown): SessionNotesState {
+  if (!value || typeof value !== "object") return { notes: null, job: null };
+  const record = value as Record<string, unknown>;
+  if ("markdown" in record) return { notes: record as unknown as SessionNotes, job: null };
+  return {
+    notes: (record.notes as SessionNotes | null | undefined) ?? null,
+    job: (record.job as AssistantJob | null | undefined) ?? null,
+  };
+}

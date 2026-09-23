@@ -182,6 +182,77 @@
       "vendor": "Gladia"
     }
   ],
+  "assistant": [
+    {
+      "default_model": "qwen-plus",
+      "display_name": "Qwen (Alibaba Model Studio)",
+      "group_id": "dashscope",
+      "models": [
+        "qwen-plus",
+        "qwen-max",
+        "qwen-turbo",
+        "qwen-long"
+      ]
+    },
+    {
+      "default_model": "gpt-4o-mini",
+      "display_name": "OpenAI",
+      "group_id": "openai",
+      "models": [
+        "gpt-4o-mini",
+        "gpt-4o",
+        "gpt-4.1-mini"
+      ]
+    },
+    {
+      "default_model": "deepseek-chat",
+      "display_name": "DeepSeek",
+      "group_id": "deepseek",
+      "models": [
+        "deepseek-chat"
+      ]
+    },
+    {
+      "default_model": "gemini-2.0-flash",
+      "display_name": "Google Gemini",
+      "group_id": "gemini",
+      "models": [
+        "gemini-2.0-flash",
+        "gemini-2.5-flash"
+      ]
+    },
+    {
+      "default_model": "llama-3.3-70b-versatile",
+      "display_name": "Groq",
+      "group_id": "groq",
+      "models": [
+        "llama-3.3-70b-versatile"
+      ]
+    },
+    {
+      "default_model": "openai/gpt-4o-mini",
+      "display_name": "OpenRouter",
+      "group_id": "openrouter",
+      "models": [
+        "openai/gpt-4o-mini"
+      ]
+    },
+    {
+      "default_model": "Qwen/Qwen2.5-72B-Instruct",
+      "display_name": "SiliconFlow",
+      "group_id": "siliconflow",
+      "models": [
+        "Qwen/Qwen2.5-72B-Instruct",
+        "deepseek-ai/DeepSeek-V3"
+      ]
+    },
+    {
+      "default_model": "",
+      "display_name": "Custom OpenAI-compatible endpoint",
+      "group_id": "custom_openai",
+      "models": []
+    }
+  ],
   "credential_groups": [
     {
       "display_name": "Qwen Cloud (Alibaba Model Studio)",

@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 pub mod providers;
 pub use providers::{
-    catalog, catalog_digest, catalog_value, CredentialField, CredentialGroup, Locality,
-    ProviderCatalog, ProviderKind, ProviderSetting, ProviderSpec,
+    catalog, catalog_digest, catalog_value, AssistantPreset, CredentialField, CredentialGroup,
+    Locality, ProviderCatalog, ProviderKind, ProviderSetting, ProviderSpec,
 };
 
 pub const PRODUCT_PHASE: &str = "phase4";
@@ -88,6 +88,109 @@ pub struct StartSessionRequest {
 /// Upper bounds shared by the shell's validation and the UI counters.
 pub const SESSION_CONTEXT_MAX_CHARS: usize = 2000;
 pub const GLOSSARY_MAX_CHARS: usize = 4000;
+
+/// Check the free-text session fields against their documented bounds
+/// (characters, not bytes). NUL is rejected because it cannot round-trip
+/// through every provider API.
+pub fn validate_session_text(request: &StartSessionRequest) -> Result<(), SessionError> {
+    for (field, value, limit) in [
+        (
+            "session context",
+            request.session_context.as_str(),
+            SESSION_CONTEXT_MAX_CHARS,
+        ),
+        ("glossary", request.glossary.as_str(), GLOSSARY_MAX_CHARS),
+    ] {
+        if value.chars().count() > limit {
+            return Err(SessionError::InvalidSessionText(format!(
+                "{field} is limited to {limit} characters"
+            )));
+        }
+        if value.contains('\0') {
+            return Err(SessionError::InvalidSessionText(format!(
+                "{field} contains a NUL character"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Upper bound for a user-typed assistant model name.
+pub const ASSISTANT_MODEL_MAX_CHARS: usize = 100;
+
+/// AI assistant used for session notes and titles (`RuntimePreferences.assistant`,
+/// docs/adr/0006). Holds no secrets: keys come from the credential cards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AssistantPreferences {
+    /// Credential group id of a catalog assistant preset; "" = not configured.
+    pub provider_group: String,
+    /// Model name; "" = the preset default.
+    pub model: String,
+    /// Explicit consent to send transcripts and attachments to the model.
+    pub transcript_upload_allowed: bool,
+    /// Name sessions with the assistant when they end.
+    pub auto_title: bool,
+}
+
+impl Default for AssistantPreferences {
+    fn default() -> Self {
+        Self {
+            provider_group: String::new(),
+            model: String::new(),
+            transcript_upload_allowed: false,
+            auto_title: true,
+        }
+    }
+}
+
+impl AssistantPreferences {
+    /// Trimmed copy validated against `catalog`: the group must be empty or
+    /// an assistant preset, the model at most [`ASSISTANT_MODEL_MAX_CHARS`]
+    /// characters without control characters.
+    pub fn normalized(&self, catalog: &ProviderCatalog) -> Result<Self, String> {
+        let provider_group = self.provider_group.trim().to_string();
+        if !provider_group.is_empty() && catalog.assistant_preset(&provider_group).is_none() {
+            return Err(format!(
+                "'{provider_group}' is not an AI assistant provider"
+            ));
+        }
+        let model = self.model.trim().to_string();
+        if model.chars().count() > ASSISTANT_MODEL_MAX_CHARS {
+            return Err(format!(
+                "assistant model name is limited to {ASSISTANT_MODEL_MAX_CHARS} characters"
+            ));
+        }
+        if model.chars().any(char::is_control) {
+            return Err("assistant model name contains control characters".into());
+        }
+        Ok(Self {
+            provider_group,
+            model,
+            ..self.clone()
+        })
+    }
+
+    pub fn preset<'a>(&self, catalog: &'a ProviderCatalog) -> Option<&'a AssistantPreset> {
+        if self.provider_group.is_empty() {
+            None
+        } else {
+            catalog.assistant_preset(&self.provider_group)
+        }
+    }
+
+    /// The model the assistant will call: the preference, else the preset
+    /// default. Empty when neither names one.
+    pub fn effective_model(&self, catalog: &ProviderCatalog) -> String {
+        let model = self.model.trim();
+        if !model.is_empty() {
+            return model.to_string();
+        }
+        self.preset(catalog)
+            .map(|preset| preset.default_model.trim().to_string())
+            .unwrap_or_default()
+    }
+}
 
 fn default_cloud_preference() -> String {
     "qwen_cloud".into()
@@ -271,6 +374,8 @@ pub enum SessionError {
     TranscriptUploadNotAllowed,
     #[error("unknown provider: {0}")]
     UnknownProvider(String),
+    #[error("{0}")]
+    InvalidSessionText(String),
 }
 
 #[derive(Debug, Default)]
@@ -292,6 +397,7 @@ impl AppCore {
             return Err(self.invalid("start"));
         }
         validate_privacy(&request)?;
+        validate_session_text(&request)?;
         let route = RouteStatus::starting(&request);
         self.snapshot = SessionSnapshot {
             state_revision: self.snapshot.state_revision + 1,
@@ -861,6 +967,100 @@ mod tests {
             starting.translation_display_name.as_deref(),
             Some("Hy-MT2 (local)")
         );
+    }
+
+    #[test]
+    fn session_context_and_glossary_are_bounded_in_characters() {
+        let mut core = AppCore::default();
+        let mut request = StartSessionRequest::default();
+        // Multi-byte text at the limit is accepted: the bound is characters.
+        request.session_context = "视".repeat(SESSION_CONTEXT_MAX_CHARS);
+        request.glossary = "g".repeat(GLOSSARY_MAX_CHARS);
+        assert!(validate_session_text(&request).is_ok());
+        request.session_context.push('x');
+        assert!(matches!(
+            core.start(request.clone()),
+            Err(SessionError::InvalidSessionText(message)) if message.contains("2000")
+        ));
+        request.session_context = "Topic: early vision".into();
+        request.glossary.push('x');
+        assert!(matches!(
+            validate_session_text(&request),
+            Err(SessionError::InvalidSessionText(message)) if message.contains("glossary")
+        ));
+        request.glossary = "saccade = 扫视\0".into();
+        assert!(validate_session_text(&request).is_err());
+        request.glossary = "saccade = 扫视\n# comment\nJulesz".into();
+        assert_eq!(core.start(request).unwrap().phase, SessionPhase::Starting);
+    }
+
+    fn assistant_catalog() -> ProviderCatalog {
+        ProviderCatalog::parse(
+            r#"{"schema_version": 1, "assistant": [
+                {"group_id": "dashscope", "display_name": "Qwen", "default_model": "qwen-plus",
+                 "models": ["qwen-plus", "qwen-max"]},
+                {"group_id": "custom_openai", "display_name": "Custom", "default_model": ""}
+            ]}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn assistant_preferences_default_off_and_validate_against_the_catalog() {
+        let catalog = assistant_catalog();
+        let legacy: AssistantPreferences = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy, AssistantPreferences::default());
+        assert!(legacy.auto_title && !legacy.transcript_upload_allowed);
+        assert!(legacy.provider_group.is_empty() && legacy.preset(&catalog).is_none());
+        assert_eq!(legacy.normalized(&catalog).unwrap(), legacy);
+
+        let chosen = AssistantPreferences {
+            provider_group: " dashscope ".into(),
+            model: "  ".into(),
+            transcript_upload_allowed: true,
+            auto_title: false,
+        }
+        .normalized(&catalog)
+        .unwrap();
+        assert_eq!(chosen.provider_group, "dashscope");
+        assert_eq!(chosen.model, "");
+        assert!(chosen.transcript_upload_allowed && !chosen.auto_title);
+        assert_eq!(chosen.effective_model(&catalog), "qwen-plus");
+        let custom_model = AssistantPreferences {
+            model: "qwen-max".into(),
+            ..chosen.clone()
+        };
+        assert_eq!(custom_model.effective_model(&catalog), "qwen-max");
+        let custom = AssistantPreferences {
+            provider_group: "custom_openai".into(),
+            ..AssistantPreferences::default()
+        };
+        assert_eq!(custom.effective_model(&catalog), "");
+
+        for invalid in [
+            AssistantPreferences {
+                provider_group: "deepl".into(),
+                ..AssistantPreferences::default()
+            },
+            AssistantPreferences {
+                provider_group: "dashscope".into(),
+                model: "m".repeat(ASSISTANT_MODEL_MAX_CHARS + 1),
+                ..AssistantPreferences::default()
+            },
+            AssistantPreferences {
+                provider_group: "dashscope".into(),
+                model: "qwen\nplus".into(),
+                ..AssistantPreferences::default()
+            },
+        ] {
+            assert!(invalid.normalized(&catalog).is_err(), "{invalid:?}");
+        }
+        let at_limit = AssistantPreferences {
+            provider_group: "dashscope".into(),
+            model: "m".repeat(ASSISTANT_MODEL_MAX_CHARS),
+            ..AssistantPreferences::default()
+        };
+        assert!(at_limit.normalized(&catalog).is_ok());
     }
 
     #[test]

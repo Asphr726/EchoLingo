@@ -20,6 +20,7 @@ desktop Rust versions are locked in `Cargo.lock`.
 | Alibaba Cloud Qwen3 ASR realtime | cloud ASR service | commercial service terms | includes zh/en/ja/ko | Dedicated Beijing/Singapore WebSocket endpoints; provider-managed runtime |
 | Alibaba Cloud Qwen-MT Flash/Plus | cloud translation service | commercial service terms | 92 languages | Flash supports incremental output; Plus is quality/cumulative output |
 | HTTPX 0.28 | async Qwen-MT/local service transport | BSD-3-Clause | n/a | Cross-platform Python HTTP/SSE client |
+| pypdf 6.x | local text extraction from PDF note attachments (AI notes, context import) | BSD-3-Clause | language-agnostic (text layer only; scanned PDFs yield no text) | Pure Python, cross-platform; bundled in the sidecar via `--collect-submodules pypdf`; PPTX/DOCX use the standard library (zipfile + ElementTree) |
 | keyring-rs 4.2 | secure cloud credential abstraction | MIT OR Apache-2.0 | n/a | Current native macOS Keychain, Windows Credential Manager and Linux Secret Service adapters |
 | hf-hub 1.0 | pinned model download, retry and progress | Apache-2.0 | n/a | Current async Rust client; content-addressed cache and cross-platform filesystem support; Rust 1.88+ |
 | llama.cpp / llama-server | Hy-MT2 GGUF runtime | MIT | model-dependent | Active; OpenAI-compatible local server with Apple Metal, CUDA and CPU paths |
@@ -32,4 +33,5 @@ tuxu/python-samplerate, Rikorose/DeepFilterNet, Google FLEURS, and OpenSLR.
 Cloud protocol sources: Alibaba Cloud Model Studio realtime ASR interaction
 flow and Qwen-MT API reference. Hy-MT2 source: Tencent's official model cards.
 Desktop runtime sources: the official keyring-rs, hf-hub, llama.cpp and
-PyInstaller repositories/documentation.
+PyInstaller repositories/documentation. AI notes source: the py-pdf/pypdf
+repository (BSD-3-Clause `LICENSE`).

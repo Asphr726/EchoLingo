@@ -279,3 +279,75 @@ def test_desktop_profiles_follow_installed_models() -> None:
     config = AppConfig()
     align_local_profiles(config, capabilities(local_models={}))
     assert config.asr.local_profile == "quality"
+
+
+# --- AI assistant presets (docs/adr/0006) ------------------------------------
+
+
+def test_assistant_presets_are_exported_in_the_catalog() -> None:
+    exported = registry.catalog()["assistant"]
+    assert [entry["group_id"] for entry in exported] == [
+        "dashscope",
+        "openai",
+        "deepseek",
+        "gemini",
+        "groq",
+        "openrouter",
+        "siliconflow",
+        "custom_openai",
+    ]
+    assert exported[0] == {
+        "group_id": "dashscope",
+        "display_name": "Qwen (Alibaba Model Studio)",
+        "default_model": "qwen-plus",
+        "models": ["qwen-plus", "qwen-max", "qwen-turbo", "qwen-long"],
+    }
+    assert registry.catalog()["schema_version"] == 1
+    for entry in exported:
+        assert set(entry) == {"group_id", "display_name", "default_model", "models"}
+        assert entry["group_id"] in registry.CREDENTIAL_GROUPS
+        if entry["group_id"] != "custom_openai":
+            assert entry["default_model"] == entry["models"][0]
+
+
+def test_assistant_presets_reuse_credential_groups_and_chat_endpoints() -> None:
+    for group_id, preset in registry.ASSISTANT_PRESETS.items():
+        group = registry.CREDENTIAL_GROUPS[group_id]
+        key_field = next(field for field in group.fields if field.key == "api_key")
+        assert preset.api_key_env == key_field.env_var
+        assert preset.key_required == key_field.required
+    assert registry.ASSISTANT_PRESETS["openai"].base_url == "https://api.openai.com/v1"
+    assert registry.ASSISTANT_PRESETS["deepseek"].base_url == "https://api.deepseek.com/v1"
+    assert registry.ASSISTANT_PRESETS["dashscope"].base_url == ""
+    assert registry.ASSISTANT_PRESETS["custom_openai"].key_required is False
+
+
+def test_assistant_preset_values_resolve_dashscope_region_and_custom_endpoint() -> None:
+    env = {"DASHSCOPE_API_KEY": "sk-dash", "ECHOLINGO_QWEN_REGION": "beijing"}
+    values = registry.assistant_preset_values("dashscope", "", env)
+    assert values["base_url"] == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    assert values["model"] == "qwen-plus"
+    assert values["api_key"] == "sk-dash"
+    assert values["dashscope_endpoint"].region == "beijing"
+    singapore = registry.assistant_preset_values("dashscope", "qwen-max", {})
+    assert singapore["base_url"] == "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    assert singapore["model"] == "qwen-max"
+    workspace = registry.assistant_preset_values(
+        "dashscope", None, {**env, "DASHSCOPE_WORKSPACE_ID": "ws-1"}
+    )
+    assert workspace["base_url"] == dashscope.resolve_endpoint("beijing", "ws-1").compatible_base_url
+
+    custom = registry.assistant_preset_values(
+        "custom_openai",
+        "",
+        {
+            "ECHOLINGO_CUSTOM_OPENAI_BASE_URL": "http://127.0.0.1:11434/v1",
+            "ECHOLINGO_CUSTOM_OPENAI_CHAT_MODEL": "qwen2.5:7b",
+        },
+    )
+    assert custom["base_url"] == "http://127.0.0.1:11434/v1"
+    assert custom["model"] == "qwen2.5:7b"
+    assert custom["api_key"] == "" and custom["key_required"] is False
+    chosen = registry.assistant_preset_values("siliconflow", "deepseek-ai/DeepSeek-V3", {})
+    assert chosen["base_url"] == "https://api.siliconflow.cn/v1"
+    assert chosen["model"] == "deepseek-ai/DeepSeek-V3"

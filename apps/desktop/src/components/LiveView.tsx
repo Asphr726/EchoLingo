@@ -22,6 +22,7 @@ import {
 } from "../lib/providers";
 import { useApp, useLiveMetrics } from "../state/AppContext";
 import type { SegmentSummary, StartSessionRequest } from "../types";
+import { LectureContextPanel } from "./LectureContextPanel";
 import { ProviderSelect } from "./ProviderSelect";
 
 const languages = [
@@ -161,6 +162,8 @@ export function LiveView() {
         </div>}
 
         {locked && <LiveSessionHeader />}
+
+        <LectureContextPanel locked={locked} />
 
         <div className="session-actions">
           <div className="primary-actions">

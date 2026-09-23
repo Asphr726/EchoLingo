@@ -60,6 +60,12 @@ def main() -> int:
         # Provider adapters are imported lazily by the registry factories.
         "--collect-submodules",
         "echolingo.backends",
+        # The AI assistant (notes/titles) and pypdf's lazily imported filters
+        # and crypto providers.
+        "--collect-submodules",
+        "echolingo.assistant",
+        "--collect-submodules",
+        "pypdf",
         "--add-data",
         f"{root / 'models' / 'silero_vad.onnx'}:models",
         "--distpath",

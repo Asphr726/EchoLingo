@@ -1,9 +1,14 @@
-import { ArrowSquareOut, CheckCircle, ClosedCaptioning, CloudArrowUp, Key, LockKey, PlugsConnected, SlidersHorizontal, Warning } from "@phosphor-icons/react";
-import { type ReactNode, useEffect, useState } from "react";
+import { ArrowSquareOut, CheckCircle, ClosedCaptioning, CloudArrowUp, Key, LockKey, PlugsConnected, SlidersHorizontal, Sparkle, Warning } from "@phosphor-icons/react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import { api, subscribeModelProgress } from "../lib/bridge";
+import { GLOSSARY_LIMIT } from "../lib/context";
+import { clearPendingSection, peekPendingSection } from "../lib/navigation";
+import { assistantPresets, credentialNeed, groupHasKey } from "../lib/notes";
 import { providersForGroup } from "../lib/providers";
 import { useApp } from "../state/AppContext";
 import type {
+  AssistantPreferences,
+  AssistantProbeResult,
   CaptionDisplay,
   CloudProbeAsrResult,
   CloudProbeResult,
@@ -14,6 +19,7 @@ import type {
   InferenceMode,
   ModelProgress,
   ModelStatus,
+  ProviderCatalog,
   ProviderSpec,
   RuntimePreferences,
   StartSessionRequest,
@@ -28,6 +34,7 @@ const sections = [
   "Inference",
   "Models",
   "Cloud providers",
+  "AI assistant",
   "Privacy",
   "Translation",
   "Appearance",
@@ -38,15 +45,18 @@ type Section = (typeof sections)[number];
 const sectionSlug = (section: Section) => section.toLowerCase().replace(/\s+/g, "-");
 
 /** `?section=cloud-providers` opens a section directly (browser preview and
- *  screenshots); the in-app navigation never changes the URL. */
+ *  screenshots); in-app deep links ("Open AI assistant settings") arrive via
+ *  `requestNavigation`. The in-app navigation never changes the URL. */
 function initialSection(): Section {
   if (typeof window === "undefined") return "General";
-  const requested = new URLSearchParams(window.location.search).get("section");
+  const pending = peekPendingSection();
+  const requested = pending ?? new URLSearchParams(window.location.search).get("section");
   return sections.find((section) => sectionSlug(section) === requested) ?? "General";
 }
 
 export function SettingsView() {
   const [section, setSection] = useState<Section>(initialSection);
+  useEffect(() => clearPendingSection(), []);
   // Availability per credential group; secret values are never held here.
   const [credentialStatus, setCredentialStatus] = useState<Record<string, CredentialGroupStatus>>({});
   const [credentialError, setCredentialError] = useState<string | null>(null);
@@ -312,6 +322,16 @@ export function SettingsView() {
           </div>
         )}
 
+        {section === "AI assistant" && (
+          <AssistantSettings
+            catalog={catalog}
+            credentialStatus={credentialStatus}
+            preferences={runtime.assistant ?? defaultAssistantPreferences}
+            onChange={(assistant) => updateRuntime({ ...runtime, assistant })}
+            onOpenCloudProviders={() => setSection("Cloud providers")}
+          />
+        )}
+
         {section === "Privacy" && (
           <div className="settings-groups">
             <SettingsGroup title="Explicit upload consent" description="EchoLingo never silently uploads audio or transcript text.">
@@ -335,14 +355,33 @@ export function SettingsView() {
 
         {section === "Translation" && (
           <div className="settings-groups">
-            <SettingsGroup title="Context and terminology" description="Streaming translation preserves an editable window and commits stable target text progressively.">
-              <Control label="Domain hint">
-                <input type="text" placeholder="e.g. computer science lecture" disabled title="Domain settings backend persistence is scheduled for the next increment" />
-              </Control>
-              <Control label="Terminology / glossary">
-                <textarea rows={5} placeholder="One source = target term per line" disabled title="Glossary editor backend persistence is scheduled for the next increment" />
-              </Control>
-              <p className="settings-helper">The backend interfaces already accept domain, context, glossary, and editable-window data. Desktop persistence for these fields is next.</p>
+            <SettingsGroup title="Glossary" description="Standing terminology for every session. Add per-lecture topics and terms under Lecture context on the Live screen.">
+              <label className="settings-control settings-control--wide">
+                <span>Terms</span>
+                <textarea
+                  className="glossary-input"
+                  rows={9}
+                  maxLength={GLOSSARY_LIMIT}
+                  spellCheck={false}
+                  value={draft.glossary}
+                  placeholder={"convolution = 卷积\nsaccade = 眼跳\nAlyosha Efros"}
+                  aria-describedby="glossary-help"
+                  // The shell rejects NUL in session text; pasted PDF text can carry it.
+                  onChange={(event) => update("glossary", event.target.value.replace(/\0/g, "").slice(0, GLOSSARY_LIMIT))}
+                />
+              </label>
+              <div className="field-foot" id="glossary-help">
+                <span>
+                  One entry per line: <code>term = translation</code>, or a term on its own to help recognition. Lines
+                  starting with <code>#</code> are ignored.
+                </span>
+                <span className={draft.glossary.length > GLOSSARY_LIMIT * 0.9 ? "char-count char-count--near" : "char-count"}>
+                  {draft.glossary.length.toLocaleString("en-US")} / {GLOSSARY_LIMIT.toLocaleString("en-US")}
+                </span>
+              </div>
+              <p className="settings-helper">
+                Terms reach cloud recognition or translation only when audio or transcript upload is allowed under Privacy. Changes apply to the next session.
+              </p>
             </SettingsGroup>
           </div>
         )}
@@ -390,6 +429,203 @@ export function SettingsView() {
           </div>
         )}
       </section>
+    </div>
+  );
+}
+
+/** Mirrors `ASSISTANT_MODEL_MAX_CHARS` in app-core; longer names are rejected. */
+const ASSISTANT_MODEL_MAX_CHARS = 100;
+
+/** Settings → AI assistant: which chat model writes notes and titles, the
+ *  consent to send transcripts to it, and automatic titles. Keys live in
+ *  the Cloud providers cards; only availability is shown here. */
+function AssistantSettings({
+  catalog,
+  credentialStatus,
+  onChange,
+  onOpenCloudProviders,
+  preferences,
+}: {
+  catalog: ProviderCatalog | null;
+  credentialStatus: Record<string, CredentialGroupStatus>;
+  preferences: AssistantPreferences;
+  onChange: (next: AssistantPreferences) => Promise<void>;
+  onOpenCloudProviders: () => void;
+}) {
+  const presets = assistantPresets(catalog);
+  const preset = presets.find((entry) => entry.group_id === preferences.provider_group);
+  const group = catalog?.credential_groups.find((entry) => entry.id === preferences.provider_group);
+  const need = credentialNeed(group, credentialStatus[preferences.provider_group]);
+  const keySaved = need === null;
+  const statusKnown = Boolean(credentialStatus[preferences.provider_group]);
+  // A custom endpoint needs its base URL; its key is optional.
+  const needsKey = Boolean(group?.fields.some((field) => field.required));
+  const vendor = group?.vendor || preset?.display_name || "the provider";
+  const [model, setModel] = useState(preferences.model);
+  const [probe, setProbe] = useState<AssistantProbeResult | null>(null);
+  const [probeError, setProbeError] = useState<string | null>(null);
+  const [testing, setTesting] = useState(false);
+  const commitTimer = useRef<number | undefined>(undefined);
+  // The debounced model commit runs after later renders; it must merge into
+  // the latest preferences so it can never undo a consent change made since.
+  const latest = useRef({ preferences, onChange });
+  latest.current = { preferences, onChange };
+
+  useEffect(() => setModel(preferences.model), [preferences.model]);
+  useEffect(() => () => window.clearTimeout(commitTimer.current), []);
+
+  const commitModel = async (value: string) => {
+    window.clearTimeout(commitTimer.current);
+    const { onChange: save, preferences: current } = latest.current;
+    if (value.trim() !== current.model) await save({ ...current, model: value.trim() });
+  };
+
+  const test = async () => {
+    await commitModel(model);
+    setTesting(true);
+    setProbe(null);
+    setProbeError(null);
+    try {
+      setProbe(await api.assistantProbe());
+    } catch (failure) {
+      setProbeError(String(failure));
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const canTest = Boolean(preferences.provider_group) && keySaved && !testing;
+  const testHint = !preferences.provider_group
+    ? "Choose a provider first."
+    : !keySaved
+      ? need === "endpoint"
+        ? "Set the endpoint under Cloud providers first."
+        : "Save a key under Cloud providers first."
+      : "Sends one short fixed prompt; no transcript.";
+
+  return (
+    <div className="settings-groups">
+      <SettingsGroup title="Model" description="Study notes and session titles are written by a chat model you choose, billed to your own API key. Recognition and translation are not affected.">
+        <Control label="Provider">
+          <select
+            value={preferences.provider_group}
+            onChange={(event) => {
+              setProbe(null);
+              setProbeError(null);
+              // Consent is given to one vendor; switching asks again.
+              void onChange({ ...preferences, provider_group: event.target.value, model: "", transcript_upload_allowed: false });
+            }}
+          >
+            <option value="">Off</option>
+            {presets.map((entry) => {
+              const entryGroup = catalog?.credential_groups.find((candidate) => candidate.id === entry.group_id);
+              const known = Boolean(credentialStatus[entry.group_id]);
+              const hasKey = groupHasKey(entryGroup, credentialStatus[entry.group_id]);
+              return (
+                <option key={entry.group_id} value={entry.group_id}>
+                  {entry.display_name}{known && !hasKey ? " (not set up yet)" : ""}
+                </option>
+              );
+            })}
+          </select>
+        </Control>
+        {preferences.provider_group && (
+          <div className="assistant-key-status">
+            {!statusKnown ? (
+              <span className="provider-badge provider-badge--neutral">Checking key…</span>
+            ) : keySaved ? (
+              <span className="provider-badge provider-badge--ok" role="status">
+                <CheckCircle size={15} weight="fill" aria-hidden="true" />
+                {needsKey ? "Key saved" : "Endpoint saved"}
+              </span>
+            ) : (
+              <button className="text-button" type="button" onClick={onOpenCloudProviders}>
+                <Key size={14} weight="regular" aria-hidden="true" />
+                {need === "endpoint" ? "Set the endpoint in Cloud providers" : "Add a key in Cloud providers"}
+              </button>
+            )}
+          </div>
+        )}
+        {preferences.provider_group && (
+          <Control label="Model">
+            <input
+              type="text"
+              list="assistant-models"
+              autoComplete="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              value={model}
+              maxLength={ASSISTANT_MODEL_MAX_CHARS}
+              placeholder={preset?.default_model || "Model name"}
+              onChange={(event) => {
+                const value = event.target.value;
+                setModel(value);
+                window.clearTimeout(commitTimer.current);
+                commitTimer.current = window.setTimeout(() => void commitModel(value), 600);
+              }}
+              onBlur={() => void commitModel(model)}
+            />
+            <datalist id="assistant-models">
+              {(preset?.models ?? []).map((name) => (
+                <option key={name} value={name} />
+              ))}
+            </datalist>
+          </Control>
+        )}
+        {preferences.provider_group && (
+          <p className="settings-helper">
+            {preset?.default_model
+              ? `Leave empty to use ${preset.default_model}. Long lectures need a model with a large context window.`
+              : "Enter the model name your endpoint serves."}
+          </p>
+        )}
+        <div className="settings-inline">
+          <button className="button" type="button" disabled={!canTest} title={testHint} onClick={() => void test()}>
+            <PlugsConnected size={18} weight="regular" aria-hidden="true" />
+            {testing ? "Testing…" : "Test"}
+          </button>
+        </div>
+        {probe && (
+          <div className="cloud-probe cloud-probe--ok" role="status">
+            <strong>{preset?.display_name ?? probe.provider} answered</strong>
+            <span>{probe.model} · {Math.round(probe.latency_ms)} ms</span>
+            <small>The test sent one short fixed prompt; no transcript was sent.</small>
+          </div>
+        )}
+        {probeError && (
+          <div className="cloud-probe cloud-probe--error" role="alert">
+            <strong>{preset?.display_name ?? "The provider"} needs attention</strong>
+            <small>{probeError}</small>
+          </div>
+        )}
+      </SettingsGroup>
+      <SettingsGroup title="Consent" description="Nothing is sent to the assistant until you allow it here. Audio never leaves this Mac for notes or titles.">
+        <PrivacyToggle
+          icon={<LockKey size={20} weight="regular" aria-hidden="true" />}
+          title="Send transcripts and attached files to this model for notes and titles"
+          description={
+            preferences.provider_group
+              ? `The session transcript, its lecture context and text extracted from files you attach go to ${vendor} when you create notes or a title is generated.`
+              : "Choose a provider first."
+          }
+          checked={preferences.transcript_upload_allowed}
+          disabled={!preferences.provider_group}
+          onChange={(checked) => void onChange({ ...preferences, transcript_upload_allowed: checked })}
+        />
+      </SettingsGroup>
+      <SettingsGroup title="Session titles" description="History lists sessions by title. Titles you rename yourself are never replaced.">
+        <label className="check-row check-row--settings">
+          <input
+            type="checkbox"
+            checked={preferences.auto_title}
+            onChange={(event) => void onChange({ ...preferences, auto_title: event.target.checked })}
+          />
+          <span>Name sessions automatically when they end</span>
+        </label>
+        <p className="settings-helper">
+          <Sparkle size={11} weight="fill" aria-hidden="true" /> Marks titles written by the assistant. Needs the consent above and a session of at least 30 words.
+        </p>
+      </SettingsGroup>
     </div>
   );
 }
@@ -686,12 +922,12 @@ function LanguageSelect({ exclude, onChange, value }: { exclude: string; onChang
   );
 }
 
-function PrivacyToggle({ checked, description, icon, onChange, title }: { checked: boolean; description: string; icon: ReactNode; onChange: (checked: boolean) => void; title: string }) {
+function PrivacyToggle({ checked, description, disabled = false, icon, onChange, title }: { checked: boolean; description: string; disabled?: boolean; icon: ReactNode; onChange: (checked: boolean) => void; title: string }) {
   return (
     <label className="privacy-toggle">
       <span className="privacy-toggle-icon">{icon}</span>
       <span><strong>{title}</strong><small>{description}</small></span>
-      <input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} />
+      <input type="checkbox" checked={checked} disabled={disabled} onChange={(event) => onChange(event.target.checked)} />
     </label>
   );
 }

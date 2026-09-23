@@ -1349,6 +1349,7 @@ dependencies = [
  "app-core",
  "audio-core",
  "chrono",
+ "futures-util",
  "inference-ipc",
  "keyring",
  "raw-window-handle",
@@ -1360,6 +1361,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "transcript-store",
  "uuid",
 ]

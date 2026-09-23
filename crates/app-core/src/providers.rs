@@ -177,6 +177,20 @@ impl CredentialGroup {
     }
 }
 
+/// A chat provider the AI assistant can use for notes and titles
+/// (docs/adr/0006). `group_id` names the credential group whose key it uses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssistantPreset {
+    pub group_id: String,
+    pub display_name: String,
+    /// The model used when the preference leaves the model empty. May be
+    /// empty for endpoints that name their own model (custom OpenAI).
+    #[serde(default)]
+    pub default_model: String,
+    #[serde(default)]
+    pub models: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderCatalog {
     pub schema_version: u16,
@@ -186,6 +200,10 @@ pub struct ProviderCatalog {
     pub translation: Vec<ProviderSpec>,
     #[serde(default)]
     pub credential_groups: Vec<CredentialGroup>,
+    /// Chat presets for the AI assistant; absent in catalogs exported before
+    /// docs/adr/0006.
+    #[serde(default)]
+    pub assistant: Vec<AssistantPreset>,
 }
 
 impl ProviderCatalog {
@@ -213,6 +231,11 @@ impl ProviderCatalog {
         self.find(kind, id)
             .and_then(|spec| spec.credential_group.as_deref())
             .and_then(|group| self.group(group))
+    }
+
+    /// The assistant preset for a credential group, if the group can chat.
+    pub fn assistant_preset(&self, group_id: &str) -> Option<&AssistantPreset> {
+        self.assistant.iter().find(|preset| preset.group_id == group_id)
     }
 
     pub fn cloud_ids(&self, kind: ProviderKind) -> impl Iterator<Item = &str> {
@@ -362,6 +385,41 @@ mod tests {
         // which mirrors the registry's `catalog_json()` (one trailing newline).
         if let Ok(expected) = std::env::var("ECHOLINGO_EXPECTED_CATALOG_DIGEST") {
             assert_eq!(digest, expected);
+        }
+    }
+
+    #[test]
+    fn assistant_presets_are_optional_and_reference_credential_groups() {
+        // Catalogs exported before docs/adr/0006 have no `assistant` array.
+        let legacy = ProviderCatalog::parse(
+            r#"{"schema_version": 1, "asr": [], "translation": [], "credential_groups": []}"#,
+        )
+        .unwrap();
+        assert!(legacy.assistant.is_empty());
+        assert!(legacy.assistant_preset("dashscope").is_none());
+
+        let current = ProviderCatalog::parse(
+            r#"{"schema_version": 1, "credential_groups": [], "assistant": [
+                {"group_id": "dashscope", "display_name": "Qwen (Alibaba Model Studio)",
+                 "default_model": "qwen-plus", "models": ["qwen-plus", "qwen-max"]},
+                {"group_id": "custom_openai", "display_name": "Custom endpoint"}
+            ]}"#,
+        )
+        .unwrap();
+        let qwen = current.assistant_preset("dashscope").unwrap();
+        assert_eq!(qwen.default_model, "qwen-plus");
+        assert_eq!(qwen.models, vec!["qwen-plus", "qwen-max"]);
+        let custom = current.assistant_preset("custom_openai").unwrap();
+        assert!(custom.default_model.is_empty() && custom.models.is_empty());
+
+        // Whatever the embedded catalog lists must use an existing key card.
+        for preset in &catalog().assistant {
+            assert!(
+                catalog().group(&preset.group_id).is_some(),
+                "assistant preset {} has no credential group",
+                preset.group_id
+            );
+            assert!(!preset.display_name.is_empty());
         }
     }
 

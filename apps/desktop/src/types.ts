@@ -324,6 +324,21 @@ export interface ProviderCatalog {
   asr: ProviderSpec[];
   translation: ProviderSpec[];
   credential_groups: CredentialGroup[];
+  /** Chat presets for the AI assistant; missing in older catalogs. */
+  assistant?: AssistantPreset[];
+}
+
+/** Result of `assistant_probe` (one fixed prompt, no transcript). */
+export interface AssistantProbeResult {
+  provider: string;
+  model: string;
+  latency_ms: number;
+}
+
+/** Payload of the `history_changed` UI event. */
+export interface HistoryChange {
+  session_id: string;
+  reason: "title" | "notes" | "renamed" | "deleted";
 }
 
 export type CredentialSource = "keychain" | "environment" | "none";

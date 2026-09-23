@@ -11,6 +11,7 @@ from typing import Any
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
+from ..assistant.service import AssistantService, request_id_of
 from ..backends import registry
 from .cloud_probe import probe_cloud
 from .parent_watchdog import start_parent_watchdog_from_environment
@@ -19,13 +20,24 @@ from .session import DesktopInferenceSession
 
 log = logging.getLogger("echolingo.sidecar")
 
+# Features the shell may rely on (docs/adr/0006).
+CAPABILITIES = ["assistant.v1", "asr_context.v1"]
+# Assistant requests carry transcripts of long sessions.
+MAX_MESSAGE_BYTES = 8 * 1024 * 1024
+
 
 def _event(event_type: str, payload: Any) -> str:
     return json.dumps({"type": event_type, "payload": payload}, ensure_ascii=False)
 
 
 class SidecarConnection:
-    def __init__(self, websocket: ServerConnection, token: str) -> None:
+    def __init__(
+        self,
+        websocket: ServerConnection,
+        token: str,
+        *,
+        assistant: AssistantService | None = None,
+    ) -> None:
         self.websocket = websocket
         self.expected_token = token
         self.authenticated = False
@@ -33,6 +45,8 @@ class SidecarConnection:
         self.events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self.sender: asyncio.Task[None] | None = None
         self.background_tasks: set[asyncio.Task[Any]] = set()
+        self.assistant = assistant or AssistantService()
+        self.assistant_tasks: dict[str, asyncio.Task[None]] = {}
 
     async def run(self) -> None:
         self.sender = asyncio.create_task(self._send_events())
@@ -92,6 +106,7 @@ class SidecarConnection:
                     {
                         "protocol_version": PROTOCOL_VERSION,
                         "providers_digest": registry.catalog_digest(),
+                        "capabilities": list(CAPABILITIES),
                     },
                 )
             )
@@ -133,17 +148,81 @@ class SidecarConnection:
         elif command_type == "finish_session":
             session = self._require_session()
             await asyncio.wait_for(session.finish(), timeout=10.0)
-            await self.websocket.send(
-                _event("session_finished", {"session_id": payload["session_id"]})
+            # Through the ordered event queue, so it follows the last
+            # transcript/translation events that finish() enqueued.
+            self.events.put_nowait(
+                {"type": "session_finished", "payload": {"session_id": payload["session_id"]}}
             )
             self.session = None
             task = asyncio.create_task(self._run_alignment(session))
             self.background_tasks.add(task)
             task.add_done_callback(self.background_tasks.discard)
+        elif command_type == "assistant_request":
+            self._start_assistant(payload)
+        elif command_type == "assistant_cancel":
+            self._cancel_assistant(payload)
         elif command_type == "shutdown":
             await self.websocket.close(code=1000, reason="sidecar shutdown")
         else:
             raise ProtocolError(f"unknown sidecar command: {command_type}")
+
+    def _start_assistant(self, payload: Any) -> None:
+        """Run an assistant task in the background.
+
+        Validation happens inside the task, which always answers with one
+        ``assistant_result``; nothing here raises into the command loop.
+        """
+        request_id = request_id_of(payload)
+        if request_id and request_id in self.assistant_tasks:
+            log.warning("assistant request %s is already running; duplicate ignored", request_id)
+            return
+        answered = False
+
+        def put(event: dict[str, Any]) -> None:
+            nonlocal answered
+            if event.get("type") == "assistant_result":
+                answered = True
+            self.events.put_nowait(event)
+
+        def settle(done: asyncio.Task[None]) -> None:
+            # A cancel that arrives before the task first runs never enters
+            # ``handle``; the request still ends in exactly one result.
+            if done.cancelled() and not answered:
+                put(
+                    {
+                        "type": "assistant_result",
+                        "payload": {
+                            "request_id": request_id,
+                            "ok": False,
+                            "result": {
+                                "code": "cancelled",
+                                "message": "The assistant task was cancelled.",
+                            },
+                        },
+                    }
+                )
+
+        task = asyncio.create_task(self.assistant.handle(payload, put))
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
+        task.add_done_callback(_consume_task_outcome)
+        task.add_done_callback(settle)
+        if request_id:
+            self.assistant_tasks[request_id] = task
+
+            def forget(done: asyncio.Task[None], request_id: str = request_id) -> None:
+                if self.assistant_tasks.get(request_id) is done:
+                    del self.assistant_tasks[request_id]
+
+            task.add_done_callback(forget)
+
+    def _cancel_assistant(self, payload: Any) -> None:
+        request_id = request_id_of(payload)
+        task = self.assistant_tasks.get(request_id) if request_id else None
+        if task is None:
+            log.debug("assistant cancel for an unknown or finished request")
+            return
+        task.cancel()
 
     async def _audio(self, data: bytes) -> None:
         if not self.authenticated:
@@ -177,10 +256,22 @@ class SidecarConnection:
             )
 
 
+def _consume_task_outcome(task: asyncio.Task[Any]) -> None:
+    """Retrieve a finished task's exception so asyncio does not log it as
+    never retrieved (assistant tasks report failures as results)."""
+    if not task.cancelled():
+        task.exception()
+
+
 async def run_server(host: str, port: int, token: str) -> None:
     if host not in {"127.0.0.1", "::1", "localhost"}:
         raise ValueError("inference sidecar must bind to loopback")
-    async with serve(lambda ws: SidecarConnection(ws, token).run(), host, port) as server:
+    async with serve(
+        lambda ws: SidecarConnection(ws, token).run(),
+        host,
+        port,
+        max_size=MAX_MESSAGE_BYTES,
+    ) as server:
         sockets = server.sockets or []
         selected_port = sockets[0].getsockname()[1] if sockets else port
         print(json.dumps({"status": "ready", "port": selected_port}), flush=True)

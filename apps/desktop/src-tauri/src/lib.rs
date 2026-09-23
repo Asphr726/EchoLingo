@@ -1,7 +1,8 @@
 use app_core::{
-    catalog, catalog_digest, catalog_value, AppCore, AudioSourceKind as AppAudioSourceKind, BackendHealth,
-    CredentialGroup, LiveMetrics, ProviderCatalog, ProviderKind, ProviderSetting, RouteStatus,
-    SegmentSummary, SessionPhase, SessionSnapshot, StartSessionRequest,
+    catalog, catalog_digest, catalog_value, validate_session_text, AppCore, AssistantPreferences,
+    AudioSourceKind as AppAudioSourceKind, BackendHealth, CredentialGroup, LiveMetrics,
+    ProviderCatalog, ProviderKind, ProviderSetting, RouteStatus, SegmentSummary, SessionPhase,
+    SessionSnapshot, StartSessionRequest,
 };
 use audio_core::{
     audio_permission_status as native_permission_status,
@@ -32,6 +33,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use transcript_store::{
     ExportFormat, SegmentDraft, SessionDetail, SessionDraft, SessionRecord, TranscriptStore,
 };
+
+mod assistant;
 
 const UI_EVENT_CHANNEL: &str = "echolingo://ui-event";
 const MODEL_PROGRESS_CHANNEL: &str = "echolingo://model-progress";
@@ -73,6 +76,10 @@ impl CredentialStore {
     }
 
     fn get(account: &str) -> Result<Option<String>, String> {
+        // Unit tests never read (or prompt for) the developer's secure store.
+        if cfg!(test) {
+            return Ok(None);
+        }
         match Self::entry(account)?.get_password() {
             Ok(value) => Ok(Some(value)),
             Err(keyring::Error::NoEntry) => Ok(None),
@@ -81,12 +88,18 @@ impl CredentialStore {
     }
 
     fn set(account: &str, value: &str) -> Result<(), String> {
+        if cfg!(test) {
+            return Err("the secure store is not available in unit tests".into());
+        }
         Self::entry(account)?
             .set_password(value)
             .map_err(|error| error.to_string())
     }
 
     fn delete(account: &str) -> Result<(), String> {
+        if cfg!(test) {
+            return Ok(());
+        }
         match Self::entry(account)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(error) => Err(error.to_string()),
@@ -272,6 +285,60 @@ fn compose_sidecar_environment(
     values
 }
 
+/// Add the model root, the alignment spool and the local runtime
+/// capabilities to the provider environment. Pure so it can be tested.
+fn compose_full_sidecar_environment(
+    mut values: HashMap<String, String>,
+    model_root: &std::path::Path,
+    capabilities: HashMap<String, String>,
+) -> Result<HashMap<String, String>, String> {
+    values.insert(
+        "ECHOLINGO_MODEL_ROOT".into(),
+        model_root.to_string_lossy().into_owned(),
+    );
+    let alignment_spool = model_root
+        .parent()
+        .ok_or_else(|| "model directory has no application-data parent".to_string())?
+        .join("alignment-spool");
+    values.insert(
+        "ECHOLINGO_ALIGNMENT_SPOOL_ROOT".into(),
+        alignment_spool.to_string_lossy().into_owned(),
+    );
+    values.extend(capabilities);
+    Ok(values)
+}
+
+/// Labels of what a credential group still needs before it can be used:
+/// required fields without a keychain or environment value, and an empty
+/// endpoint (`base_url`) setting. Never includes values.
+fn missing_credential_labels(
+    group: &CredentialGroup,
+    status: &CredentialGroupStatus,
+) -> Vec<String> {
+    let mut missing: Vec<String> = group
+        .fields
+        .iter()
+        .filter(|field| field.required)
+        .filter(|field| {
+            !status
+                .fields
+                .iter()
+                .any(|entry| entry.key == field.key && entry.available)
+        })
+        .map(|field| field.label.clone())
+        .collect();
+    if let Some(endpoint) = group.setting("base_url") {
+        if status
+            .settings
+            .get("base_url")
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            missing.push(endpoint.label.clone());
+        }
+    }
+    missing
+}
+
 /// One keychain mutation planned by [`plan_credential_update`]. `Debug` never
 /// prints the value.
 #[derive(Clone, PartialEq, Eq)]
@@ -431,6 +498,16 @@ impl Default for CaptionPreferences {
     }
 }
 
+/// Who asks for the sidecar. The live-session path (Start and the launch
+/// warm-up) owns the session, so it may restart a stale sidecar; background
+/// users (assistant jobs, credential probes) may run during a live session
+/// and must never restart the sidecar under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidecarUser {
+    LiveSession,
+    Background,
+}
+
 struct RuntimeState {
     core: Mutex<AppCore>,
     event_sequence: AtomicU64,
@@ -457,6 +534,12 @@ struct RuntimeState {
     persistence_throttle: Mutex<PersistenceThrottle>,
     runtime_preferences: Mutex<RuntimePreferences>,
     warmup_in_progress: std::sync::atomic::AtomicBool,
+    /// Running AI assistant jobs and picked note attachments (docs/adr/0006).
+    assistant: assistant::AssistantRegistry,
+    /// Serialises every decision to launch, restart or stop the sidecar, so a
+    /// restart can never slip between an assistant job's launch and its
+    /// request, and two callers never launch two sidecars.
+    sidecar_lifecycle: tokio::sync::Mutex<()>,
 }
 
 fn project_root() -> PathBuf {
@@ -486,6 +569,8 @@ impl Default for RuntimeState {
             persistence_throttle: Mutex::new(PersistenceThrottle::default()),
             runtime_preferences: Mutex::new(RuntimePreferences::default()),
             warmup_in_progress: std::sync::atomic::AtomicBool::new(false),
+            assistant: assistant::AssistantRegistry::default(),
+            sidecar_lifecycle: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -549,6 +634,21 @@ impl RuntimeState {
             .sidecar_environment(&self.provider_settings()?)
     }
 
+    /// The complete sidecar launch environment: provider credentials and
+    /// settings, the model root, the alignment spool and the local runtime
+    /// capabilities. Every path that launches the sidecar (sessions, warm-up,
+    /// credential probes, assistant jobs) uses this, so none of them can
+    /// leave a partially configured sidecar running.
+    fn full_sidecar_environment(&self) -> Result<HashMap<String, String>, String> {
+        compose_full_sidecar_environment(
+            self.sidecar_environment()?,
+            self.models()?.root(),
+            self.local_runtimes()?.capability_environment(),
+        )
+    }
+
+    /// Whether the live session is idle. Assistant jobs are deliberately not
+    /// considered: they may run while idle and never block starting a session.
     fn is_idle(&self) -> bool {
         self.snapshot()
             .map(|snapshot| {
@@ -560,17 +660,82 @@ impl RuntimeState {
             .unwrap_or(false)
     }
 
+    /// Launch the sidecar with the full environment if it is not running.
+    /// A stale environment (credentials changed since launch) restarts it
+    /// first, unless an assistant request is in flight or, for a background
+    /// user, a live session runs: then the restart is deferred until the
+    /// jobs finish or the session ends. Callers hold `sidecar_lifecycle`.
+    async fn start_sidecar_locked(
+        &self,
+        app: Option<&AppHandle>,
+        user: SidecarUser,
+    ) -> Result<(), String> {
+        if self.sidecar_environment_stale.load(Ordering::Acquire) {
+            if self.assistant.any_in_flight() {
+                self.log_desktop_event("sidecar_restart_deferred reason=assistant_job_running");
+            } else if user == SidecarUser::Background && !self.is_idle() {
+                // Restarting now would cut off the live session.
+                self.log_desktop_event("sidecar_restart_deferred reason=live_session");
+            } else {
+                // Environment variables only apply at launch. The flag is
+                // cleared before the environment is read, so a change that
+                // lands in between marks it stale again.
+                self.sidecar_environment_stale
+                    .store(false, Ordering::Release);
+                self.supervisor().shutdown().await;
+            }
+        }
+        let environment = self.full_sidecar_environment()?;
+        self.supervisor()
+            .configure_secret_environment(environment)
+            .await;
+        self.supervisor()
+            .ensure_started()
+            .await
+            .map_err(|error| error.to_string())?;
+        self.check_catalog_digest(app).await;
+        Ok(())
+    }
+
+    async fn ensure_sidecar(&self, app: Option<&AppHandle>, user: SidecarUser) -> Result<(), String> {
+        let _lifecycle = self.sidecar_lifecycle.lock().await;
+        self.start_sidecar_locked(app, user).await
+    }
+
     /// Credentials or settings changed: restart the sidecar now when nothing
-    /// is running, otherwise before the next session so a live session is
-    /// never interrupted.
+    /// is running, otherwise before the next session (or once the running
+    /// assistant jobs finish) so neither a live session nor a job is cut off.
     async fn invalidate_sidecar_environment(&self) {
         self.sidecar_environment_stale
             .store(true, Ordering::Release);
-        if self.is_idle() {
+        self.restart_stale_sidecar_if_quiet().await;
+    }
+
+    /// Stop a sidecar whose environment is stale when no live session and no
+    /// assistant request uses it; the next user launches it fresh. Never
+    /// waits: while a launch holds the lifecycle lock, the stale flag makes
+    /// that launch (or the next one) restart instead.
+    async fn restart_stale_sidecar_if_quiet(&self) {
+        let Ok(_lifecycle) = self.sidecar_lifecycle.try_lock() else {
+            return;
+        };
+        if self.sidecar_environment_stale.load(Ordering::Acquire)
+            && self.is_idle()
+            && !self.assistant.any_in_flight()
+        {
             self.supervisor().shutdown().await;
             self.sidecar_environment_stale
                 .store(false, Ordering::Release);
         }
+    }
+
+    fn assistant_preferences(&self) -> Result<AssistantPreferences, String> {
+        Ok(self
+            .runtime_preferences
+            .lock()
+            .map_err(|_| "runtime preferences lock poisoned".to_string())?
+            .assistant
+            .clone())
     }
 
     /// Compare the sidecar's provider catalog with the one embedded in this
@@ -765,6 +930,8 @@ struct RuntimePreferences {
     /// Non-secret `ProviderSetting` values per credential group, for example
     /// `{"dashscope": {"region": "beijing"}}`. Secrets never live here.
     providers: ProviderSettings,
+    /// AI assistant for session notes and titles (docs/adr/0006).
+    assistant: AssistantPreferences,
 }
 
 impl Default for RuntimePreferences {
@@ -772,6 +939,7 @@ impl Default for RuntimePreferences {
         Self {
             preload_local_models: true,
             providers: ProviderSettings::new(),
+            assistant: AssistantPreferences::default(),
         }
     }
 }
@@ -785,6 +953,7 @@ fn validate_session_defaults(defaults: &StartSessionRequest) -> Result<(), Strin
     if defaults.source_language == defaults.target_language {
         return Err("source and target languages must differ".into());
     }
+    validate_session_text(defaults).map_err(|error| error.to_string())?;
     if !matches!(
         defaults.audio_profile.as_str(),
         "lecture" | "conversation" | "raw"
@@ -920,21 +1089,33 @@ fn reserve_local_runtime_ports() -> std::io::Result<(std::net::TcpListener, std:
 }
 
 fn load_preferences(path: &std::path::Path) -> DesktopPreferences {
-    let preferences = std::fs::read(path)
+    let mut preferences = std::fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<DesktopPreferences>(&bytes).ok())
         .unwrap_or_default();
+    if validate_session_text(&preferences.session).is_err() {
+        // Only a hand-edited file can hold over-long text; drop the text,
+        // not the whole file.
+        preferences.session.session_context.clear();
+        preferences.session.glossary.clear();
+    }
     if preferences.schema_version != 1
         || validate_session_defaults(&preferences.session).is_err()
         || validate_caption_preferences(&preferences.caption).is_err()
     {
         return DesktopPreferences::default();
     }
-    let mut preferences = preferences;
     // Provider settings are dropped on corruption rather than discarding the
     // whole file; the catalog defaults apply again.
     preferences.runtime.providers =
         validate_provider_settings(&preferences.runtime.providers).unwrap_or_default();
+    // An assistant choice the catalog no longer offers resets to "off"
+    // (which also withdraws the upload consent).
+    preferences.runtime.assistant = preferences
+        .runtime
+        .assistant
+        .normalized(catalog())
+        .unwrap_or_default();
     preferences
 }
 
@@ -1195,8 +1376,8 @@ async fn update_provider_settings(
     Ok(preferences)
 }
 
-/// Validate cloud credentials for the requested providers by launching a
-/// credentials-only sidecar and asking it to probe. ASR probes perform the
+/// Validate cloud credentials for the requested providers by asking the
+/// sidecar (launched with its complete environment) to probe them. ASR probes perform the
 /// authenticated handshake only (no audio is uploaded); translation probes
 /// translate one fixed sentence. Failures are appended, redacted, to
 /// `<app_data>/logs/desktop.log`.
@@ -1208,6 +1389,11 @@ async fn probe_cloud(
 ) -> Result<Value, String> {
     if !state.is_idle() {
         return Err("Stop the current session before testing cloud credentials".into());
+    }
+    if state.assistant.any_running() {
+        // A probe may restart the sidecar for fresh credentials, which would
+        // cut the job off.
+        return Err(assistant::ASSISTANT_BUSY.into());
     }
     let asr_provider = asr_provider.filter(|id| !id.trim().is_empty());
     let translation_provider = translation_provider.filter(|id| !id.trim().is_empty());
@@ -1233,18 +1419,7 @@ async fn probe_cloud(
         };
         let group = credential_group(group_id)?;
         let status = state.credentials.group_status(group_id, &providers)?;
-        let missing = group
-            .fields
-            .iter()
-            .filter(|field| field.required)
-            .filter(|field| {
-                !status
-                    .fields
-                    .iter()
-                    .any(|entry| entry.key == field.key && entry.available)
-            })
-            .map(|field| field.label.as_str())
-            .collect::<Vec<_>>();
+        let missing = missing_credential_labels(group, &status);
         if !missing.is_empty() {
             return Err(format!(
                 "Save the {} credentials first (missing: {})",
@@ -1260,16 +1435,11 @@ async fn probe_cloud(
         translation_provider.as_deref().unwrap_or("-")
     );
     let supervisor = state.supervisor().clone();
-    supervisor.shutdown().await;
-    supervisor
-        .configure_secret_environment(state.credentials.sidecar_environment(&providers)?)
-        .await;
     let outcome = async {
-        supervisor
-            .ensure_started()
-            .await
-            .map_err(|error| error.to_string())?;
-        state.check_catalog_digest(None).await;
+        // Launch (or restart, when credentials changed since launch) with the
+        // complete environment, so the sidecar stays usable for the next
+        // session and for assistant jobs after the probe.
+        state.ensure_sidecar(None, SidecarUser::Background).await?;
         let mut events = supervisor.subscribe();
         let request_id = uuid::Uuid::new_v4();
         supervisor
@@ -1296,12 +1466,6 @@ async fn probe_cloud(
         .map_err(|_| "Cloud provider validation timed out".to_string())?
     }
     .await;
-    // The probe sidecar was launched with credentials only. Stop it so the
-    // next real session starts with its complete model/runtime environment.
-    supervisor.shutdown().await;
-    state
-        .sidecar_environment_stale
-        .store(false, Ordering::Release);
     match &outcome {
         Ok(result) if result["ok"].as_bool() == Some(true) => {}
         Ok(result) => state.log_desktop_event(&format!(
@@ -1618,26 +1782,64 @@ async fn persist_sidecar_event(
 /// request. Core state is always updated; only the webview fan-out is paced.
 const TRANSLATION_DELTA_UI_INTERVAL: std::time::Duration = std::time::Duration::from_millis(66);
 
+/// One item of the FIFO persistence queue: the session it belongs to and the
+/// sidecar event to store.
+type PersistItem = (uuid::Uuid, SidecarEvent);
+
+/// Drain the persistence queue in order. `SessionFinished` is not stored: it
+/// reaches `on_session_finished` only after every earlier event of the queue
+/// has been written, so the hook (the auto title) sees the whole transcript.
+async fn run_persistence_queue<Report, Finished, Hook>(
+    state: &RuntimeState,
+    mut queue: tokio::sync::mpsc::Receiver<PersistItem>,
+    mut report_error: Report,
+    mut on_session_finished: Finished,
+) where
+    Report: FnMut(uuid::Uuid, String),
+    Finished: FnMut(uuid::Uuid) -> Hook,
+    Hook: std::future::Future<Output = ()>,
+{
+    while let Some((session_id, event)) = queue.recv().await {
+        if let SidecarEvent::SessionFinished {
+            session_id: finished,
+        } = event
+        {
+            on_session_finished(finished).await;
+            continue;
+        }
+        if let Err(error) = persist_sidecar_event(state, session_id, &event).await {
+            report_error(session_id, error);
+        }
+    }
+}
+
 fn forward_sidecar_events(app: AppHandle) {
     let mut receiver = app.state::<RuntimeState>().supervisor().subscribe();
     // Persistence runs on its own task so SQLite latency never delays the
     // canonical UI event stream. The channel is bounded; the forwarder awaits
     // when it fills, which only happens if storage is far behind.
-    let (persist_tx, mut persist_rx) =
-        tokio::sync::mpsc::channel::<(uuid::Uuid, SidecarEvent)>(4_096);
+    let (persist_tx, persist_rx) = tokio::sync::mpsc::channel::<PersistItem>(4_096);
     let persist_app = app.clone();
     tauri::async_runtime::spawn(async move {
-        while let Some((session_id, event)) = persist_rx.recv().await {
-            let state = persist_app.state::<RuntimeState>();
-            if let Err(error) = persist_sidecar_event(&state, session_id, &event).await {
+        let state = persist_app.state::<RuntimeState>();
+        run_persistence_queue(
+            &state,
+            persist_rx,
+            |session_id, error| {
                 let _ = state.emit_event(
                     &persist_app,
                     Some(session_id),
                     UiEventKind::Error,
                     json!({"code": "storage_error", "message": error, "recoverable": true}),
                 );
-            }
-        }
+            },
+            |session_id| {
+                // The title job runs on its own task; the queue keeps draining.
+                assistant::spawn_auto_title(persist_app.clone(), session_id);
+                std::future::ready(())
+            },
+        )
+        .await;
     });
     tauri::async_runtime::spawn(async move {
         let mut last_delta_emit: HashMap<String, std::time::Instant> = HashMap::new();
@@ -1651,6 +1853,14 @@ fn forward_sidecar_events(app: AppHandle) {
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
             let state = app.state::<RuntimeState>();
+            if let SidecarEvent::SessionFinished { session_id } = &event {
+                // Queued behind the session's last transcript/translation
+                // events (docs/adr/0006 auto title); never shown in the UI.
+                if persist_tx.send((*session_id, event.clone())).await.is_err() {
+                    break;
+                }
+                continue;
+            }
             let persist_event = event.clone();
             let mut segment_update: Option<SegmentSummary> = None;
             let mut suppress_ui = false;
@@ -2036,6 +2246,7 @@ async fn update_runtime_preferences(
     mut preferences: RuntimePreferences,
 ) -> Result<RuntimePreferences, String> {
     preferences.providers = validate_provider_settings(&preferences.providers)?;
+    preferences.assistant = preferences.assistant.normalized(catalog())?;
     let previous = {
         let mut guard = state
             .runtime_preferences
@@ -2044,6 +2255,12 @@ async fn update_runtime_preferences(
         std::mem::replace(&mut *guard, preferences.clone())
     };
     state.persist_preferences()?;
+    if previous.assistant.transcript_upload_allowed
+        && !preferences.assistant.transcript_upload_allowed
+    {
+        // Consent withdrawn: stop every job that sends transcripts or files.
+        state.assistant.cancel_uploading_jobs();
+    }
     if preferences.providers != previous.providers {
         state.invalidate_sidecar_environment().await;
     }
@@ -2130,40 +2347,7 @@ async fn prepare_inference_runtimes(
     session_id: uuid::Uuid,
     payload: &Value,
 ) -> Result<Vec<String>, String> {
-    let mut sidecar_environment = state.sidecar_environment()?;
-    sidecar_environment.insert(
-        "ECHOLINGO_MODEL_ROOT".into(),
-        state.models()?.root().to_string_lossy().into_owned(),
-    );
-    let alignment_spool = state
-        .models()?
-        .root()
-        .parent()
-        .ok_or_else(|| "model directory has no application-data parent".to_string())?
-        .join("alignment-spool");
-    sidecar_environment.insert(
-        "ECHOLINGO_ALIGNMENT_SPOOL_ROOT".into(),
-        alignment_spool.to_string_lossy().into_owned(),
-    );
-    sidecar_environment.extend(state.local_runtimes()?.capability_environment());
-    if state
-        .sidecar_environment_stale
-        .swap(false, Ordering::AcqRel)
-    {
-        // Credentials or provider settings changed while the sidecar was up;
-        // environment variables only apply at launch.
-        state.supervisor().shutdown().await;
-    }
-    state
-        .supervisor()
-        .configure_secret_environment(sidecar_environment)
-        .await;
-    state
-        .supervisor()
-        .ensure_started()
-        .await
-        .map_err(|error| error.to_string())?;
-    state.check_catalog_digest(Some(app)).await;
+    state.ensure_sidecar(Some(app), SidecarUser::LiveSession).await?;
     let mut receiver = state.supervisor().subscribe();
     state
         .supervisor()
@@ -2372,6 +2556,7 @@ async fn start_session(
                     privacy: serde_json::to_value(&config.privacy)
                         .map_err(|error| error.to_string())?,
                     model_config: route,
+                    context: config.session_context.clone(),
                 })
                 .await
                 .map_err(|error| error.to_string())?;
@@ -2547,8 +2732,20 @@ async fn history_open(
         .map_err(|error| error.to_string())
 }
 
+/// Tell every window that a History entry changed (`history_changed`,
+/// reason `title | notes | renamed | deleted`).
+fn emit_history_changed(app: &AppHandle, state: &RuntimeState, session_id: uuid::Uuid, reason: &str) {
+    let _ = state.emit_event(
+        app,
+        Some(session_id),
+        UiEventKind::HistoryChanged,
+        json!({"session_id": session_id, "reason": reason}),
+    );
+}
+
 #[tauri::command]
 async fn history_rename(
+    app: AppHandle,
     state: State<'_, RuntimeState>,
     session_id: String,
     title: String,
@@ -2560,19 +2757,29 @@ async fn history_rename(
         .store()?
         .rename(id, &title)
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    emit_history_changed(&app, &state, id, "renamed");
+    Ok(())
 }
 
 #[tauri::command]
-async fn history_delete(state: State<'_, RuntimeState>, session_id: String) -> Result<(), String> {
+async fn history_delete(
+    app: AppHandle,
+    state: State<'_, RuntimeState>,
+    session_id: String,
+) -> Result<(), String> {
     let id = session_id
         .parse()
         .map_err(|_| "invalid session id".to_string())?;
+    // Jobs for a deleted session could only fail when they save.
+    state.assistant.cancel_session_jobs(id);
     state
         .store()?
         .delete(id)
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    emit_history_changed(&app, &state, id, "deleted");
+    Ok(())
 }
 
 #[tauri::command]
@@ -2660,6 +2867,14 @@ pub fn run() {
             history_delete,
             history_export,
             history_export_to_path,
+            assistant::assistant_status,
+            assistant::assistant_probe,
+            assistant::get_session_notes,
+            assistant::pick_note_attachments,
+            assistant::create_session_notes,
+            assistant::cancel_session_notes,
+            assistant::generate_session_title,
+            assistant::import_context_files,
         ])
         .setup(|app| {
             let state = app.state::<RuntimeState>();
@@ -2875,6 +3090,7 @@ mod tests {
                     "transcript_upload_allowed": false
                 }),
                 model_config: route.clone(),
+                context: String::new(),
             })
             .await
             .map_err(|error| error.to_string())?;
@@ -3282,6 +3498,221 @@ mod tests {
         assert!(throttle.allow_revision(session, "source", "stable"));
         throttle.finish(session);
         assert!(throttle.allow_metrics(session, 20.0));
+    }
+
+    #[test]
+    fn every_sidecar_launch_gets_the_complete_environment() {
+        let secrets = HashMap::from([("DASHSCOPE_API_KEY".to_string(), "sk-test-1".to_string())]);
+        let capabilities = HashMap::from([(
+            "ECHOLINGO_LOCAL_QWEN_URL".to_string(),
+            "http://127.0.0.1:4100".to_string(),
+        )]);
+        let root = PathBuf::from("/data/EchoLingo/models");
+        let values = compose_full_sidecar_environment(secrets, &root, capabilities).unwrap();
+        assert_eq!(values["DASHSCOPE_API_KEY"], "sk-test-1");
+        assert_eq!(values["ECHOLINGO_MODEL_ROOT"], "/data/EchoLingo/models");
+        assert_eq!(
+            values["ECHOLINGO_ALIGNMENT_SPOOL_ROOT"],
+            "/data/EchoLingo/alignment-spool"
+        );
+        assert_eq!(values["ECHOLINGO_LOCAL_QWEN_URL"], "http://127.0.0.1:4100");
+        assert!(compose_full_sidecar_environment(
+            HashMap::new(),
+            std::path::Path::new("/"),
+            HashMap::new()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn missing_credentials_name_required_keys_and_an_empty_endpoint() {
+        let dashscope = catalog().group("dashscope").unwrap();
+        let none = |_: &str| None;
+        let status = group_status(dashscope, none, none, &ProviderSettings::new());
+        let missing = missing_credential_labels(dashscope, &status);
+        assert_eq!(missing, vec![dashscope.field("api_key").unwrap().label.clone()]);
+        let keychain = |account: &str| (account == "dashscope-api-key").then(|| "sk-key-123".into());
+        let status = group_status(dashscope, keychain, none, &ProviderSettings::new());
+        assert!(missing_credential_labels(dashscope, &status).is_empty());
+
+        let custom = catalog().group("custom_openai").unwrap();
+        let status = group_status(custom, none, none, &ProviderSettings::new());
+        assert_eq!(
+            missing_credential_labels(custom, &status),
+            vec![custom.setting("base_url").unwrap().label.clone()]
+        );
+        let mut providers = ProviderSettings::new();
+        providers.insert(
+            "custom_openai".into(),
+            HashMap::from([("base_url".to_string(), "http://127.0.0.1:8080/v1".to_string())]),
+        );
+        let status = group_status(custom, none, none, &providers);
+        assert!(missing_credential_labels(custom, &status).is_empty());
+    }
+
+    #[test]
+    fn session_defaults_bound_the_context_and_glossary() {
+        let mut defaults = StartSessionRequest::default();
+        defaults.session_context = "Topic: early vision\nsaccade = 扫视".into();
+        defaults.glossary = "Julesz\ntexton = 纹理基元".into();
+        assert!(validate_session_defaults(&defaults).is_ok());
+        defaults.session_context = "x".repeat(app_core::SESSION_CONTEXT_MAX_CHARS + 1);
+        assert!(validate_session_defaults(&defaults)
+            .unwrap_err()
+            .contains("session context"));
+        defaults.session_context.clear();
+        defaults.glossary = "x".repeat(app_core::GLOSSARY_MAX_CHARS + 1);
+        assert!(validate_session_defaults(&defaults)
+            .unwrap_err()
+            .contains("glossary"));
+
+        // A hand-edited file with over-long text keeps everything else.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preferences.json");
+        let mut preferences = DesktopPreferences::default();
+        preferences.onboarding_complete = true;
+        preferences.session.target_language = "ja".into();
+        preferences.session.glossary = defaults.glossary.clone();
+        save_preferences(&path, &preferences).unwrap();
+        let loaded = load_preferences(&path);
+        assert!(loaded.onboarding_complete);
+        assert_eq!(loaded.session.target_language, "ja");
+        assert!(loaded.session.glossary.is_empty());
+    }
+
+    #[test]
+    fn runtime_preferences_keep_a_valid_assistant_and_reset_an_unknown_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preferences.json");
+        let mut preferences = DesktopPreferences::default();
+        assert_eq!(preferences.runtime.assistant, AssistantPreferences::default());
+        preferences.runtime.assistant = AssistantPreferences {
+            provider_group: "dashscope".into(),
+            model: "qwen-max".into(),
+            transcript_upload_allowed: true,
+            auto_title: false,
+        };
+        preferences.session.session_context = "Topic: textures".into();
+        save_preferences(&path, &preferences).unwrap();
+        let loaded = load_preferences(&path);
+        assert_eq!(loaded.runtime.assistant, preferences.runtime.assistant);
+        assert_eq!(loaded.session.session_context, "Topic: textures");
+
+        // Files written before docs/adr/0006 have no `assistant`.
+        let legacy: RuntimePreferences =
+            serde_json::from_str(r#"{"preload_local_models": true, "providers": {}}"#).unwrap();
+        assert_eq!(legacy.assistant, AssistantPreferences::default());
+        assert!(legacy.assistant.auto_title && !legacy.assistant.transcript_upload_allowed);
+
+        // A group that is not an assistant preset resets the choice and the
+        // consent, without discarding the rest of the file.
+        preferences.runtime.assistant.provider_group = "deepl".into();
+        save_preferences(&path, &preferences).unwrap();
+        let loaded = load_preferences(&path);
+        assert_eq!(loaded.runtime.assistant, AssistantPreferences::default());
+        assert_eq!(loaded.session.session_context, "Topic: textures");
+    }
+
+    #[tokio::test]
+    async fn stale_environment_restart_waits_for_in_flight_assistant_jobs() {
+        let state = RuntimeState::default();
+        let stale = |state: &RuntimeState| state.sidecar_environment_stale.load(Ordering::Acquire);
+        let (job_id, _cancel, _) = state
+            .assistant
+            .register(assistant::AssistantTask::Probe, None, false)
+            .unwrap();
+        // Registered but not yet sent: restarting is still harmless.
+        state.invalidate_sidecar_environment().await;
+        assert!(!stale(&state));
+        state.assistant.mark_dispatched(job_id);
+        state.invalidate_sidecar_environment().await;
+        assert!(stale(&state), "restart must wait for the in-flight job");
+        // Jobs never make the live session busy.
+        assert!(state.is_idle());
+        state
+            .assistant
+            .finish(job_id, assistant::JobState::Completed, None, None, None);
+        state.restart_stale_sidecar_if_quiet().await;
+        assert!(!stale(&state));
+
+        // A live session defers the restart as before.
+        state
+            .core
+            .lock()
+            .unwrap()
+            .start(StartSessionRequest::default())
+            .unwrap();
+        state.invalidate_sidecar_environment().await;
+        assert!(stale(&state));
+    }
+
+    fn transcript_event(session_id: uuid::Uuid, revision: i64, text: &str) -> SidecarEvent {
+        SidecarEvent::Transcript(json!({
+            "session_id": session_id,
+            "event_id": uuid::Uuid::new_v4(),
+            "revision_id": revision,
+            "kind": "stable",
+            "text": text,
+            "start_ms": revision as f64 * 1_000.0,
+            "end_ms": revision as f64 * 1_000.0 + 900.0,
+            "backend": "mock",
+        }))
+    }
+
+    #[tokio::test]
+    async fn persistence_queue_stores_every_segment_before_the_finished_hook() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = RuntimeState::default();
+        state
+            .store
+            .set(
+                TranscriptStore::open(directory.path().join("history.sqlite"))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+        let session_id = uuid::Uuid::new_v4();
+        create_soak_history(&state, session_id, &json!({}), 1)
+            .await
+            .unwrap();
+        let (sender, queue) = tokio::sync::mpsc::channel::<PersistItem>(16);
+        for revision in 1..=3 {
+            sender
+                .send((session_id, transcript_event(session_id, revision, "Textures pop out.")))
+                .await
+                .unwrap();
+        }
+        sender
+            .send((session_id, SidecarEvent::SessionFinished { session_id }))
+            .await
+            .unwrap();
+        // Alignment and late events after the hook are still stored.
+        sender
+            .send((session_id, transcript_event(session_id, 4, "Late unit.")))
+            .await
+            .unwrap();
+        drop(sender);
+
+        let store = state.store().unwrap().clone();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut errors = Vec::new();
+        run_persistence_queue(
+            &state,
+            queue,
+            |_, error| errors.push(error),
+            |finished| {
+                let store = store.clone();
+                let seen = Arc::clone(&seen);
+                async move {
+                    let stored = store.detail(finished).await.unwrap().segments.len();
+                    seen.lock().unwrap().push((finished, stored));
+                }
+            },
+        )
+        .await;
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(*seen.lock().unwrap(), vec![(session_id, 3)]);
+        assert_eq!(store.detail(session_id).await.unwrap().segments.len(), 4);
     }
 
     #[tokio::test]

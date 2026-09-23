@@ -641,6 +641,117 @@ def chat_preset_values(provider_id: str, config, env: Mapping[str, str]) -> dict
     }
 
 
+# --- AI assistant (notes, titles, context terms; docs/adr/0006) ---------------
+
+
+@dataclass(frozen=True, slots=True)
+class AssistantPreset:
+    """An OpenAI-compatible chat endpoint the History assistant can use.
+
+    Keys come from the existing credential group; nothing here is a secret.
+    ``base_url`` is empty when it is resolved at runtime (DashScope region and
+    workspace, the custom endpoint).
+    """
+
+    group_id: str
+    display_name: str
+    default_model: str
+    models: tuple[str, ...]
+    base_url: str = ""
+    api_key_env: str = ""
+    key_required: bool = True
+    # Accepts ``stream_options.include_usage`` (Gemini's OpenAI layer and
+    # unknown self-hosted servers may reject it with HTTP 400).
+    stream_usage: bool = False
+
+
+# credential group -> (base_url, api key env) from the chat translation presets
+_CHAT_BY_GROUP: dict[str, tuple[str, str]] = {
+    group: (base_url, key_env) for group, base_url, _model, key_env in CHAT_PRESETS.values()
+}
+
+ASSISTANT_PRESETS: dict[str, AssistantPreset] = {}
+
+
+def _assistant(
+    group_id: str,
+    default_model: str,
+    models: tuple[str, ...],
+    *,
+    display_name: str | None = None,
+    stream_usage: bool = True,
+) -> AssistantPreset:
+    group = CREDENTIAL_GROUPS[group_id]
+    base_url, key_env = _CHAT_BY_GROUP.get(group_id, ("", ""))
+    key_field = next(field_spec for field_spec in group.fields if field_spec.key == "api_key")
+    preset = AssistantPreset(
+        group_id=group_id,
+        display_name=display_name or group.display_name,
+        default_model=default_model,
+        models=models,
+        base_url=base_url,
+        api_key_env=key_env or key_field.env_var,
+        key_required=key_field.required,
+        stream_usage=stream_usage,
+    )
+    ASSISTANT_PRESETS[group_id] = preset
+    return preset
+
+
+_assistant(
+    "dashscope",
+    "qwen-plus",
+    ("qwen-plus", "qwen-max", "qwen-turbo", "qwen-long"),
+    display_name="Qwen (Alibaba Model Studio)",
+)
+_assistant("openai", "gpt-4o-mini", ("gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"))
+_assistant("deepseek", "deepseek-chat", ("deepseek-chat",))
+_assistant("gemini", "gemini-2.0-flash", ("gemini-2.0-flash", "gemini-2.5-flash"), stream_usage=False)
+_assistant("groq", "llama-3.3-70b-versatile", ("llama-3.3-70b-versatile",))
+_assistant("openrouter", "openai/gpt-4o-mini", ("openai/gpt-4o-mini",))
+_assistant(
+    "siliconflow",
+    "Qwen/Qwen2.5-72B-Instruct",
+    ("Qwen/Qwen2.5-72B-Instruct", "deepseek-ai/DeepSeek-V3"),
+)
+_assistant("custom_openai", "", (), stream_usage=False)
+
+
+def assistant_preset_values(
+    group_id: str, model: str | None, env: Mapping[str, str]
+) -> dict[str, Any]:
+    """Resolve base URL / model / key for an assistant preset.
+
+    DashScope follows the shared region setting (``ECHOLINGO_QWEN_REGION``)
+    and optional workspace (``DASHSCOPE_WORKSPACE_ID``); the custom endpoint
+    reads its base URL and model from its credential-card settings. An empty
+    ``model`` selects the preset default.
+    """
+    preset = ASSISTANT_PRESETS[group_id]
+    endpoint = None
+    if group_id == "dashscope":
+        from . import dashscope
+
+        region = dashscope.normalize_region(env.get(DASHSCOPE_REGION_SETTING.env_var))
+        endpoint = dashscope.resolve_endpoint(region, env.get("DASHSCOPE_WORKSPACE_ID"))
+        base_url = endpoint.compatible_base_url
+    else:
+        base_url = (env.get(f"ECHOLINGO_{group_id.upper()}_BASE_URL") or preset.base_url).strip()
+    chosen = (model or "").strip()
+    if not chosen and group_id == "custom_openai":
+        chosen = (env.get("ECHOLINGO_CUSTOM_OPENAI_CHAT_MODEL") or "").strip()
+    return {
+        "group": group_id,
+        "display_name": preset.display_name,
+        "base_url": base_url,
+        "model": chosen or preset.default_model,
+        "api_key": (env.get(preset.api_key_env) or "").strip(),
+        "key_required": preset.key_required,
+        "stream_usage": preset.stream_usage,
+        "dashscope_endpoint": endpoint,
+    }
+
+
 def _mt_chat_factory(provider_id: str):
     def build(config, env):
         from .translation.openai_chat import OpenAiChatTranslation
@@ -924,6 +1035,17 @@ def catalog() -> dict[str, Any]:
         "asr": [spec_json(spec) for spec in specs("asr")],
         "translation": [spec_json(spec) for spec in specs("translation")],
         "credential_groups": [group_json(group) for group in CREDENTIAL_GROUPS.values()],
+        # Environment-independent on purpose: the digest of this catalog must
+        # match the copy embedded in the desktop shell.
+        "assistant": [
+            {
+                "group_id": preset.group_id,
+                "display_name": preset.display_name,
+                "default_model": preset.default_model,
+                "models": list(preset.models),
+            }
+            for preset in ASSISTANT_PRESETS.values()
+        ],
     }
 
 
@@ -947,6 +1069,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{kind}:")
         for spec in specs(kind):
             print(f"  {spec.id:18s} {spec.locality.value:6s} {spec.display_name}")
+    print("assistant:")
+    for preset in ASSISTANT_PRESETS.values():
+        print(f"  {preset.group_id:18s} {preset.default_model or '-':26s} {preset.display_name}")
     return 0
 
 
