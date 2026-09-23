@@ -1,4 +1,4 @@
-//! AI assistant jobs driven by the shell (docs/adr/0006): session notes,
+//! AI assistant jobs driven by the shell: session notes,
 //! session titles, lecture-context import and the provider probe.
 //!
 //! The assistant runs inside the Python sidecar. This module gates each

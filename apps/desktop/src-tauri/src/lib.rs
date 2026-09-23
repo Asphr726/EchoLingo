@@ -534,7 +534,7 @@ struct RuntimeState {
     persistence_throttle: Mutex<PersistenceThrottle>,
     runtime_preferences: Mutex<RuntimePreferences>,
     warmup_in_progress: std::sync::atomic::AtomicBool,
-    /// Running AI assistant jobs and picked note attachments (docs/adr/0006).
+    /// Running AI assistant jobs and picked note attachments.
     assistant: assistant::AssistantRegistry,
     /// Serialises every decision to launch, restart or stop the sidecar, so a
     /// restart can never slip between an assistant job's launch and its
@@ -930,7 +930,7 @@ struct RuntimePreferences {
     /// Non-secret `ProviderSetting` values per credential group, for example
     /// `{"dashscope": {"region": "beijing"}}`. Secrets never live here.
     providers: ProviderSettings,
-    /// AI assistant for session notes and titles (docs/adr/0006).
+    /// AI assistant for session notes and titles.
     assistant: AssistantPreferences,
 }
 
@@ -1855,7 +1855,7 @@ fn forward_sidecar_events(app: AppHandle) {
             let state = app.state::<RuntimeState>();
             if let SidecarEvent::SessionFinished { session_id } = &event {
                 // Queued behind the session's last transcript/translation
-                // events (docs/adr/0006 auto title); never shown in the UI.
+                // events (auto title); never shown in the UI.
                 if persist_tx.send((*session_id, event.clone())).await.is_err() {
                     break;
                 }
@@ -1948,7 +1948,7 @@ fn forward_sidecar_events(app: AppHandle) {
                 | SidecarEvent::CloudProbeResult { .. }
                 | SidecarEvent::SessionFinished { .. }
                 // Assistant events are consumed by the job that sent the
-                // request (docs/adr/0006); they never reach the live stream.
+                // request; they never reach the live stream.
                 | SidecarEvent::AssistantProgress { .. }
                 | SidecarEvent::AssistantDelta { .. }
                 | SidecarEvent::AssistantResult { .. } => continue,
@@ -3598,7 +3598,7 @@ mod tests {
         assert_eq!(loaded.runtime.assistant, preferences.runtime.assistant);
         assert_eq!(loaded.session.session_context, "Topic: textures");
 
-        // Files written before docs/adr/0006 have no `assistant`.
+        // Files written before AI notes existed have no `assistant`.
         let legacy: RuntimePreferences =
             serde_json::from_str(r#"{"preload_local_models": true, "providers": {}}"#).unwrap();
         assert_eq!(legacy.assistant, AssistantPreferences::default());
