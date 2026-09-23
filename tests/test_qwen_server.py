@@ -141,6 +141,7 @@ def _streamer(**overrides):
         segment_punct_min_steps=100,
         echolingo_pause_roll_min_steps=50,
         echolingo_pause_roll_steps=10,
+        echolingo_punct_roll_min_steps=0,
     )
     values.update(overrides)
     return cls(**values)
@@ -189,6 +190,22 @@ def test_confirmed_boundary_roll_commits_the_sentence_and_strips_a_new_edge_mark
     )
     assert event["committed"] == streamer.completed_text
     assert streamer.rolls_by_reason == {"confirmed": 1}
+
+
+def test_delayed_punctuation_roll_strips_an_edge_mark_but_keeps_interior_ends() -> None:
+    streamer = _streamer(echolingo_punct_roll_min_steps=100)
+    assert not _feed(streamer, "Textures just pop out and others are hard to find.", 110)["segment_rollover"]
+    event = _feed(streamer, "Textures just pop out and others are hard to find. Okay so let's do another.", 122)
+    assert event["segment_rollover_reason"] == "punctuation"
+    # The real end became interior and survives; the new edge mark is stripped.
+    assert streamer.completed_text == (
+        "Textures just pop out and others are hard to find. Okay so let's do another"
+    )
+    streamer = _streamer(echolingo_punct_roll_min_steps=100)
+    _feed(streamer, "so he was really puzzling about what makes some.", 110)
+    event = _feed(streamer, "so he was really puzzling about what makes some textures", 122)
+    assert event["segment_rollover_reason"] == "punctuation"
+    assert streamer.completed_text == "so he was really puzzling about what makes some textures"
 
 
 def test_cap_roll_strips_the_invented_edge_period() -> None:

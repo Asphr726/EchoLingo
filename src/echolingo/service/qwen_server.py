@@ -48,6 +48,7 @@ DECODE_POLICY_DEFAULTS: dict[str, Any] = {
     "segment_punct_min_steps": 100,
     "echolingo_pause_roll": True,
     "echolingo_confirmed_roll": True,
+    "echolingo_punct_roll_min_steps": 100,
     "echolingo_pause_roll_min_steps": 50,
     "echolingo_pause_roll_steps": 10,
     "echolingo_strip_edge_punct": True,
@@ -60,6 +61,8 @@ _ENVIRONMENT_KEYS = {
     "segment_punct_min_steps": ("ECHOLINGO_QWEN_SEGMENT_PUNCT_MIN_STEPS", int, 20, 400),
     "echolingo_pause_roll": ("ECHOLINGO_QWEN_PAUSE_ROLL", bool, None, None),
     "echolingo_confirmed_roll": ("ECHOLINGO_QWEN_CONFIRMED_ROLL", bool, None, None),
+    # 0 disables the delayed punctuation roll (pause/confirmed/cap rolls only).
+    "echolingo_punct_roll_min_steps": ("ECHOLINGO_QWEN_PUNCT_ROLL_MIN_STEPS", int, 0, 400),
     "echolingo_pause_roll_min_steps": ("ECHOLINGO_QWEN_PAUSE_ROLL_MIN_STEPS", int, 10, 400),
     "echolingo_pause_roll_steps": ("ECHOLINGO_QWEN_PAUSE_ROLL_STEPS", int, 3, 60),
     "echolingo_strip_edge_punct": ("ECHOLINGO_QWEN_STRIP_EDGE_PUNCT", bool, None, None),
@@ -190,6 +193,7 @@ def make_segmented_streamer_class(base: type) -> type:
     class EchoLingoSegmentedStreamer(base):  # type: ignore[misc,valid-type]
         echolingo_pause_roll: bool = True
         echolingo_confirmed_roll: bool = True
+        echolingo_punct_roll_min_steps: int = 100
         echolingo_pause_roll_min_steps: int = 50
         echolingo_pause_roll_steps: int = 10
         echolingo_strip_edge_punct: bool = True
@@ -205,6 +209,7 @@ def make_segmented_streamer_class(base: type) -> type:
             self._pause_tracker = PauseRollTracker(
                 min_steps=self.echolingo_pause_roll_min_steps,
                 pause_steps=self.echolingo_pause_roll_steps,
+                punct_min_steps=self.echolingo_punct_roll_min_steps or None,
                 confirmed_rolls=self.echolingo_confirmed_roll,
             )
 
@@ -293,6 +298,7 @@ def install_streaming_policy(
         # Declared here so ``apply_decode_policy`` (hasattr-based) accepts them.
         echolingo_pause_roll = True
         echolingo_confirmed_roll = True
+        echolingo_punct_roll_min_steps = 100
         echolingo_pause_roll_min_steps = 50
         echolingo_pause_roll_steps = 10
         echolingo_strip_edge_punct = True
@@ -331,6 +337,7 @@ def install_streaming_policy(
             values.update(
                 echolingo_pause_roll=bool(self.echolingo_pause_roll),
                 echolingo_confirmed_roll=bool(self.echolingo_confirmed_roll),
+                echolingo_punct_roll_min_steps=int(self.echolingo_punct_roll_min_steps),
                 echolingo_pause_roll_min_steps=int(self.echolingo_pause_roll_min_steps),
                 echolingo_pause_roll_steps=int(self.echolingo_pause_roll_steps),
                 echolingo_strip_edge_punct=bool(self.echolingo_strip_edge_punct),

@@ -66,27 +66,38 @@ def strip_edge_punct(text: str) -> str:
 
 
 class PauseRollTracker:
-    """Decide when a sentence mark at the hypothesis end is a real boundary.
+    """Decide when and how the active segment rolls at a sentence mark.
 
     ``observe`` is called once per decode with the active segment hypothesis
-    and returns ``None`` (keep decoding) or the roll reason:
+    and returns ``None`` (keep decoding) or a roll reason:
 
     * ``"pause"`` – the hypothesis ends with a sentence mark and stayed exactly
       the same while at least ``pause_steps`` new audio steps (80 ms each)
-      were decoded: the speaker stopped, the mark is real and is kept;
-    * ``"confirmed"`` – the next decode kept the mark *and* continued after it,
-      so the sentence boundary is real even without a pause (continuous
-      lecture speech rarely pauses long enough).
+      were decoded: the speaker stopped, so the mark is real and is kept;
+    * ``"punctuation"`` – once the segment holds ``punct_min_steps``, an edge
+      mark schedules a roll on the *next* decode. Waiting one decode lets a
+      real sentence end become interior ("…find. Okay so") while an invented
+      one is usually revised away ("some." → "some textures"); whatever edge
+      mark the new hypothesis ends with is stripped by the caller. This keeps
+      segments as short as the upstream eager rule (decode cost grows with
+      segment length) without committing invented marks;
+    * ``"confirmed"`` – before ``punct_min_steps``, the next decode kept the
+      mark *and* continued after it.
 
-    A mark that the next decode revises away ("some." → "some textures") was a
-    window-edge artefact and never causes a roll. Rolls need ``min_steps``.
+    Rolls never happen below ``min_steps``.
     """
 
     def __init__(
-        self, *, min_steps: int = 50, pause_steps: int = 10, confirmed_rolls: bool = True
+        self,
+        *,
+        min_steps: int = 50,
+        pause_steps: int = 10,
+        punct_min_steps: int | None = 100,
+        confirmed_rolls: bool = True,
     ) -> None:
         self.min_steps = max(1, int(min_steps))
         self.pause_steps = max(1, int(pause_steps))
+        self.punct_min_steps = None if punct_min_steps is None else max(1, int(punct_min_steps))
         self.confirmed_rolls = confirmed_rolls
         self._candidate: str | None = None
         self._quiet_steps = 0
@@ -98,19 +109,21 @@ class PauseRollTracker:
     def observe(self, hypothesis: str, *, new_steps: int, cached_steps: int) -> str | None:
         text = " ".join((hypothesis or "").split())
         candidate = self._candidate
-        long_enough = int(cached_steps) >= self.min_steps
-        if candidate is not None and text == candidate:
-            self._quiet_steps += max(0, int(new_steps))
-            if self._quiet_steps >= self.pause_steps and long_enough:
-                return "pause"
-            return None
-        if (
-            self.confirmed_rolls
-            and candidate is not None
-            and long_enough
-            and text.startswith(candidate + " ")
-        ):
-            return "confirmed"
+        cached_steps = int(cached_steps)
+        if candidate is not None:
+            if text == candidate:
+                self._quiet_steps += max(0, int(new_steps))
+                if self._quiet_steps >= self.pause_steps and cached_steps >= self.min_steps:
+                    return "pause"
+                return None
+            if self.punct_min_steps is not None and cached_steps >= self.punct_min_steps:
+                return "punctuation"
+            if (
+                self.confirmed_rolls
+                and cached_steps >= self.min_steps
+                and text.startswith(candidate + " ")
+            ):
+                return "confirmed"
         if ends_with_sentence_mark(text):
             self._candidate = text
             self._quiet_steps = 0

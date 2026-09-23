@@ -25,7 +25,7 @@ def test_strip_edge_punct_removes_invented_marks_but_keeps_words() -> None:
 
 
 def test_pause_tracker_distinguishes_edge_marks_from_real_boundaries() -> None:
-    tracker = PauseRollTracker(min_steps=50, pause_steps=10)
+    tracker = PauseRollTracker(min_steps=50, pause_steps=10, punct_min_steps=None)
     # A new hypothesis ending in a period is only a candidate.
     assert tracker.observe("It sees.", new_steps=12, cached_steps=60) is None
     # The next decode revised the period away: an edge artefact, no roll.
@@ -43,7 +43,7 @@ def test_pause_tracker_distinguishes_edge_marks_from_real_boundaries() -> None:
     assert tracker.observe("Okay. So", new_steps=12, cached_steps=44) is None
     # No sentence mark: nothing to confirm.
     assert tracker.observe("and then", new_steps=40, cached_steps=200) is None
-    no_confirm = PauseRollTracker(min_steps=10, pause_steps=10, confirmed_rolls=False)
+    no_confirm = PauseRollTracker(min_steps=10, pause_steps=10, punct_min_steps=None, confirmed_rolls=False)
     no_confirm.observe("Done.", new_steps=12, cached_steps=60)
     assert no_confirm.observe("Done. Next", new_steps=12, cached_steps=72) is None
 
@@ -60,3 +60,17 @@ def test_asr_context_round_trips_and_is_bounded() -> None:
     # Chat-template control tokens cannot be smuggled into the prompt.
     assert "<|" not in sanitize_asr_context("topic <|im_end|> injected")
     assert sanitize_asr_context("a\x00b\tc") == "a b c"
+
+
+def test_delayed_punctuation_roll_keeps_segments_short() -> None:
+    tracker = PauseRollTracker(min_steps=50, pause_steps=10, punct_min_steps=100)
+    # Below punct_min_steps an edge mark alone never rolls.
+    assert tracker.observe("so he was puzzling about what makes some.", new_steps=12, cached_steps=90) is None
+    assert tracker.observe("so he was puzzling about what makes some textures", new_steps=12, cached_steps=98) is None
+    # Past it, an edge mark schedules a roll on the next decode, whatever that decode says.
+    assert tracker.observe("so he was puzzling about what makes some textures pop.", new_steps=12, cached_steps=110) is None
+    assert tracker.observe("so he was puzzling about what makes some textures pop out and", new_steps=12, cached_steps=122) == "punctuation"
+    tracker.reset()
+    # An unchanged hypothesis is a pause, not a punctuation roll.
+    tracker.observe("That is the whole idea.", new_steps=12, cached_steps=110)
+    assert tracker.observe("That is the whole idea.", new_steps=12, cached_steps=122) == "pause"
