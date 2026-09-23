@@ -5,7 +5,7 @@ the topic, and capitalized multi-word names, acronyms and other technical
 tokens that occur at least twice give recognition hint terms. With a model
 (explicit consent only) the terms can be complemented by ``term =
 translation`` lines. The output uses the grammar that
-``echolingo.session_context`` parses (docs/adr/0006):
+``echolingo.session_context`` parses:
 
     Topic: <slide titles>
     Terms: <term>, <term>, ...

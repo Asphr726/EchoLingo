@@ -4,7 +4,7 @@ Pure functions and a small state machine, kept free of torch/qwen imports so
 they are unit-testable without the model runtime (see qwen_server.py for the
 streamer subclass that applies them).
 
-Background (docs/adr/0006): the 0.6B model punctuates the end of almost every
+Background: the 0.6B model punctuates the end of almost every
 decode window as if the utterance had ended ("…what is it that makes some.").
 Rolling a segment on such an *edge* mark commits it verbatim, restarts the
 decoder without context and turns one sentence into two fragments. A segment

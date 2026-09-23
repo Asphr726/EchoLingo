@@ -178,7 +178,7 @@ impl CredentialGroup {
 }
 
 /// A chat provider the AI assistant can use for notes and titles
-/// (docs/adr/0006). `group_id` names the credential group whose key it uses.
+///. `group_id` names the credential group whose key it uses.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AssistantPreset {
     pub group_id: String,
@@ -201,7 +201,7 @@ pub struct ProviderCatalog {
     #[serde(default)]
     pub credential_groups: Vec<CredentialGroup>,
     /// Chat presets for the AI assistant; absent in catalogs exported before
-    /// docs/adr/0006.
+    /// the assistant existed.
     #[serde(default)]
     pub assistant: Vec<AssistantPreset>,
 }
@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn assistant_presets_are_optional_and_reference_credential_groups() {
-        // Catalogs exported before docs/adr/0006 have no `assistant` array.
+        // Catalogs exported before AI notes existed have no `assistant` array.
         let legacy = ProviderCatalog::parse(
             r#"{"schema_version": 1, "asr": [], "translation": [], "credential_groups": []}"#,
         )

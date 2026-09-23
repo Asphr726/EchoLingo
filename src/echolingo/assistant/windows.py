@@ -1,6 +1,6 @@
 """Transcript windows, title excerpts and reference-material budgets.
 
-Long sessions are written part by part (docs/adr/0006): the committed
+Long sessions are written part by part: the committed
 transcript units are split at unit boundaries into windows of roughly 12–15
 minutes, and each window's request carries only the pages or slides of the
 attachments that are most relevant to it. Everything here is pure and

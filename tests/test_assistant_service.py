@@ -134,7 +134,7 @@ def notes_payload(transcript: list[dict], **extra) -> dict:
 
 
 def rebuild_like_the_shell(events: list[dict]) -> str:
-    """Apply deltas the way docs/adr/0006 describes: append-only, in seq order."""
+    """Apply deltas as the desktop shell does: append-only, in seq order."""
     text = ""
     last_seq = 0
     for event in events:

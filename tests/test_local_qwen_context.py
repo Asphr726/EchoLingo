@@ -1,4 +1,4 @@
-"""Local Qwen ASR adapter: session context header (docs/adr/0006).
+"""Local Qwen ASR adapter: session context header.
 
 A fake ``websockets.connect`` captures the handshake; nothing touches the
 network or a model runtime.

@@ -89,7 +89,7 @@ def desktop_config(payload: dict[str, Any]):
     config.privacy.transcript_upload_allowed = bool(
         privacy.get("transcript_upload_allowed", False)
     )
-    # Session context (docs/adr/0006). Absent keys keep the config file's
+    # Session context. Absent keys keep the config file's
     # values so older shells still start sessions.
     for key in ("session_context", "glossary"):
         if key in payload:

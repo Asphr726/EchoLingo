@@ -75,7 +75,7 @@ pub struct StartSessionRequest {
     /// Which cloud translation provider the Auto/Cloud route may use.
     #[serde(default = "default_cloud_preference")]
     pub cloud_translation_preference: String,
-    /// Per-lecture topic and terms (docs/adr/0006). Sent to recognition and
+    /// Per-lecture topic and terms. Sent to recognition and
     /// translation providers only under the session's upload flags.
     #[serde(default)]
     pub session_context: String,
@@ -118,8 +118,8 @@ pub fn validate_session_text(request: &StartSessionRequest) -> Result<(), Sessio
 /// Upper bound for a user-typed assistant model name.
 pub const ASSISTANT_MODEL_MAX_CHARS: usize = 100;
 
-/// AI assistant used for session notes and titles (`RuntimePreferences.assistant`,
-/// docs/adr/0006). Holds no secrets: keys come from the credential cards.
+/// AI assistant used for session notes and titles (`RuntimePreferences.assistant`).
+/// Holds no secrets: keys come from the credential cards.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AssistantPreferences {

@@ -12,7 +12,7 @@ Protocol summary (``wss://streaming.assemblyai.com/v3/ws``):
   ``Termination`` after ``Terminate``;
 * there is no keepalive message; the server keeps idle sessions open for a
   while on its own;
-* session hint terms (docs/adr/0006) travel as ``keyterms_prompt``, a JSON
+* session hint terms travel as ``keyterms_prompt``, a JSON
   array of at most 100 terms of at most 50 characters each (2000 UTF-8 bytes
   in total, because it travels in the URL).
 

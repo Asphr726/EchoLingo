@@ -281,7 +281,7 @@ def test_desktop_profiles_follow_installed_models() -> None:
     assert config.asr.local_profile == "quality"
 
 
-# --- AI assistant presets (docs/adr/0006) ------------------------------------
+# --- AI assistant presets ------------------------------------
 
 
 def test_assistant_presets_are_exported_in_the_catalog() -> None:

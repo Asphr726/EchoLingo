@@ -1,4 +1,4 @@
-"""Session context: lecture topic, recognition hints and glossary (ADR 0006).
+"""Session context: lecture topic, recognition hints and glossary.
 
 The desktop shell sends two free-text fields with every session start:
 

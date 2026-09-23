@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 pub const SCHEMA_VERSION: u32 = 2;
 
-/// Where a session title came from (`sessions.title_source`, docs/adr/0006).
+/// Where a session title came from (`sessions.title_source`).
 pub const TITLE_SOURCE_DEFAULT: &str = "default";
 /// Typed by the user; AI titles never replace it.
 pub const TITLE_SOURCE_USER: &str = "user";
@@ -49,7 +49,7 @@ pub struct SessionDraft {
     pub route_reason: String,
     pub privacy: serde_json::Value,
     pub model_config: serde_json::Value,
-    /// Per-lecture topic and terms the session ran with (docs/adr/0006).
+    /// Per-lecture topic and terms the session ran with.
     #[serde(default)]
     pub context: String,
 }
@@ -206,7 +206,7 @@ pub enum ExportFormat {
     Json,
     Srt,
     Vtt,
-    /// The saved AI notes alone, as Markdown (docs/adr/0006).
+    /// The saved AI notes alone, as Markdown.
     Notes,
 }
 

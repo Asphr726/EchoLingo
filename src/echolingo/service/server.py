@@ -20,7 +20,7 @@ from .session import DesktopInferenceSession
 
 log = logging.getLogger("echolingo.sidecar")
 
-# Features the shell may rely on (docs/adr/0006).
+# Features the shell may rely on.
 CAPABILITIES = ["assistant.v1", "asr_context.v1"]
 # Assistant requests carry transcripts of long sessions.
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024

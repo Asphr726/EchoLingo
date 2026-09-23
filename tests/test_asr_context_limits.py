@@ -1,4 +1,4 @@
-"""Session-context bounds shared by the cloud ASR adapters (docs/adr/0006)."""
+"""Session-context bounds shared by the cloud ASR adapters."""
 
 from __future__ import annotations
 

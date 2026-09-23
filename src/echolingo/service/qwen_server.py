@@ -7,7 +7,7 @@ windowed backend's repetition guard and punctuation-based segment rollover are
 fixed at construction time. Both matter for lectures: the 0.6B model can lock
 into "it's like, it's like, ..." loops on noisy far-field audio.
 
-Segment rollover (docs/adr/0006): the upstream "punctuation rollover" rolled
+Segment rollover: the upstream "punctuation rollover" rolled
 whenever the latest hypothesis ended in ``.!?``, but the model invents such a
 mark at almost every decode-window edge, so sentences were committed in
 fragments. ``EchoLingoSegmentedStreamer`` rolls only on a pause-confirmed

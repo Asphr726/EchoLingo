@@ -1,4 +1,4 @@
--- Session context, title provenance and AI notes (docs/adr/0006).
+-- Session context, title provenance and AI notes.
 
 ALTER TABLE sessions ADD COLUMN title_source TEXT NOT NULL DEFAULT 'default';
 ALTER TABLE sessions ADD COLUMN context TEXT NOT NULL DEFAULT '';

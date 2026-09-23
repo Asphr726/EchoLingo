@@ -134,7 +134,7 @@ class AsrSessionConfig:
     language: str
     sample_rate_hz: int = 16_000
     streaming_mode: str = "streaming"
-    # Session context (docs/adr/0006): a short topic/terms prompt and the hint
+    # Session context: a short topic/terms prompt and the hint
     # terms on their own, for providers that take a keyword list.
     context: str = ""
     terms: tuple[str, ...] = ()

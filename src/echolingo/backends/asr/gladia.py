@@ -18,7 +18,7 @@ The token-bearing WebSocket URL is kept private on the instance and never
 appears in ``endpoint``, error messages or logs. Every (re)connection performs
 a fresh REST session init because Gladia session URLs are single-use.
 
-Session hint terms (docs/adr/0006) are sent in the init body as
+Session hint terms are sent in the init body as
 ``realtime_processing.custom_vocabulary_config.vocabulary`` (at most 100).
 
 Timeline: Gladia reports utterance times relative to the audio it received on

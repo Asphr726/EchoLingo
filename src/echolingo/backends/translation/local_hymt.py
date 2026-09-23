@@ -104,7 +104,7 @@ class LocalHyMtBackend:
         """Session topic plus previous source sentences.
 
         Target text is never included: the 1.8B model copies it. The topic
-        (docs/adr/0006) is one short line so it cannot dominate the prompt.
+        is one short line so it cannot dominate the prompt.
         """
         spans: list[str] = []
         topic = " ".join((request.domain or "").split())[:TOPIC_MAX_CHARS]

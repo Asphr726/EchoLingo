@@ -45,7 +45,7 @@ def _add_pipeline_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--context-file",
         type=Path,
-        help="UTF-8 text file with the lecture topic and terms (docs/adr/0006)",
+        help="UTF-8 text file with the lecture topic and terms",
     )
     parser.add_argument(
         "--glossary-file",

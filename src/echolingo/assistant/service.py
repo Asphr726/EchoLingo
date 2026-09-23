@@ -1,7 +1,7 @@
 """Assistant task orchestration: notes, titles, context terms and probes.
 
 The sidecar command ``assistant_request {request_id, task, payload}``
-(docs/adr/0006) runs :meth:`AssistantService.handle` as a background task.
+runs :meth:`AssistantService.handle` as a background task.
 Everything is validated inside that task, and every outcome, including
 malformed input, missing credentials, provider errors and cancellation,
 ends in exactly one ``assistant_result`` event. Nothing raises into the
@@ -638,7 +638,7 @@ class AssistantService:
         add_usage(usage, finishing.usage)
         head, rest = split_header(trim_preamble(finishing.text))
         closing = drop_repeated_sections(rest, headings)
-        # Deltas are append-only (docs/adr/0006): the header, which belongs at
+        # Deltas are append-only: the header, which belongs at
         # the top of the document, reaches the shell only through the result.
         header = f"{head}\n\n" if head else ""
         tail = ""

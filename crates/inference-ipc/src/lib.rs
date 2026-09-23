@@ -52,7 +52,7 @@ pub enum SidecarCommand {
         session_id: Uuid,
     },
     /// Run an AI assistant task (`notes`, `title`, `context`, `probe`) in the
-    /// background. See docs/adr/0006 for the task payloads. The sidecar
+    /// background. The sidecar
     /// answers with `AssistantProgress`/`AssistantDelta` events and exactly
     /// one `AssistantResult` carrying the same `request_id`.
     AssistantRequest {
@@ -134,7 +134,7 @@ pub enum UiEventKind {
     BackendHealth,
     AudioDeviceChange,
     SettingsChanged,
-    /// AI assistant job progress/text/result (docs/adr/0006).
+    /// AI assistant job progress/text/result.
     AssistantUpdate,
     /// A History entry changed outside the History view (AI title, notes).
     HistoryChanged,

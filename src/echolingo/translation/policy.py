@@ -354,7 +354,7 @@ class StreamingTranslationCoordinator:
         self.context = ContextWindow(context_segments)
         self.target = TargetCommitPolicy()
         self.glossary = glossary
-        # Session topic (docs/adr/0006); providers see it only under the same
+        # Session topic; providers see it only under the same
         # transcript-upload consent as the source text.
         self.domain = (domain or "").strip() or None
 

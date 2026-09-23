@@ -24,7 +24,7 @@ from ._queue import AsrEventQueue
 logger = logging.getLogger(__name__)
 
 # Session context travels in a header (base64url UTF-8), never in the query
-# string: query strings reach access logs. See docs/adr/0006.
+# string: query strings reach access logs.
 ASR_CONTEXT_HEADER = "X-EchoLingo-Asr-Context"
 
 

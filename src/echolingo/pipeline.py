@@ -29,7 +29,7 @@ def asr_session_config(
     streaming_mode: str = "streaming",
     context: SessionContext | None = None,
 ) -> AsrSessionConfig:
-    """ASR session settings carrying the parsed session context (ADR 0006)."""
+    """ASR session settings carrying the parsed session context."""
     return AsrSessionConfig(
         session_id=session_id,
         language=language,

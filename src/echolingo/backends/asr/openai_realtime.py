@@ -20,7 +20,7 @@ Protocol summary (``wss://api.openai.com/v1/realtime?intent=transcription``):
   close while finishing resolves it as well;
 * there is no application-level keepalive; the WebSocket ping/pong keeps the
   connection alive;
-* the session context (topic and hint terms, docs/adr/0006) is sent as
+* the session context (topic and hint terms) is sent as
   ``session.audio.input.transcription.prompt`` (at most 1000 chars).
 
 Language table: EchoLingo ``en``/``zh``/``ja``/``ko`` map to the same ISO 639-1

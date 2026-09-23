@@ -7,7 +7,7 @@ arrive as ``Results`` JSON messages: interim ones replace the unstable tail,
 and ``speech_final`` marks the end of an utterance. ``UtteranceEnd`` (from
 ``utterance_end_ms``) closes an utterance that never received ``speech_final``.
 
-Session hint terms (docs/adr/0006) are sent as repeated ``keyterm`` query
+Session hint terms are sent as repeated ``keyterm`` query
 parameters for Nova-3 models (keyterm prompting; at most 50 terms of 50 chars
 and 1000 UTF-8 bytes in total); other model families get no hint terms rather
 than the older ``keywords`` boosting.

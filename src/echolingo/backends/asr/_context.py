@@ -1,4 +1,4 @@
-"""Session context helpers shared by the ASR adapters (docs/adr/0006).
+"""Session context helpers shared by the ASR adapters.
 
 ``AsrSessionConfig.context`` carries a short topic plus hint-terms prompt and
 ``AsrSessionConfig.terms`` the hint terms on their own. Each adapter bounds
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-# The prompt budget shared by every provider (ADR 0006: ≤ 1000 chars).
+# The prompt budget shared by every provider (≤ 1000 chars).
 CONTEXT_MAX_CHARS = 1000
 
 

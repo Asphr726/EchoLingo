@@ -641,7 +641,7 @@ def chat_preset_values(provider_id: str, config, env: Mapping[str, str]) -> dict
     }
 
 
-# --- AI assistant (notes, titles, context terms; docs/adr/0006) ---------------
+# --- AI assistant (notes, titles, context terms) ---------------
 
 
 @dataclass(frozen=True, slots=True)

@@ -144,7 +144,7 @@ class AlignmentConfig:
 
 @dataclass(slots=True)
 class ContextConfig:
-    """Session context text (docs/adr/0006), parsed by ``echolingo.session_context``.
+    """Session context text, parsed by ``echolingo.session_context``.
 
     ``session_context`` is the per-lecture topic and terms; ``glossary`` the
     standing terminology. Both reach recognition/translation providers only
