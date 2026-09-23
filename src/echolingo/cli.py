@@ -11,7 +11,6 @@ from .audio import MicrophoneSource, WavReplaySource, list_input_devices
 from .backends import registry
 from .config import load_config
 from .enhancement import make_processor
-from .farfield import generate_proxy_files
 from .pipeline import FarFieldPipeline
 from .errors import ConfigurationError
 from .runtime import BackendFactory, CapabilityDetector, RuntimeRouter
@@ -81,26 +80,6 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--realtime", action="store_true")
     _add_pipeline_args(replay)
 
-    benchmark = sub.add_parser("benchmark", help="run frontend comparisons")
-    benchmark.add_argument("path", type=Path)
-    benchmark.add_argument(
-        "--profiles", nargs="+", default=["raw", "webrtc_agc", "webrtc_ns_agc"]
-    )
-    benchmark.add_argument("--vad", choices=["auto", "silero", "webrtc", "energy"])
-    benchmark.add_argument("--silero-model", type=Path, default=Path("models/silero_vad.onnx"))
-    benchmark.add_argument("--duration-limit", type=float)
-    benchmark.add_argument("--run-root", type=Path, default=Path("runs/spike1/benchmark"))
-
-    proxy = sub.add_parser("farfield-proxy", help="generate labeled SLR26 acoustic proxies")
-    proxy.add_argument("source", type=Path)
-    proxy.add_argument("--rir-archive", type=Path, default=Path("data/cache/sim_rir_16k.zip"))
-    proxy.add_argument(
-        "--rir-member",
-        default="simulated_rirs_16k/smallroom/Room001/Room001-00001.wav",
-    )
-    proxy.add_argument("--distances", type=float, nargs="+", default=[0.3, 3, 5, 8])
-    proxy.add_argument("--snr-db", type=float, default=10.0)
-    proxy.add_argument("--output-dir", type=Path, default=Path("data/generated/farfield"))
     return parser
 
 
@@ -254,48 +233,6 @@ def main(argv: list[str] | None = None) -> int:
         source = WavReplaySource(args.path, realtime=args.realtime)
         run_dir = asyncio.run(_run_source(source, args))
         print(f"Run recorded at {run_dir}")
-        return 0
-    if args.command == "benchmark":
-        completed = []
-        for profile in args.profiles:
-            config = load_config(args.config)
-            config.frontend.profile = profile
-            config.asr.provider = "none"
-            processor = make_processor(profile, 16_000, 1)
-            source = WavReplaySource(args.path)
-            processor = make_processor(profile, source.sample_rate_hz, source.channels)
-            model_path = args.silero_model if args.silero_model.exists() else None
-            vad = make_vad(args.vad or config.vad.backend, model_path)
-            sink = RunRecorder(
-                args.run_root / profile,
-                source.sample_rate_hz,
-                source.channels,
-                config.redacted_dict(),
-                record_audio=False,
-                console=False,
-            )
-            pipeline = FarFieldPipeline(
-                processor,
-                vad,
-                LectureSpeechPolicy(),
-                BackendFactory(config).asr("none"),
-                sink,
-                source.sample_rate_hz,
-            )
-            asyncio.run(pipeline.run(source, args.duration_limit))
-            completed.append(str(sink.run_dir))
-        print(json.dumps({"runs": completed}, indent=2))
-        return 0
-    if args.command == "farfield-proxy":
-        paths = generate_proxy_files(
-            args.source,
-            args.rir_archive,
-            args.rir_member,
-            args.output_dir,
-            args.distances,
-            args.snr_db,
-        )
-        print(json.dumps({"proxies": [str(path) for path in paths]}, indent=2))
         return 0
     return 2
 
