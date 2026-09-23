@@ -75,8 +75,19 @@ pub struct StartSessionRequest {
     /// Which cloud translation provider the Auto/Cloud route may use.
     #[serde(default = "default_cloud_preference")]
     pub cloud_translation_preference: String,
+    /// Per-lecture topic and terms (docs/adr/0006). Sent to recognition and
+    /// translation providers only under the session's upload flags.
+    #[serde(default)]
+    pub session_context: String,
+    /// Standing terminology, one `term = translation` or `term` per line.
+    #[serde(default)]
+    pub glossary: String,
     pub privacy: PrivacyPolicy,
 }
+
+/// Upper bounds shared by the shell's validation and the UI counters.
+pub const SESSION_CONTEXT_MAX_CHARS: usize = 2000;
+pub const GLOSSARY_MAX_CHARS: usize = 4000;
 
 fn default_cloud_preference() -> String {
     "qwen_cloud".into()
@@ -96,6 +107,8 @@ impl Default for StartSessionRequest {
             translation_provider: "auto".into(),
             cloud_asr_preference: default_cloud_preference(),
             cloud_translation_preference: default_cloud_preference(),
+            session_context: String::new(),
+            glossary: String::new(),
             privacy: PrivacyPolicy::default(),
         }
     }
@@ -824,6 +837,8 @@ mod tests {
         .unwrap();
         assert_eq!(request.cloud_asr_preference, "qwen_cloud");
         assert_eq!(request.cloud_translation_preference, "qwen_cloud");
+        assert_eq!(request.session_context, "");
+        assert_eq!(request.glossary, "");
         let serialized = serde_json::to_value(&request).unwrap();
         assert_eq!(serialized["cloud_asr_preference"], "qwen_cloud");
         let route: RouteStatus = serde_json::from_value(serde_json::json!({

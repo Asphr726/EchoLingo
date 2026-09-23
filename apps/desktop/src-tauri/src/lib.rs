@@ -1736,7 +1736,12 @@ fn forward_sidecar_events(app: AppHandle) {
                 SidecarEvent::HelloAccepted { .. }
                 | SidecarEvent::RoutePlan { .. }
                 | SidecarEvent::CloudProbeResult { .. }
-                | SidecarEvent::SessionFinished { .. } => continue,
+                | SidecarEvent::SessionFinished { .. }
+                // Assistant events are consumed by the job that sent the
+                // request (docs/adr/0006); they never reach the live stream.
+                | SidecarEvent::AssistantProgress { .. }
+                | SidecarEvent::AssistantDelta { .. }
+                | SidecarEvent::AssistantResult { .. } => continue,
             };
             let active_session_id = state
                 .snapshot()

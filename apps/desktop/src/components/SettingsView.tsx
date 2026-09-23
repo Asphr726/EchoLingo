@@ -18,6 +18,7 @@ import type {
   RuntimePreferences,
   StartSessionRequest,
 } from "../types";
+import { defaultAssistantPreferences } from "../types";
 import { ProviderSelect } from "./ProviderSelect";
 
 const sections = [
@@ -56,7 +57,11 @@ export function SettingsView() {
   const [modelError, setModelError] = useState<string | null>(null);
   const { caption, catalog, draft, setDraft, snapshot, updateCaption } = useApp();
   const sessionActive = !["IDLE", "COMPLETED"].includes(snapshot.phase);
-  const [runtime, setRuntime] = useState<RuntimePreferences>({ preload_local_models: true, providers: {} });
+  const [runtime, setRuntime] = useState<RuntimePreferences>({
+    preload_local_models: true,
+    providers: {},
+    assistant: defaultAssistantPreferences,
+  });
   useEffect(() => {
     let active = true;
     api.runtimePreferences().then((value) => active && setRuntime(value)).catch(() => undefined);

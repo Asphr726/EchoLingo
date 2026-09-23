@@ -175,6 +175,8 @@ export function withProviderDefaults(defaults: Partial<StartSessionRequest>): St
     cloud_asr_preference: defaults.cloud_asr_preference || defaultSessionDefaults.cloud_asr_preference,
     cloud_translation_preference:
       defaults.cloud_translation_preference || defaultSessionDefaults.cloud_translation_preference,
+    session_context: defaults.session_context ?? "",
+    glossary: defaults.glossary ?? "",
   };
 }
 

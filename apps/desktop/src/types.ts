@@ -34,6 +34,10 @@ export interface StartSessionRequest {
   cloud_asr_preference: string;
   /** Cloud translator used by the Auto route, as above. */
   cloud_translation_preference: string;
+  /** Per-lecture topic and terms (docs/adr/0006), at most 2000 chars. */
+  session_context: string;
+  /** Standing terminology: one `term = translation` or `term` per line. */
+  glossary: string;
   privacy: PrivacyPolicy;
 }
 
@@ -146,6 +150,109 @@ export interface RuntimePreferences {
   /** Non-secret provider settings keyed by credential group id, then by
    *  setting key (for example `{ dashscope: { region: "beijing" } }`). */
   providers: Record<string, Record<string, string>>;
+  assistant: AssistantPreferences;
+}
+
+/** AI assistant used for session notes and titles (docs/adr/0006). */
+export interface AssistantPreferences {
+  /** Credential group id of an OpenAI-compatible chat provider, "" = off. */
+  provider_group: string;
+  /** Model name; "" = the preset default. */
+  model: string;
+  /** Explicit consent to send transcripts and attachments to the model. */
+  transcript_upload_allowed: boolean;
+  /** Name sessions with the assistant when they end. */
+  auto_title: boolean;
+}
+
+export const defaultAssistantPreferences: AssistantPreferences = {
+  provider_group: "",
+  model: "",
+  transcript_upload_allowed: false,
+  auto_title: true,
+};
+
+/** Catalog entry for a chat provider the assistant can use. */
+export interface AssistantPreset {
+  group_id: string;
+  display_name: string;
+  default_model: string;
+  models: string[];
+}
+
+export interface AssistantStatus {
+  configured: boolean;
+  consent: boolean;
+  provider_group: string;
+  model: string;
+  display_name: string;
+  key_available: boolean;
+  auto_title: boolean;
+}
+
+export interface NoteAttachment {
+  id: string;
+  name: string;
+  size_bytes: number;
+  extension: string;
+}
+
+export interface NoteAttachmentReport {
+  id?: string;
+  name: string;
+  pages?: number | null;
+  chars?: number;
+  truncated?: boolean;
+  warning?: string | null;
+}
+
+export interface SessionNotes {
+  session_id: string;
+  markdown: string;
+  language: string;
+  provider: string;
+  model: string;
+  attachments: NoteAttachmentReport[];
+  usage: { prompt_tokens?: number | null; completion_tokens?: number | null };
+  prompt_version: string;
+  source_chars: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export type AssistantJobState = "running" | "completed" | "failed" | "cancelled";
+
+export interface AssistantProgress {
+  index?: number;
+  total?: number;
+  start_ms?: number;
+  end_ms?: number;
+}
+
+/** Payload of the `assistant_update` UI event and of a running job. */
+export interface AssistantJob {
+  job_id: string;
+  session_id: string | null;
+  task: "notes" | "title" | "context" | "probe";
+  state: AssistantJobState;
+  stage?: string | null;
+  progress?: AssistantProgress | null;
+  /** Full markdown produced so far. */
+  text?: string;
+  result?: unknown;
+  error?: { code: string; message: string } | null;
+}
+
+export interface SessionNotesState {
+  notes: SessionNotes | null;
+  job: AssistantJob | null;
+}
+
+export interface ContextImportResult {
+  context: string;
+  terms: string[];
+  glossary: Array<{ source: string; target: string }>;
+  warnings: string[];
 }
 
 export interface CaptionPreferences {
@@ -308,6 +415,10 @@ export interface SessionRecord {
   asr_backend: string;
   translation_backend: string;
   route_reason: string;
+  /** `default` (generated), `user` (renamed) or `ai` (assistant title). */
+  title_source?: "default" | "user" | "ai";
+  /** The lecture context the session ran with. */
+  context?: string;
 }
 
 export interface SegmentRecord {
@@ -338,6 +449,8 @@ export interface UiEventEnvelope {
     | "backend_health"
     | "audio_device_change"
     | "settings_changed"
+    | "assistant_update"
+    | "history_changed"
     | "error";
   emitted_at_unix_ms: number;
   payload: unknown;
@@ -391,6 +504,8 @@ export const defaultSessionDefaults: StartSessionRequest = {
   translation_provider: "auto",
   cloud_asr_preference: "qwen_cloud",
   cloud_translation_preference: "qwen_cloud",
+  session_context: "",
+  glossary: "",
   privacy: {
     audio_upload_allowed: false,
     transcript_upload_allowed: false,

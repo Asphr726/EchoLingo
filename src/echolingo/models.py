@@ -134,7 +134,10 @@ class AsrSessionConfig:
     language: str
     sample_rate_hz: int = 16_000
     streaming_mode: str = "streaming"
+    # Session context (docs/adr/0006): a short topic/terms prompt and the hint
+    # terms on their own, for providers that take a keyword list.
     context: str = ""
+    terms: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -198,6 +201,8 @@ class TranscriptEvent:
     provider_event_id: str | None = None
     error_code: str | None = None
     recoverable: bool | None = None
+    # Why a STABLE unit closed: sentence | clause | cap | flush (diagnostics).
+    closure_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)

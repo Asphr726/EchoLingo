@@ -17,7 +17,7 @@ import type {
   StartSessionRequest,
   UiEventEnvelope,
 } from "../types";
-import { defaultCaptionPreferences, defaultSessionDefaults, emptySnapshot } from "../types";
+import { defaultAssistantPreferences, defaultCaptionPreferences, defaultSessionDefaults, emptySnapshot } from "../types";
 // The committed catalog doubles as the browser-preview fixture. In the
 // desktop runtime the shell serves the same document via `list_providers`.
 import providerCatalogJson from "../../../../configs/providers.json";
@@ -83,7 +83,11 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
       },
     ] satisfies AudioDevice[],
     get_caption_preferences: defaultCaptionPreferences,
-    get_runtime_preferences: { preload_local_models: true, providers: {} } satisfies RuntimePreferences,
+    get_runtime_preferences: {
+      preload_local_models: true,
+      providers: {},
+      assistant: defaultAssistantPreferences,
+    } satisfies RuntimePreferences,
     get_session_defaults: defaultSessionDefaults,
     history_search: previewMode() ? [previewSessionRecord()] : [],
     history_open: previewMode()
@@ -137,6 +141,7 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
     return {
       preload_local_models: true,
       providers: { [String(args?.groupId)]: (args?.settings ?? {}) as Record<string, string> },
+      assistant: defaultAssistantPreferences,
     } satisfies RuntimePreferences as T;
   }
   if (name === "probe_cloud" && previewMode()) {

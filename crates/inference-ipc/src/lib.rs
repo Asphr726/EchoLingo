@@ -51,6 +51,18 @@ pub enum SidecarCommand {
     FinishSession {
         session_id: Uuid,
     },
+    /// Run an AI assistant task (`notes`, `title`, `context`, `probe`) in the
+    /// background. See docs/adr/0006 for the task payloads. The sidecar
+    /// answers with `AssistantProgress`/`AssistantDelta` events and exactly
+    /// one `AssistantResult` carrying the same `request_id`.
+    AssistantRequest {
+        request_id: Uuid,
+        task: String,
+        payload: Value,
+    },
+    AssistantCancel {
+        request_id: Uuid,
+    },
     Shutdown,
 }
 
@@ -86,6 +98,23 @@ pub enum SidecarEvent {
     SessionFinished {
         session_id: Uuid,
     },
+    AssistantProgress {
+        request_id: Uuid,
+        stage: String,
+        #[serde(default)]
+        detail: Value,
+    },
+    /// Markdown appended to the task output; `seq` is strictly increasing.
+    AssistantDelta {
+        request_id: Uuid,
+        seq: u64,
+        text: String,
+    },
+    AssistantResult {
+        request_id: Uuid,
+        ok: bool,
+        result: Value,
+    },
     Error {
         code: String,
         message: String,
@@ -105,6 +134,10 @@ pub enum UiEventKind {
     BackendHealth,
     AudioDeviceChange,
     SettingsChanged,
+    /// AI assistant job progress/text/result (docs/adr/0006).
+    AssistantUpdate,
+    /// A History entry changed outside the History view (AI title, notes).
+    HistoryChanged,
     Error,
 }
 
@@ -263,5 +296,48 @@ mod tests {
             current,
             SidecarEvent::HelloAccepted { providers_digest: Some(digest), .. } if digest == "abc"
         ));
+    }
+
+    #[test]
+    fn assistant_messages_match_the_python_wire_format() {
+        let request_id = Uuid::nil();
+        let command = serde_json::to_value(SidecarCommand::AssistantRequest {
+            request_id,
+            task: "notes".into(),
+            payload: serde_json::json!({"output_language": "zh"}),
+        })
+        .unwrap();
+        assert_eq!(command["type"], "assistant_request");
+        assert_eq!(command["payload"]["task"], "notes");
+        assert_eq!(command["payload"]["payload"]["output_language"], "zh");
+        let cancel = serde_json::to_value(SidecarCommand::AssistantCancel { request_id }).unwrap();
+        assert_eq!(cancel["type"], "assistant_cancel");
+
+        let delta: SidecarEvent = serde_json::from_value(serde_json::json!({
+            "type": "assistant_delta",
+            "payload": {"request_id": request_id, "seq": 3, "text": "## Heading"}
+        }))
+        .unwrap();
+        assert_eq!(
+            delta,
+            SidecarEvent::AssistantDelta { request_id, seq: 3, text: "## Heading".into() }
+        );
+        let progress: SidecarEvent = serde_json::from_value(serde_json::json!({
+            "type": "assistant_progress",
+            "payload": {"request_id": request_id, "stage": "extracting"}
+        }))
+        .unwrap();
+        assert!(matches!(progress, SidecarEvent::AssistantProgress { detail: Value::Null, .. }));
+        let result: SidecarEvent = serde_json::from_value(serde_json::json!({
+            "type": "assistant_result",
+            "payload": {"request_id": request_id, "ok": false, "result": {"code": "authentication_failed", "message": "x"}}
+        }))
+        .unwrap();
+        assert!(matches!(result, SidecarEvent::AssistantResult { ok: false, .. }));
+        assert_eq!(
+            serde_json::to_value(UiEventKind::AssistantUpdate).unwrap(),
+            "assistant_update"
+        );
+        assert_eq!(serde_json::to_value(UiEventKind::HistoryChanged).unwrap(), "history_changed");
     }
 }
