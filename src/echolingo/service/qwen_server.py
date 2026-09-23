@@ -52,6 +52,12 @@ DECODE_POLICY_DEFAULTS: dict[str, Any] = {
     "echolingo_pause_roll_min_steps": 50,
     "echolingo_pause_roll_steps": 10,
     "echolingo_strip_edge_punct": True,
+    # Languages that keep the upstream eager punctuation rollover: Korean
+    # sentence-final endings (-습니다., -요.) make the model's edge periods
+    # reliable, and a roll one decode later starts the next segment inside a
+    # word (KO CER 0.062 -> 0.076 over 4/6 runs), while English suffers from
+    # invented edge periods (docs/benchmark.md).
+    "echolingo_eager_roll_languages": "ko",
 }
 
 _ENVIRONMENT_KEYS = {
@@ -66,6 +72,7 @@ _ENVIRONMENT_KEYS = {
     "echolingo_pause_roll_min_steps": ("ECHOLINGO_QWEN_PAUSE_ROLL_MIN_STEPS", int, 10, 400),
     "echolingo_pause_roll_steps": ("ECHOLINGO_QWEN_PAUSE_ROLL_STEPS", int, 3, 60),
     "echolingo_strip_edge_punct": ("ECHOLINGO_QWEN_STRIP_EDGE_PUNCT", bool, None, None),
+    "echolingo_eager_roll_languages": ("ECHOLINGO_QWEN_EAGER_ROLL_LANGUAGES", str, None, None),
 }
 
 # Lecture context of the WebSocket session being set up; the online processor
@@ -130,6 +137,9 @@ def decode_policy_from_environment(
             value = _parse_bool(raw) if kind is bool else kind(raw)
         except ValueError:
             logger.warning("ignoring invalid %s=%r", name, raw)
+            continue
+        if kind is str:
+            policy[key] = value.strip().lower()
             continue
         if kind is not bool and not (minimum <= value <= maximum):
             logger.warning("ignoring out-of-range %s=%r", name, raw)
@@ -197,6 +207,8 @@ def make_segmented_streamer_class(base: type) -> type:
         echolingo_pause_roll_min_steps: int = 50
         echolingo_pause_roll_steps: int = 10
         echolingo_strip_edge_punct: bool = True
+        # Keep the upstream eager punctuation rollover unchanged (per language).
+        echolingo_eager_upstream: bool = False
         rolls_by_reason: dict = dataclasses.field(default_factory=dict)
         edge_marks_stripped: int = 0
         _pause_tracker: Any = dataclasses.field(default=None, repr=False)
@@ -204,8 +216,9 @@ def make_segmented_streamer_class(base: type) -> type:
 
         def __post_init__(self) -> None:
             super().__post_init__()
-            # The eager upstream rule rolls on invented window-edge marks.
-            self.segment_punct_rollover = False
+            # The eager upstream rule rolls on invented window-edge marks
+            # (kept only for languages listed in echolingo_eager_roll_languages).
+            self.segment_punct_rollover = bool(self.echolingo_eager_upstream)
             self._pause_tracker = PauseRollTracker(
                 min_steps=self.echolingo_pause_roll_min_steps,
                 pause_steps=self.echolingo_pause_roll_steps,
@@ -215,6 +228,10 @@ def make_segmented_streamer_class(base: type) -> type:
 
         def update_from_hypothesis(self, hypothesis_tokens: Any, **kwargs: Any) -> dict[str, Any]:
             event = super().update_from_hypothesis(hypothesis_tokens, **kwargs)
+            if self.echolingo_eager_upstream:
+                if event.get("segment_rollover"):
+                    self._note_roll(str(event.get("segment_rollover_reason") or "eager"))
+                return event
             if event.get("segment_rollover"):
                 # A step-cap roll happened inside the upstream update.
                 reason = str(event.get("segment_rollover_reason") or "cap")
@@ -257,7 +274,11 @@ def make_segmented_streamer_class(base: type) -> type:
         def roll_segment(self) -> Any:
             before = self.completed_text
             final = super().roll_segment()
-            if self.echolingo_strip_edge_punct and not self._pause_confirmed_roll:
+            if (
+                self.echolingo_strip_edge_punct
+                and not self._pause_confirmed_roll
+                and not self.echolingo_eager_upstream
+            ):
                 stripped = strip_edge_punct(final.final_text)
                 if stripped != final.final_text.rstrip():
                     self.edge_marks_stripped += 1
@@ -302,6 +323,7 @@ def install_streaming_policy(
         echolingo_pause_roll_min_steps = 50
         echolingo_pause_roll_steps = 10
         echolingo_strip_edge_punct = True
+        echolingo_eager_roll_languages = "ko"
         _echolingo_streamer_class: type | None = None
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -334,7 +356,14 @@ def install_streaming_policy(
                     upstream.config, prompt_prefix_template=prompt
                 )
                 values["segment_prompt_base_context"] = context
+            language = (whisper_language or getattr(self, "original_language", "") or "").lower()
+            eager_languages = {
+                code.strip()
+                for code in str(self.echolingo_eager_roll_languages or "").replace(";", ",").split(",")
+                if code.strip()
+            }
             values.update(
+                echolingo_eager_upstream=language in eager_languages,
                 echolingo_pause_roll=bool(self.echolingo_pause_roll),
                 echolingo_confirmed_roll=bool(self.echolingo_confirmed_roll),
                 echolingo_punct_roll_min_steps=int(self.echolingo_punct_roll_min_steps),

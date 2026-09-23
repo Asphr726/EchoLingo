@@ -297,3 +297,20 @@ async def test_context_middleware_sets_and_resets_the_session_context() -> None:
     await middleware({"type": "http", "headers": []}, None, None)
     assert seen == ["Topic: texture perception", "", ""]
     assert qwen_server.session_asr_context() == ""
+
+
+def test_korean_keeps_the_upstream_eager_rollover() -> None:
+    streamer = _streamer(echolingo_eager_upstream=True, segment_punct_rollover=True)
+    assert streamer.segment_punct_rollover is True
+    event = _feed(streamer, "오늘은 색 공간에 대해 이야기하겠습니다.", 110)
+    assert event["segment_rollover"] and event["segment_rollover_reason"] == "punctuation"
+    # The period is kept and nothing is stripped in eager mode.
+    assert streamer.completed_text == "오늘은 색 공간에 대해 이야기하겠습니다."
+    assert streamer.edge_marks_stripped == 0
+
+
+def test_eager_languages_come_from_the_policy_and_environment() -> None:
+    policy = qwen_server.decode_policy_from_environment({})
+    assert policy["echolingo_eager_roll_languages"] == "ko"
+    policy = qwen_server.decode_policy_from_environment({"ECHOLINGO_QWEN_EAGER_ROLL_LANGUAGES": "KO, JA"})
+    assert policy["echolingo_eager_roll_languages"] == "ko, ja"
