@@ -184,6 +184,9 @@ class OpenAiChatTranslation(OpenAiCompatibleChatTranslation):
             "Output ONLY the translation: no explanations, no quotes, no preface.",
             "Keep numbers, names, code identifiers and technical terms accurate.",
         ]
+        topic = " ".join((request.domain or "").split())[:400]
+        if topic:
+            lines.append(f"Session topic (background, do not translate): {topic}")
         terms = request.terms or self.glossary
         if terms:
             lines.append("")

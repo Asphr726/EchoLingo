@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from collections.abc import AsyncIterator
@@ -16,8 +17,15 @@ from ...models import (
     BackendLocality,
     CanonicalTranscriptEvent,
 )
+from ...service.qwen_segment_policy import encode_asr_context
 from ...streaming import WlkEventMapper
 from ._queue import AsrEventQueue
+
+logger = logging.getLogger(__name__)
+
+# Session context travels in a header (base64url UTF-8), never in the query
+# string: query strings reach access logs. See docs/adr/0006.
+ASR_CONTEXT_HEADER = "X-EchoLingo-Asr-Context"
 
 
 def _with_language(url: str, language: str) -> str:
@@ -29,6 +37,15 @@ def _with_language(url: str, language: str) -> str:
 
 def _authorization_headers(token: str | None) -> dict[str, str] | None:
     return {"Authorization": f"Bearer {token}"} if token else None
+
+
+def _connect_headers(token: str | None, context: str = "") -> dict[str, str] | None:
+    """Handshake headers: the optional bearer token and the session context."""
+    headers = dict(_authorization_headers(token) or {})
+    encoded = encode_asr_context(context)
+    if encoded:
+        headers[ASR_CONTEXT_HEADER] = encoded
+    return headers or None
 
 
 class LocalQwenAsrBackend:
@@ -77,9 +94,13 @@ class LocalQwenAsrBackend:
             config.session_id, config.language, self.model, config.streaming_mode
         )
         token = os.getenv("WLK_API_TOKEN")
+        headers = _connect_headers(token, config.context)
+        if headers and ASR_CONTEXT_HEADER in headers:
+            # Only the size: the context is user content.
+            logger.info("local ASR session context attached (%d chars)", len(config.context))
         self._websocket = await websockets.connect(
             _with_language(self.url, config.language),
-            additional_headers=_authorization_headers(token),
+            additional_headers=headers,
             max_size=8 * 1024 * 1024,
         )
         first = json.loads(await self._websocket.recv())

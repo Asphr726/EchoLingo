@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 from dataclasses import asdict
@@ -16,6 +17,7 @@ from ..enhancement import make_processor
 from ..models import AudioFrame
 from ..pipeline import FarFieldPipeline, StreamingPipelineSession
 from ..runtime import BackendFactory, CapabilityDetector, RuntimeRouter
+from ..session_context import SessionContext, parse_session_context
 from ..streaming import LectureSpeechPolicy
 from ..translation import StreamingTranslationCoordinator
 from ..vad import make_vad
@@ -23,6 +25,8 @@ from ..resample import StreamingResampler
 from .protocol import AudioPacket
 from .sink import SidecarEventSink
 from .alignment import SessionAlignmentCapture
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_frontend_profile(product_profile: str) -> str:
@@ -85,8 +89,19 @@ def desktop_config(payload: dict[str, Any]):
     config.privacy.transcript_upload_allowed = bool(
         privacy.get("transcript_upload_allowed", False)
     )
+    # Session context (docs/adr/0006). Absent keys keep the config file's
+    # values so older shells still start sessions.
+    for key in ("session_context", "glossary"):
+        if key in payload:
+            value = payload.get(key)
+            setattr(config.context, key, "" if value is None else str(value))
     config.validate()
     return config
+
+
+def session_context_for(config) -> SessionContext:
+    """Parsed topic, hint terms and glossary for one validated config."""
+    return parse_session_context(config.context.session_context, config.context.glossary)
 
 
 def align_local_profiles(config, capabilities) -> None:
@@ -258,6 +273,15 @@ class DesktopInferenceSession:
         factory = BackendFactory(config)
         asr = factory.asr(decision.asr_provider)
         translation_backend = factory.translation(decision.translation_provider)
+        session_context = session_context_for(config)
+        if not session_context.empty:
+            # Counts only: the context text itself stays out of the log.
+            logger.info(
+                "session context: topic %d chars, %d hint terms, %d glossary pairs",
+                len(session_context.topic),
+                len(session_context.hint_terms),
+                len(session_context.glossary),
+            )
         translation = None
         if translation_backend is not None:
             translation = StreamingTranslationCoordinator(
@@ -265,6 +289,8 @@ class DesktopInferenceSession:
                 source_lang=config.asr.language,
                 target_lang=config.translation.target_language,
                 context_segments=config.translation.context_segments,
+                glossary=session_context.glossary,
+                domain=session_context.topic or None,
                 provisional_enabled=registry.get(
                     "translation", decision.translation_provider
                 ).streaming_partials,
@@ -285,11 +311,21 @@ class DesktopInferenceSession:
                 alignment_capture = SessionAlignmentCapture(alignment_service)
         sink = SidecarEventSink(events, alignment_capture=alignment_capture)
         core_pipeline = FarFieldPipeline(
-            processor, vad, speech_policy, asr, sink, frontend_rate_hz, translation
+            processor,
+            vad,
+            speech_policy,
+            asr,
+            sink,
+            frontend_rate_hz,
+            translation,
+            session_context=session_context,
         )
         session_id = str(payload["session_id"])
         pipeline = StreamingPipelineSession(
-            core_pipeline, session_id=session_id, language=config.asr.language
+            core_pipeline,
+            session_id=session_id,
+            language=config.asr.language,
+            session_context=session_context,
         )
         route = route_payload(decision, config)
         instance = cls(

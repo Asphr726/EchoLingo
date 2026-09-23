@@ -190,6 +190,72 @@ def test_cloud_qwen_403_explains_workspace_and_region_without_echoing_url() -> N
     assert "secret" not in str(normalized)
 
 
+async def test_cloud_qwen_session_context_becomes_corpus_text(caplog) -> None:
+    websocket = FakeWebSocket()
+    captured = {}
+
+    async def factory(url, headers):
+        captured.update(url=url, headers=headers)
+        return websocket
+
+    backend = CloudQwenAsrBackend(
+        api_key="secret", audio_upload_allowed=True, websocket_factory=factory
+    )
+    context = "Topic: early vision.\nTerms: Béla Julesz, Treisman, saccade"
+    with caplog.at_level("DEBUG", logger="echolingo"):
+        await backend.start_session(
+            AsrSessionConfig("session", "en", context=context, terms=("Béla Julesz",))
+        )
+    await backend.close()
+
+    transcription = websocket.sent[0]["session"]["input_audio_transcription"]
+    assert transcription == {"language": "en", "corpus": {"text": context}}
+    assert "Julesz" not in captured["url"]
+    assert "Julesz" not in json.dumps(captured["headers"], ensure_ascii=False)
+    assert "Julesz" not in caplog.text
+
+
+async def test_cloud_qwen_corpus_is_bounded_resent_on_reconnect_and_omitted_when_blank() -> None:
+    sockets = [FakeWebSocket(), FakeWebSocket()]
+    calls = 0
+
+    async def factory(url, headers):
+        nonlocal calls
+        socket = sockets[calls]
+        calls += 1
+        return socket
+
+    backend = CloudQwenAsrBackend(
+        api_key="secret", audio_upload_allowed=True, websocket_factory=factory
+    )
+    backend.retry = RetryPolicy(initial_s=0.001, maximum_s=0.002, budget_s=0.2)
+    await backend.start_session(AsrSessionConfig("session", "auto", context="term " * 300))
+    await sockets[0].incoming.put(ConnectionError("dropped"))
+
+    async def reconnected():
+        while calls < 2 or not sockets[1].sent:
+            await asyncio.sleep(0.001)
+
+    await asyncio.wait_for(reconnected(), 1)
+    await backend.close()
+    corpora = [socket.sent[0]["session"]["input_audio_transcription"] for socket in sockets]
+    assert corpora[0] == corpora[1]
+    assert "language" not in corpora[0]
+    assert 0 < len(corpora[0]["corpus"]["text"]) <= 1000
+
+    blank = FakeWebSocket()
+
+    async def blank_factory(url, headers):
+        return blank
+
+    backend = CloudQwenAsrBackend(
+        api_key="secret", audio_upload_allowed=True, websocket_factory=blank_factory
+    )
+    await backend.start_session(AsrSessionConfig("session", "auto", context="   "))
+    await backend.close()
+    assert "input_audio_transcription" not in blank.sent[0]["session"]
+
+
 def translation_request() -> TranslationRequest:
     return TranslationRequest(
         request_id="request",
@@ -259,11 +325,16 @@ async def test_cloud_backends_refuse_upload_without_explicit_consent() -> None:
 
 def test_local_hymt_uses_official_templates_with_source_only_background() -> None:
     backend = LocalHyMtBackend()
-    prompt = backend.build_prompt(translation_request())
+    request = translation_request()
+    # Glossary pairs are only included when their term occurs in the span.
+    assert "参考下面的翻译" not in backend.build_prompt(request)
+    request.source_text = "hello EchoLingo world"
+    prompt = backend.build_prompt(request)
     assert prompt.startswith("参考下面的翻译：\nEchoLingo 翻译成 回声语")
-    assert "【背景信息】\nprevious\n" in prompt
+    # The session topic (request.domain) leads the source-only background.
+    assert "【背景信息】\nlecture transcription\nprevious\n" in prompt
     assert "将以下文本翻译为 中文，注意只需要输出翻译后的结果，不要额外解释" in prompt
-    assert prompt.endswith("【待翻译文本】\nhello world")
+    assert prompt.endswith("【待翻译文本】\nhello EchoLingo world")
     # Target-language text from earlier segments is never placed in the prompt:
     # the 1.8B model copies it back as the "translation".
     assert "之前" not in prompt
@@ -272,6 +343,7 @@ def test_local_hymt_uses_official_templates_with_source_only_background() -> Non
     plain = translation_request()
     plain.context = ()
     plain.terms = ()
+    plain.domain = None
     assert backend.build_prompt(plain) == (
         "将以下文本翻译为 中文，注意只需要输出翻译后的结果，不要额外解释：\n\nhello world"
     )
@@ -279,6 +351,7 @@ def test_local_hymt_uses_official_templates_with_source_only_background() -> Non
     english = translation_request()
     english.context = ()
     english.terms = ()
+    english.domain = None
     english.target_lang = "ja"
     assert backend.build_prompt(english) == (
         "Translate the following text into Japanese. Note that you should only output "
@@ -388,3 +461,26 @@ class _AsyncByteStream(httpx.AsyncByteStream):
 
     async def aclose(self) -> None:
         await self._generator.aclose()
+
+
+def test_local_hymt_puts_the_session_topic_first_in_the_background() -> None:
+    backend = LocalHyMtBackend()
+    request = translation_request()
+    request.domain = "CS180 computer vision: color spaces and image sensors"
+    prompt = backend.build_prompt(request)
+    assert "【背景信息】\nCS180 computer vision: color spaces and image sensors\nprevious\n" in prompt
+    # A context-free retry has no topic either (the coordinator drops both).
+    request.context = ()
+    request.domain = None
+    assert "【背景信息】" not in backend.build_prompt(request)
+
+
+def test_leaked_template_markers_are_stripped() -> None:
+    from echolingo.backends.translation._text import strip_instruction_echo
+
+    assert strip_instruction_echo("【待翻译文本】\n啊，好的。现在休息得真好。") == "啊，好的。现在休息得真好。"
+    assert strip_instruction_echo("【背景信息】\n前一句\n\n【待翻译文本】\n译文。") == "译文。"
+    assert strip_instruction_echo("[Source Text]\nThe translation.") == "The translation."
+    assert strip_instruction_echo("参考下面的翻译：\nEchoLingo 翻译成 回声语\n\n回声语很好用。") == "回声语很好用。"
+    # Ordinary text with brackets is untouched.
+    assert strip_instruction_echo("【注意】这是一个重点。") == "【注意】这是一个重点。"

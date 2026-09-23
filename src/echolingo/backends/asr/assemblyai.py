@@ -11,7 +11,10 @@ Protocol summary (``wss://streaming.assemblyai.com/v3/ws``):
   once more with punctuation/casing as ``turn_is_formatted``) and
   ``Termination`` after ``Terminate``;
 * there is no keepalive message; the server keeps idle sessions open for a
-  while on its own.
+  while on its own;
+* session hint terms (docs/adr/0006) travel as ``keyterms_prompt``, a JSON
+  array of at most 100 terms of at most 50 characters each (2000 UTF-8 bytes
+  in total, because it travels in the URL).
 
 Universal-Streaming transcribes English only. ``auto`` is accepted and
 treated as English because the session language is not pinned; every other
@@ -33,6 +36,7 @@ from ...errors import (
     RateLimitError,
 )
 from ...models import AsrSessionConfig
+from ._context import hint_terms
 from .cloud_streaming import CloudStreamingAsrBase, ProviderTranscriptDelta, json_message
 
 STREAMING_HOST = "streaming.assemblyai.com"
@@ -47,6 +51,11 @@ MAX_FRAME_MS = 1_000
 _BYTES_PER_MS = SAMPLE_RATE_HZ * 2 // 1_000
 MIN_FRAME_BYTES = MIN_FRAME_MS * _BYTES_PER_MS
 MAX_FRAME_BYTES = MAX_FRAME_MS * _BYTES_PER_MS
+# ``keyterms_prompt`` limits. The JSON array travels in the URL, so its UTF-8
+# size is bounded too (at most ~6 KB once percent-encoded).
+MAX_KEYTERMS = 100
+MAX_KEYTERM_CHARS = 50
+MAX_KEYTERM_TOTAL_BYTES = 2_000
 
 # EchoLingo session language -> AssemblyAI language. ``None`` means the
 # provider cannot transcribe that language and ``start_session`` refuses.
@@ -140,8 +149,19 @@ class AssemblyAiAsrBackend(CloudStreamingAsrBase):
         text = f"{value:.4f}".rstrip("0").rstrip(".")
         return text or "0"
 
+    def keyterms(self) -> list[str]:
+        """Session hint terms for ``keyterms_prompt`` (none before a session)."""
+        if self.config is None or not self.config.terms:
+            return []
+        return hint_terms(
+            self.config.terms,
+            max_terms=MAX_KEYTERMS,
+            max_chars=MAX_KEYTERM_CHARS,
+            max_total_bytes=MAX_KEYTERM_TOTAL_BYTES,
+        )
+
     def query_parameters(self) -> dict[str, str]:
-        return {
+        params = {
             "sample_rate": str(SAMPLE_RATE_HZ),
             "encoding": "pcm_s16le",
             "format_turns": "true" if self.format_turns else "false",
@@ -153,6 +173,10 @@ class AssemblyAiAsrBackend(CloudStreamingAsrBase):
             ),
             "max_turn_silence": str(self.max_turn_silence_ms),
         }
+        terms = self.keyterms()
+        if terms:
+            params["keyterms_prompt"] = json.dumps(terms, ensure_ascii=False)
+        return params
 
     def build_url(self) -> str:
         return f"{STREAMING_URL}?{urlencode(self.query_parameters())}"

@@ -62,12 +62,14 @@ def looks_degenerate(source: str, text: str) -> bool:
     return False
 
 
-def looks_like_echo(source: str, text: str, context) -> bool:
-    """The provider returned the source itself or an earlier context sentence."""
+def looks_like_echo(source: str, text: str, context, domain: str | None = None) -> bool:
+    """The provider returned the source itself, the session topic or an earlier context sentence."""
     normalized = _normalize(text)
     if not normalized:
         return False
     if normalized == _normalize(source):
+        return True
+    if domain and normalized == _normalize(domain):
         return True
     for item in context:
         if normalized == _normalize(item.source) or (
@@ -75,6 +77,79 @@ def looks_like_echo(source: str, text: str, context) -> bool:
         ):
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# wrong-script guard
+# ---------------------------------------------------------------------------
+
+_HANGUL_CLASS = "\u1100-\u11ff\u3130-\u318f\ua960-\ua97f\uac00-\ud7af\ud7b0-\ud7ff"
+# Kana without the katakana middle dot (U+30FB), which Chinese uses in names.
+_KANA_CLASS = "\u3040-\u309f\u30a1-\u30fa\u30fc-\u30ff\u31f0-\u31ff\uff66-\uff9f"
+_HAN_CLASS = "\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0002fa1f"
+_CYRILLIC_CLASS = "\u0400-\u052f"
+_CJK_TEXT_CLASS = _HAN_CLASS + "\u3000-\u303f\uff00-\uffef"
+_SENTINEL = "\x00"
+_SENTINEL_RUN_RE = re.compile(r"[ \t\u3000]*\x00(?:[ \t\u3000]*\x00)*[ \t\u3000]*")
+_CJK_TEXT_RE = re.compile(f"[{_CJK_TEXT_CLASS}]")
+_LETTER_RE = re.compile(r"\w", re.UNICODE)
+
+
+def _language_base(code: str | None) -> str:
+    return (code or "").strip().replace("_", "-").lower().split("-", 1)[0]
+
+
+def foreign_script_pattern(target_lang: str, source_lang: str | None = None) -> re.Pattern | None:
+    """Runs of characters that cannot belong to a ``target_lang`` translation.
+
+    Chinese targets reject Hangul, and kana unless the source is Japanese;
+    English targets reject Han, kana, Hangul and Cyrillic. Other targets are
+    not checked.
+    """
+    target = _language_base(target_lang)
+    if target == "zh":
+        classes = _HANGUL_CLASS + ("" if _language_base(source_lang) == "ja" else _KANA_CLASS)
+    elif target == "en":
+        classes = _HAN_CLASS + _KANA_CLASS + _HANGUL_CLASS + _CYRILLIC_CLASS
+    else:
+        return None
+    return re.compile(f"[{classes}]+")
+
+
+def has_foreign_script(text: str, target_lang: str, source_lang: str | None = None) -> bool:
+    pattern = foreign_script_pattern(target_lang, source_lang)
+    return bool(pattern is not None and pattern.search(text))
+
+
+def strip_foreign_script(text: str, target_lang: str, source_lang: str | None = None) -> str:
+    """Remove foreign-script runs and repair the spacing they leave behind."""
+    pattern = foreign_script_pattern(target_lang, source_lang)
+    if pattern is None:
+        return text
+    marked = pattern.sub(_SENTINEL, text)
+    chinese = _language_base(target_lang) == "zh"
+
+    def join(match: re.Match) -> str:
+        before = marked[match.start() - 1] if match.start() > 0 else ""
+        after = marked[match.end()] if match.end() < len(marked) else ""
+        if not before or not after:
+            return ""
+        if chinese and (_CJK_TEXT_RE.match(before) or _CJK_TEXT_RE.match(after)):
+            return ""
+        return " "
+
+    cleaned = _SENTINEL_RUN_RE.sub(join, marked)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    # Punctuation orphaned by the removal: a leading comma, doubled commas,
+    # a space before a Latin mark.
+    cleaned = re.sub(r"^[\s,，、;；:：]+", "", cleaned)
+    cleaned = re.sub(r"([，,、])(?:\s*[，,、])+", r"\1", cleaned)
+    cleaned = re.sub(r"\s+([,.;:!?%)\]])", r"\1", cleaned)
+    return cleaned.strip()
+
+
+def _has_context(request: TranslationRequest) -> bool:
+    return bool(request.context or request.domain)
 
 
 class TranslationRequestError(RuntimeError):
@@ -279,7 +354,9 @@ class StreamingTranslationCoordinator:
         self.context = ContextWindow(context_segments)
         self.target = TargetCommitPolicy()
         self.glossary = glossary
-        self.domain = domain
+        # Session topic (docs/adr/0006); providers see it only under the same
+        # transcript-upload consent as the source text.
+        self.domain = (domain or "").strip() or None
 
     async def start(self) -> None:
         await self.backend.set_glossary(self.glossary)
@@ -316,7 +393,9 @@ class StreamingTranslationCoordinator:
             target_lang=self.target_lang,
             context=() if drop_context else self.context.snapshot(),
             terms=self.glossary,
-            domain=self.domain,
+            # A retry without context also drops the topic: both are prompt
+            # material a small model can copy or be confused by.
+            domain=None if drop_context else self.domain,
             editable_window_start=max(0, len(decision.committed_source) - len(source)),
             editable_window_end=len(decision.committed_source),
             latency_budget_ms=self.policy.latency_budget_ms,
@@ -355,7 +434,7 @@ class StreamingTranslationCoordinator:
                     raise TranslationRequestError(
                         translated.error_code or "provider_error",
                         translated.text,
-                        retry_without_context=bool(request.context),
+                        retry_without_context=_has_context(request),
                     )
                 outcome.text = translated.text
                 outcome.truncated = translated.truncated
@@ -366,12 +445,16 @@ class StreamingTranslationCoordinator:
                 provider_final = translated.kind == TranslationKind.FINAL
                 if committed_span:
                     if provider_final:
-                        if looks_like_echo(request.source_text, translated.text, request.context):
+                        if looks_like_echo(
+                            request.source_text, translated.text, request.context, request.domain
+                        ):
                             raise TranslationRequestError(
                                 "context_echo",
                                 "provider echoed the source or its context",
-                                retry_without_context=bool(request.context),
+                                retry_without_context=_has_context(request),
                             )
+                        translated = self._guard_script(translated, request)
+                        outcome.text = translated.text
                         state = self.target.commit(
                             translated.text, source_revision_id=decision.source_revision_id
                         )
@@ -402,6 +485,41 @@ class StreamingTranslationCoordinator:
                 self.target.discard_provisional()
             raise
         return outcome
+
+    def _guard_script(
+        self, translated: CanonicalTranslationEvent, request: TranslationRequest
+    ) -> CanonicalTranslationEvent:
+        """Reject, then repair, a committed translation in the wrong script.
+
+        Small local models occasionally drift into Korean or Japanese inside a
+        Chinese sentence. The first attempt is retried without context; the
+        retry's answer is committed with the foreign runs removed rather than
+        losing the whole sentence.
+        """
+        if not has_foreign_script(translated.text, self.target_lang, self.source_lang):
+            return translated
+        if request.attempt < 2:
+            logger.info(
+                "translation of source revision %d is in the wrong script; retrying",
+                request.source_revision_id,
+            )
+            raise TranslationRequestError(
+                "wrong_script",
+                "translation contains text in the wrong script for the target language",
+                retry_without_context=True,
+            )
+        cleaned = strip_foreign_script(translated.text, self.target_lang, self.source_lang)
+        if not _LETTER_RE.search(cleaned):
+            raise TranslationRequestError(
+                "wrong_script",
+                "translation is entirely in the wrong script for the target language",
+            )
+        logger.info(
+            "removed %d wrong-script chars from the translation of source revision %d",
+            max(0, len(translated.text) - len(cleaned)),
+            request.source_revision_id,
+        )
+        return replace(translated, text=cleaned)
 
     def abandon(self, decision: TranslationDecision) -> None:
         """A committed span that could not be translated is never retried later."""

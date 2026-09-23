@@ -32,9 +32,41 @@ _ECHO_FRAGMENTS = (
 )
 
 
+# Section markers of the Hy-MT2 context template (local_hymt.build_prompt).
+# A small model occasionally copies them, sometimes with the whole background.
+_TEMPLATE_MARKER_RE = re.compile(
+    r"(?:【\s*(?:待翻译文本|背景信息|原文|译文|翻译结果)\s*】"
+    r"|\[\s*(?:Source Text|Background Information|Translation|Target Text)\s*\])"
+    r"[ \t]*[:：]?[ \t]*\n?",
+    re.IGNORECASE,
+)
+_SOURCE_MARKERS = ("【待翻译文本】", "[source text]")
+# "参考下面的翻译：\nX 翻译成 Y" / "Reference the following translations:" blocks.
+_TERMS_ECHO_RE = re.compile(
+    r"^(?:参考下面的翻译[：:]|Reference the following translations:)[^\n]*\n"
+    r"(?:[^\n]*(?:翻译成|translates to)[^\n]*\n)*\s*",
+    re.IGNORECASE,
+)
+
+
+def strip_template_markers(text: str) -> str:
+    """Drop copied prompt sections, keeping what follows the source marker."""
+    lowered = text.lower()
+    cut = -1
+    for marker in _SOURCE_MARKERS:
+        index = lowered.rfind(marker.lower())
+        if index >= 0:
+            cut = max(cut, index)
+    if cut > 0:
+        # Everything before the last "source text" marker is copied prompt.
+        text = text[cut:]
+    text = _TERMS_ECHO_RE.sub("", text.lstrip())
+    return _TEMPLATE_MARKER_RE.sub("", text).lstrip()
+
+
 def strip_instruction_echo(text: str) -> str:
     """Remove chatter a small model sometimes copies from the instruction."""
-    stripped = text.lstrip()
+    stripped = strip_template_markers(text).lstrip()
     for pattern in _ECHO_PREFIXES:
         stripped = pattern.sub("", stripped, count=1)
     for fragment in _ECHO_FRAGMENTS:

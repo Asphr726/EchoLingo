@@ -22,6 +22,20 @@ from ...translation.policy import TranslationRequestError
 
 logger = logging.getLogger(__name__)
 
+TOPIC_MAX_CHARS = 200
+MAX_PROMPT_TERMS = 8
+
+
+def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if minimum <= value <= maximum else default
+
 # Re-exported for existing imports; the helpers live in ``_text``.
 from ._text import LANGUAGE_NAMES, language_name, repeated_tail, strip_instruction_echo  # noqa: E402
 
@@ -69,7 +83,9 @@ class LocalHyMtBackend:
         self.top_p = top_p
         self.top_k = top_k
         self.repeat_penalty = repeat_penalty
-        self.background_spans = background_spans
+        self.background_spans = _env_int(
+            "ECHOLINGO_HYMT_BACKGROUND_SPANS", background_spans, minimum=1, maximum=4
+        )
         self.background_max_chars = background_max_chars
         self.glossary: tuple[GlossaryTerm, ...] = ()
         self.descriptor = BackendDescriptor(
@@ -85,9 +101,14 @@ class LocalHyMtBackend:
     # ------------------------------------------------------------------
 
     def _background(self, request: TranslationRequest) -> str:
-        """Previous source sentences only: target text in the prompt gets copied."""
+        """Session topic plus previous source sentences.
+
+        Target text is never included: the 1.8B model copies it. The topic
+        (docs/adr/0006) is one short line so it cannot dominate the prompt.
+        """
         spans: list[str] = []
-        total = 0
+        topic = " ".join((request.domain or "").split())[:TOPIC_MAX_CHARS]
+        total = len(topic)
         for item in reversed(request.context[-self.background_spans :]):
             source = item.source.strip()
             if not source:
@@ -96,12 +117,25 @@ class LocalHyMtBackend:
                 break
             spans.append(source)
             total += len(source)
-        return "\n".join(reversed(spans))
+        lines = list(reversed(spans))
+        if topic:
+            lines.insert(0, topic)
+        return "\n".join(lines)
+
+    def _terms(self, request: TranslationRequest) -> tuple[GlossaryTerm, ...]:
+        """Glossary pairs that occur in this source span (the prompt stays short)."""
+        source = request.source_text.lower()
+        matched = [
+            item
+            for item in (request.terms or self.glossary)
+            if item.source.strip() and item.source.strip().lower() in source
+        ]
+        return tuple(matched[:MAX_PROMPT_TERMS])
 
     def build_prompt(self, request: TranslationRequest) -> str:
         chinese_prompt = request.target_lang.lower().startswith("zh")
         target = language_name(request.target_lang, chinese_prompt=chinese_prompt)
-        terms = request.terms or self.glossary
+        terms = self._terms(request)
         background = self._background(request)
         source = request.source_text.strip()
         parts: list[str] = []

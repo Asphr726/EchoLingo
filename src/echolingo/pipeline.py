@@ -10,6 +10,7 @@ import numpy as np
 
 from .models import AsrAudioChunk, AsrSessionConfig, AudioFrame, AudioMetrics, ProcessedFrame
 from .resample import StreamingResampler, downmix
+from .session_context import SessionContext
 from .translation.scheduler import TranslationScheduler
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,22 @@ def rms_dbfs(samples: np.ndarray) -> float:
         return -120.0
     rms = float(np.sqrt(np.mean(np.square(samples, dtype=np.float64))))
     return max(-120.0, 20.0 * np.log10(max(rms, 1e-12)))
+
+
+def asr_session_config(
+    session_id: str,
+    language: str,
+    streaming_mode: str = "streaming",
+    context: SessionContext | None = None,
+) -> AsrSessionConfig:
+    """ASR session settings carrying the parsed session context (ADR 0006)."""
+    return AsrSessionConfig(
+        session_id=session_id,
+        language=language,
+        streaming_mode=streaming_mode,
+        context=context.asr_prompt if context is not None else "",
+        terms=context.hint_terms if context is not None else (),
+    )
 
 
 @dataclass(slots=True)
@@ -40,7 +57,16 @@ class NoiseFloorTracker:
 
 class FarFieldPipeline:
     def __init__(
-        self, processor, vad, policy, asr, sink, input_rate_hz: int, translation=None
+        self,
+        processor,
+        vad,
+        policy,
+        asr,
+        sink,
+        input_rate_hz: int,
+        translation=None,
+        *,
+        session_context: SessionContext | None = None,
     ) -> None:
         self.processor = processor
         self.vad = vad
@@ -54,6 +80,9 @@ class FarFieldPipeline:
         self.asr_audio_ms = 0.0
         self._previous_speech = False
         self.translation = translation
+        # Lecture topic/terms for the ASR prompt; translation receives the
+        # topic and glossary through its coordinator.
+        self.session_context = session_context
         self.translation_scheduler = (
             TranslationScheduler(translation, sink.write_translation)
             if translation is not None
@@ -176,10 +205,11 @@ class FarFieldPipeline:
             if self.translation is not None:
                 await self.translation.start()
             await self.asr.start_session(
-                AsrSessionConfig(
-                    session_id=str(uuid.uuid4()),
-                    language=getattr(self.asr, "language", "en"),
-                    streaming_mode=getattr(self.asr, "streaming_mode", "streaming"),
+                asr_session_config(
+                    str(uuid.uuid4()),
+                    getattr(self.asr, "language", "en"),
+                    getattr(self.asr, "streaming_mode", "streaming"),
+                    self.session_context,
                 )
             )
             consumer = asyncio.create_task(self._consume_events())
@@ -255,11 +285,17 @@ class StreamingPipelineSession:
         session_id: str,
         language: str,
         streaming_mode: str = "streaming",
+        session_context: SessionContext | None = None,
     ) -> None:
         self.pipeline = pipeline
         self.session_id = session_id
         self.language = language
         self.streaming_mode = streaming_mode
+        self.session_context = (
+            session_context
+            if session_context is not None
+            else getattr(pipeline, "session_context", None)
+        )
         self._consumer: asyncio.Task[None] | None = None
         self._translation_consumer: asyncio.Task[None] | None = None
         self._started = False
@@ -271,10 +307,8 @@ class StreamingPipelineSession:
         if self.pipeline.translation is not None:
             await self.pipeline.translation.start()
         await self.pipeline.asr.start_session(
-            AsrSessionConfig(
-                session_id=self.session_id,
-                language=self.language,
-                streaming_mode=self.streaming_mode,
+            asr_session_config(
+                self.session_id, self.language, self.streaming_mode, self.session_context
             )
         )
         self._consumer = asyncio.create_task(self.pipeline._consume_events())

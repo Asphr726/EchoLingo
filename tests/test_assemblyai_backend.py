@@ -765,3 +765,60 @@ async def test_probe_reads_begin_or_error_frame_without_sending_audio() -> None:
     with pytest.raises(AuthenticationError) as info:
         await run({"type": "Error", "error_code": 1008, "error": "Unauthorized Connection: Invalid API key"})
     assert KEY not in str(info.value)
+
+
+# ----------------------------------------------------------- session context
+
+
+async def test_session_terms_become_a_json_keyterms_prompt(caplog) -> None:
+    socket = FakeSocket()
+    captured: dict = {}
+
+    async def factory(url, headers):
+        captured.update(url=url, headers=headers)
+        return socket
+
+    adapter = backend(websocket_factory=factory)
+    # No session yet (e.g. the probe): no terms in the URL.
+    assert "keyterms_prompt" not in parse_qs(urlsplit(adapter.build_url()).query)
+    terms = ("Béla Julesz", "pre-attentive", "Treisman", "treisman", "x" * 51, "")
+    with caplog.at_level("DEBUG", logger="echolingo"):
+        await adapter.start_session(
+            AsrSessionConfig("s", "en", context="Topic: early vision", terms=terms)
+        )
+    await adapter.close()
+    query = parse_qs(urlsplit(captured["url"]).query)
+    assert json.loads(query["keyterms_prompt"][0]) == ["Béla Julesz", "pre-attentive", "Treisman"]
+    # Every other parameter keeps a single value.
+    assert all(len(values) == 1 for values in query.values())
+    assert query["sample_rate"] == ["16000"]
+    assert KEY not in captured["url"] and "Julesz" not in json.dumps(captured["headers"])
+    assert "Julesz" not in caplog.text
+
+
+def test_keyterms_prompt_is_capped_at_100_terms_and_omitted_without_terms() -> None:
+    adapter = backend()
+    adapter.config = AsrSessionConfig("s", "en", terms=tuple(f"term{i}" for i in range(130)))
+    query = parse_qs(urlsplit(adapter.build_url()).query)
+    terms = json.loads(query["keyterms_prompt"][0])
+    assert len(terms) == 100 and terms[0] == "term0" and terms[-1] == "term99"
+    adapter.config = AsrSessionConfig("s", "en", context="only a topic")
+    assert "keyterms_prompt" not in adapter.query_parameters()
+
+
+async def test_reconnect_url_keeps_the_keyterms_prompt() -> None:
+    sockets = [FakeSocket(), FakeSocket()]
+    urls: list[str] = []
+
+    async def factory(url, headers):
+        urls.append(url)
+        return sockets[len(urls) - 1]
+
+    adapter = backend(websocket_factory=factory)
+    adapter.retry = RetryPolicy(initial_s=0.001, maximum_s=0.002, budget_s=0.2)
+    await adapter.start_session(AsrSessionConfig("s", "en", terms=("texton",)))
+    await sockets[0].incoming.put(ConnectionError("dropped"))
+    await settle(lambda: len(urls) >= 2)
+    await adapter.close()
+    prompts = [parse_qs(urlsplit(url).query)["keyterms_prompt"] for url in urls]
+    assert prompts == [['["texton"]'], ['["texton"]']]

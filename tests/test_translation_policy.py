@@ -170,3 +170,46 @@ def test_policy_without_provisional_only_translates_stable_and_final() -> None:
     )
     decision = policy.observe(final, now_ns=7_000_000_000)
     assert decision is not None and decision.source_text == "Bye."
+
+
+def test_wrong_script_guard_retries_then_repairs_the_real_leak() -> None:
+    import pytest
+
+    from echolingo.models import TranslationRequest
+    from echolingo.translation.policy import (
+        StreamingTranslationCoordinator,
+        TranslationRequestError,
+        has_foreign_script,
+        strip_foreign_script,
+    )
+
+    leaked = "然后其中 하나が出现，但并没有完全显现出来。"
+    assert has_foreign_script(leaked, "zh", "en")
+    assert strip_foreign_script(leaked, "zh", "en") == "然后其中出现，但并没有完全显现出来。"
+    # Kana is legitimate in a Chinese translation of Japanese names only when
+    # the source is Japanese; Hangul never is.
+    assert not has_foreign_script("东京・新宿", "zh", "ja")
+    assert has_foreign_script("It is 좋다", "en", "ko")
+
+    coordinator = StreamingTranslationCoordinator(
+        MockTranslationBackend(), source_lang="en", target_lang="zh"
+    )
+
+    def request(attempt: int) -> TranslationRequest:
+        return TranslationRequest(
+            request_id="r", source_revision_id=7, source_text="And then one of them pops up",
+            source_lang="en", target_lang="zh", source_committed=True, attempt=attempt,
+        )
+
+    from echolingo.models import CanonicalTranslationEvent, TranslationKind
+
+    translated = CanonicalTranslationEvent(
+        request_id="r", event_id="e", revision_id=1, source_revision_id=7,
+        kind=TranslationKind.FINAL, text=leaked, provider="mock", model="mock",
+        locality=BackendLocality.MOCK, emitted_at_monotonic_ns=0,
+    )
+    with pytest.raises(TranslationRequestError) as info:
+        coordinator._guard_script(translated, request(1))
+    assert info.value.error_code == "wrong_script" and info.value.retry_without_context
+    repaired = coordinator._guard_script(translated, request(2))
+    assert repaired.text == "然后其中出现，但并没有完全显现出来。"

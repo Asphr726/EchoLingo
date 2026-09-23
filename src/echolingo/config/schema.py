@@ -24,6 +24,7 @@ from .providers import (
 __all__ = [
     "AppConfig",
     "AsrConfig",
+    "ContextConfig",
     "TranslationConfig",
     "CloudQwenAsrConfig",
     "CloudQwenMtConfig",
@@ -142,6 +143,19 @@ class AlignmentConfig:
 
 
 @dataclass(slots=True)
+class ContextConfig:
+    """Session context text (docs/adr/0006), parsed by ``echolingo.session_context``.
+
+    ``session_context`` is the per-lecture topic and terms; ``glossary`` the
+    standing terminology. Both reach recognition/translation providers only
+    under the session's existing upload flags.
+    """
+
+    session_context: str = ""
+    glossary: str = ""
+
+
+@dataclass(slots=True)
 class AppConfig:
     audio: AudioConfig = field(default_factory=AudioConfig)
     frontend: FrontendConfig = field(default_factory=FrontendConfig)
@@ -154,9 +168,11 @@ class AppConfig:
     network: NetworkConfig = field(default_factory=NetworkConfig)
     cost: CostConfig = field(default_factory=CostConfig)
     alignment: AlignmentConfig = field(default_factory=AlignmentConfig)
+    context: ContextConfig = field(default_factory=ContextConfig)
 
     def validate(self) -> None:
         from ..backends import registry
+        from ..session_context import GLOSSARY_MAX_CHARS, SESSION_CONTEXT_MAX_CHARS
 
         if self.inference.mode not in {"auto", "local", "cloud"}:
             raise ConfigurationError("inference.mode must be auto, local, or cloud")
@@ -218,6 +234,14 @@ class AppConfig:
             raise ConfigurationError("OpenAI realtime VAD threshold must be between 0 and 1")
         if self.translation.deepl.tier not in {"free", "pro"}:
             raise ConfigurationError("DeepL tier must be free or pro")
+        for name, value, limit in (
+            ("context.session_context", self.context.session_context, SESSION_CONTEXT_MAX_CHARS),
+            ("context.glossary", self.context.glossary, GLOSSARY_MAX_CHARS),
+        ):
+            if not isinstance(value, str):
+                raise ConfigurationError(f"{name} must be text")
+            if len(value) > limit:
+                raise ConfigurationError(f"{name} must be at most {limit} characters")
 
     def redacted_dict(self) -> dict[str, Any]:
         """Configuration without secrets: credentials appear only as booleans."""

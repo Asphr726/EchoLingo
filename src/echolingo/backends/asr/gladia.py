@@ -18,6 +18,9 @@ The token-bearing WebSocket URL is kept private on the instance and never
 appears in ``endpoint``, error messages or logs. Every (re)connection performs
 a fresh REST session init because Gladia session URLs are single-use.
 
+Session hint terms (docs/adr/0006) are sent in the init body as
+``realtime_processing.custom_vocabulary_config.vocabulary`` (at most 100).
+
 Timeline: Gladia reports utterance times relative to the audio it received on
 the *current* connection, while the base class works in source time (the
 local audio ring). ``_stream_origin_ms`` records the source time of the first
@@ -46,6 +49,7 @@ from ...errors import (
     RateLimitError,
 )
 from ...models import AsrAudioChunk
+from ._context import hint_terms
 from .cloud_streaming import CloudStreamingAsrBase, ProviderTranscriptDelta, json_message
 
 LIVE_HOST = "api.gladia.io"
@@ -79,6 +83,11 @@ _IGNORED_MESSAGE_TYPES = frozenset(
         "chapterization",
     }
 )
+
+
+# ``custom_vocabulary_config.vocabulary`` limits.
+MAX_VOCABULARY_TERMS = 100
+MAX_VOCABULARY_TERM_CHARS = 100
 
 
 _RECOVERABLE_PATTERN = re.compile(r"rate[ _-]?limit|\btimeout\b|\btimed out\b|\b429\b|\b503\b|overloaded")
@@ -206,7 +215,23 @@ class GladiaAsrBackend(CloudStreamingAsrBase):
             "receive_errors": True,
             "receive_lifecycle_events": True,
         }
+        vocabulary = self.vocabulary()
+        if vocabulary:
+            payload["realtime_processing"] = {
+                "custom_vocabulary": True,
+                "custom_vocabulary_config": {"vocabulary": vocabulary},
+            }
         return payload
+
+    def vocabulary(self) -> list[str]:
+        """Session hint terms for custom vocabulary (none before a session)."""
+        if self.config is None or not self.config.terms:
+            return []
+        return hint_terms(
+            self.config.terms,
+            max_terms=MAX_VOCABULARY_TERMS,
+            max_chars=MAX_VOCABULARY_TERM_CHARS,
+        )
 
     @property
     def http_client(self) -> httpx.AsyncClient:

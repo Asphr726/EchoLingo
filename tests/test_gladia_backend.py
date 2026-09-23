@@ -578,3 +578,77 @@ def test_registry_factory_builds_backend_from_injected_environment(monkeypatch) 
     assert backend.descriptor.locality.value == "cloud"
     assert backend.descriptor.audio_upload_required is True
     assert BackendFactory(config, {}).asr("gladia").api_key is None
+
+
+# ----------------------------------------------------------- session context
+
+
+async def test_session_terms_enable_realtime_custom_vocabulary(caplog) -> None:
+    rest = RestInit()
+    socket = FakeSocket()
+
+    async def factory(url, headers):
+        return socket
+
+    backend = make_backend(rest, factory)
+    terms = ("Béla Julesz", "pre-attentive", "julesz", "BÉLA JULESZ", "texton", "  ")
+    with caplog.at_level("DEBUG", logger="echolingo"):
+        await backend.start_session(
+            AsrSessionConfig("s", "en", context="Topic: early vision", terms=terms)
+        )
+    await backend.close()
+    body = json.loads(rest.requests[0].content)
+    assert body["realtime_processing"] == {
+        "custom_vocabulary": True,
+        "custom_vocabulary_config": {"vocabulary": ["Béla Julesz", "pre-attentive", "julesz", "texton"]},
+    }
+    # Terms go in the body only, never in a header or the URL.
+    assert "Julesz" not in str(rest.requests[0].url)
+    assert "Julesz" not in json.dumps(dict(rest.requests[0].headers))
+    assert "Julesz" not in caplog.text
+
+
+def test_custom_vocabulary_is_capped_and_omitted_without_terms() -> None:
+    backend = GladiaAsrBackend(api_key=API_KEY, model="solaria-1", language="en")
+    assert "realtime_processing" not in backend.session_payload()
+    backend.config = AsrSessionConfig("s", "en", context="only a topic")
+    assert "realtime_processing" not in backend.session_payload()
+    backend.config = AsrSessionConfig("s", "en", terms=tuple(f"term{i}" for i in range(150)))
+    vocabulary = backend.session_payload()["realtime_processing"]["custom_vocabulary_config"][
+        "vocabulary"
+    ]
+    assert len(vocabulary) == 100 and vocabulary[-1] == "term99"
+
+
+async def test_probe_and_reconnect_init_bodies_carry_terms_only_in_a_session() -> None:
+    rest = RestInit()
+    probe = make_backend(rest)
+    await probe.probe_connection()
+    assert "realtime_processing" not in json.loads(rest.requests[0].content)
+
+    rest = RestInit()
+    sockets = [FakeSocket(), FakeSocket()]
+    calls = 0
+
+    async def factory(url, headers):
+        nonlocal calls
+        socket = sockets[calls]
+        calls += 1
+        return socket
+
+    backend = make_backend(rest, factory)
+    backend.retry = RetryPolicy(initial_s=0.001, maximum_s=0.002, budget_s=0.2)
+    await backend.start_session(AsrSessionConfig("s", "en", terms=("Treisman",)))
+    await sockets[0].incoming.put(ConnectionError("gone"))
+
+    async def reconnected():
+        while calls < 2:
+            await asyncio.sleep(0.001)
+
+    await asyncio.wait_for(reconnected(), 1)
+    await backend.close()
+    vocabularies = [
+        json.loads(request.content)["realtime_processing"]["custom_vocabulary_config"]["vocabulary"]
+        for request in rest.requests
+    ]
+    assert vocabularies == [["Treisman"], ["Treisman"]]

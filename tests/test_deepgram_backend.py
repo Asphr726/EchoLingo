@@ -587,3 +587,109 @@ async def test_reconnect_gives_up_after_budget_with_recoverable_error() -> None:
     assert events and events[-1].kind == TranscriptKind.ERROR
     assert events[-1].error_code == "network_error" and events[-1].recoverable is True
     assert KEY not in events[-1].text
+
+
+# ----------------------------------------------------------- session context
+
+
+def _keyterms(url: str) -> list[str]:
+    return parse_qs(urlparse(url).query).get("keyterm", [])
+
+
+async def test_nova3_session_terms_become_repeated_keyterm_parameters(caplog) -> None:
+    socket = FakeSocket()
+    captured: dict = {}
+
+    async def factory(url, headers):
+        captured.update(url=url, headers=headers)
+        return socket
+
+    backend = make(model="nova-3", language="en", websocket_factory=factory)
+    # No session yet (e.g. the connection probe): no terms travel.
+    assert _keyterms(backend.endpoint) == []
+    terms = ("Julesz", "pre-attentive", "Hubel & Wiesel", "julesz", "texton", "  saccade  ")
+    with caplog.at_level("DEBUG", logger="echolingo"):
+        await backend.start_session(
+            AsrSessionConfig("s", "en", context="Topic: early vision", terms=terms)
+        )
+    await backend.close()
+    url = captured["url"]
+    assert _keyterms(url) == ["Julesz", "pre-attentive", "Hubel & Wiesel", "texton", "saccade"]
+    # Multi-word terms travel percent-encoded, never as a raw '&' or '+'.
+    assert "keyterm=Hubel%20%26%20Wiesel" in url
+    # The other parameters keep their single values and wire order.
+    pairs = backend.query_parameters()
+    assert pairs[0] == ("model", "nova-3") and pairs[1] == ("language", "en")
+    assert [key for key, _ in pairs].count("model") == 1
+    assert KEY not in url and "Julesz" not in json.dumps(captured["headers"])
+    assert "Julesz" not in caplog.text and "saccade" not in caplog.text
+
+
+def test_keyterm_limits_skip_long_terms_and_cap_the_count() -> None:
+    backend = make(model="nova-3-medical", language="en")
+    long_term = "x" * 51
+    many = tuple(f"term{index}" for index in range(80))
+    backend.config = AsrSessionConfig("s", "en", terms=(long_term, "", *many))
+    terms = _keyterms(backend.endpoint)
+    assert len(terms) == deepgram.MAX_KEYTERMS == 50
+    assert terms[0] == "term0" and long_term not in terms
+    assert all(len(term) <= deepgram.MAX_KEYTERM_CHARS for term in terms)
+
+
+@pytest.mark.parametrize(
+    ("model", "language", "expect_terms"),
+    [
+        ("nova-3", "en", True),
+        ("nova-3", "ja", True),
+        ("nova-3", "auto", True),
+        ("nova-3", "zh", False),  # falls back to nova-2 on the wire
+        ("nova-3", "ko", False),
+        ("nova-2", "en", False),
+        ("nova-2-general", "en", False),
+        ("enhanced", "en", False),
+    ],
+)
+def test_keyterms_are_sent_for_nova3_wire_models_only(model, language, expect_terms) -> None:
+    backend = make(model=model, language=language)
+    backend.config = AsrSessionConfig("s", language, terms=("Julesz",))
+    query = parse_qs(urlparse(backend.endpoint).query)
+    assert ("keyterm" in query) is expect_terms
+    assert "keywords" not in query
+    if expect_terms:
+        assert query["keyterm"] == ["Julesz"]
+
+
+async def test_reconnect_url_keeps_the_keyterms() -> None:
+    sockets = [FakeSocket(), FakeSocket()]
+    urls: list[str] = []
+
+    async def factory(url, headers):
+        urls.append(url)
+        return sockets[len(urls) - 1]
+
+    backend = make(websocket_factory=factory)
+    backend.retry = RetryPolicy(initial_s=0.001, maximum_s=0.002, budget_s=0.2)
+    await backend.start_session(AsrSessionConfig("s", "en", terms=("Treisman",)))
+    await sockets[0].incoming.put(ConnectionError("dropped"))
+
+    async def reconnected():
+        while len(urls) < 2:
+            await asyncio.sleep(0.001)
+
+    await asyncio.wait_for(reconnected(), 1)
+    await backend.close()
+    assert [_keyterms(url) for url in urls] == [["Treisman"], ["Treisman"]]
+
+
+async def test_http_400_mentions_keyterms_only_when_terms_were_sent() -> None:
+    async def factory(url, headers):
+        raise _handshake_error(400)
+
+    backend = make(websocket_factory=factory)
+    with pytest.raises(BackendError) as info:
+        await backend.start_session(AsrSessionConfig("s", "en", terms=("Julesz",)))
+    assert "keyterm" in str(info.value) and "Julesz" not in str(info.value)
+    backend = make(websocket_factory=factory)
+    with pytest.raises(BackendError) as info:
+        await backend.start_session(AsrSessionConfig("s", "en"))
+    assert "keyterm" not in str(info.value)

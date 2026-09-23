@@ -168,10 +168,11 @@ class DeepLTranslation(RestTranslationBase):
         Target text is never sent as context: DeepL would treat it as more
         source and the translation drifts toward copying it.
         """
+        topic = " ".join((request.domain or "").split())[:200]
         if not self.context_spans:
-            return ""
+            return topic
         spans: list[str] = []
-        total = 0
+        total = len(topic)
         for item in reversed(request.context):
             source = item.source.strip()
             if not source:
@@ -182,7 +183,10 @@ class DeepLTranslation(RestTranslationBase):
             total += len(source)
             if len(spans) >= self.context_spans:
                 break
-        return "\n".join(reversed(spans))
+        lines = list(reversed(spans))
+        if topic:
+            lines.insert(0, topic)
+        return "\n".join(lines)
 
     def build_payload(self, request: TranslationRequest) -> dict[str, Any]:
         payload: dict[str, Any] = {

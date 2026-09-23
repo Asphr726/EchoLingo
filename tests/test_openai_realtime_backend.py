@@ -734,3 +734,72 @@ async def test_probe_reads_the_first_event_to_detect_an_invalid_key() -> None:
 
     instance, socket = backend(None)  # silent gateway: the upgrade counts
     assert await instance.probe_connection() >= 0
+
+
+# ----------------------------------------------------------- session context
+
+
+CONTEXT = "Topic: early vision and pre-attentive texture segregation.\nTerms: Julesz, Treisman, saccade"
+
+
+async def test_session_context_becomes_the_transcription_prompt(caplog) -> None:
+    socket = FakeSocket()
+    backend, captured = make_backend(socket)
+    with caplog.at_level("DEBUG"):
+        await backend.start_session(
+            AsrSessionConfig("s", "en", context=CONTEXT, terms=("Julesz", "Treisman"))
+        )
+    await backend.close()
+    transcription = socket.messages()[0]["session"]["audio"]["input"]["transcription"]
+    assert transcription == {"model": "gpt-4o-transcribe", "language": "en", "prompt": CONTEXT}
+    # Context never travels in the URL or headers, and is never logged.
+    assert "Julesz" not in captured["url"] and "Julesz" not in json.dumps(captured["headers"])
+    assert "Julesz" not in caplog.text
+
+
+async def test_session_context_prompt_is_capped_and_omitted_when_blank() -> None:
+    socket = FakeSocket()
+    backend, _ = make_backend(socket)
+    long_context = "word " * 400  # 2000 chars
+    await backend.start_session(AsrSessionConfig("s", "en", context=long_context))
+    await backend.close()
+    prompt = socket.messages()[0]["session"]["audio"]["input"]["transcription"]["prompt"]
+    assert 0 < len(prompt) <= 1000 and prompt.startswith("word word")
+    assert not prompt.endswith(" ")
+
+    blank = FakeSocket()
+    backend, _ = make_backend(blank)
+    await backend.start_session(AsrSessionConfig("s", "en", context="  \n "))
+    await backend.close()
+    assert "prompt" not in blank.messages()[0]["session"]["audio"]["input"]["transcription"]
+    # Before a session there is no context to send (the probe sends nothing anyway).
+    idle = OpenAiRealtimeAsrBackend(api_key=KEY)
+    assert "prompt" not in idle.session_config()["audio"]["input"]["transcription"]
+
+
+async def test_reconnect_resends_the_session_context_prompt() -> None:
+    sockets = [FakeSocket(on_commit="empty"), FakeSocket(on_commit="empty")]
+    calls = 0
+
+    async def factory(url, headers):
+        nonlocal calls
+        socket = sockets[calls]
+        calls += 1
+        return socket
+
+    backend = OpenAiRealtimeAsrBackend(
+        api_key=KEY, audio_upload_allowed=True, websocket_factory=factory
+    )
+    backend.retry = RetryPolicy(initial_s=0.001, maximum_s=0.002, budget_s=0.2)
+    await backend.start_session(AsrSessionConfig("s", "en", context=CONTEXT))
+    await sockets[0].incoming.put(ConnectionClosedError(Close(1006, "gone"), None))
+
+    async def reconnected():
+        while calls < 2 or not sockets[1].sent:
+            await asyncio.sleep(0.001)
+
+    await asyncio.wait_for(reconnected(), 1)
+    await backend.close()
+    first = sockets[1].messages()[0]
+    assert first["type"] == "session.update"
+    assert first["session"]["audio"]["input"]["transcription"]["prompt"] == CONTEXT

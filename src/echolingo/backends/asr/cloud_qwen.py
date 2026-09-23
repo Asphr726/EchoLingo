@@ -10,6 +10,7 @@ import uuid
 
 from ...errors import AuthenticationError
 from .. import dashscope
+from ._context import bounded_context
 from .cloud_streaming import CloudStreamingAsrBase, ProviderTranscriptDelta
 
 
@@ -113,8 +114,11 @@ class CloudQwenAsrBackend(CloudStreamingAsrBase):
         transcription: dict[str, object] = {}
         if self.config.language != "auto":
             transcription["language"] = self.config.language
-        if self.config.context:
-            transcription["corpus"] = {"text": self.config.context}
+        # Session topic and hint terms (docs/adr/0006) bias recognition of
+        # names and technical terms; sent only once audio upload is allowed.
+        context = bounded_context(self.config.context)
+        if context:
+            transcription["corpus"] = {"text": context}
         session: dict[str, object] = {
             "modalities": ["text"],
             "input_audio_format": "pcm",

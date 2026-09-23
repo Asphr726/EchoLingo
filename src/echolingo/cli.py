@@ -13,7 +13,9 @@ from .config import load_config
 from .enhancement import make_processor
 from .farfield import generate_proxy_files
 from .pipeline import FarFieldPipeline
+from .errors import ConfigurationError
 from .runtime import BackendFactory, CapabilityDetector, RuntimeRouter
+from .session_context import parse_session_context
 from .sinks import RunRecorder
 from .streaming import LectureSpeechPolicy
 from .translation import StreamingTranslationCoordinator
@@ -40,6 +42,16 @@ def _add_pipeline_args(parser: argparse.ArgumentParser) -> None:
         "--translation", choices=registry.provider_ids("translation")
     )
     parser.add_argument("--target-language", choices=["en", "zh", "ja", "ko"])
+    parser.add_argument(
+        "--context-file",
+        type=Path,
+        help="UTF-8 text file with the lecture topic and terms (docs/adr/0006)",
+    )
+    parser.add_argument(
+        "--glossary-file",
+        type=Path,
+        help="UTF-8 text file with standing 'term = translation' lines",
+    )
     parser.add_argument("--run-root", type=Path, default=Path("runs/spike1"))
     parser.add_argument("--duration-limit", type=float)
     parser.add_argument("--no-record-audio", action="store_true")
@@ -117,8 +129,19 @@ def _resolve_config(args):
         config.translation.provider = args.translation
     if getattr(args, "target_language", None):
         config.translation.target_language = args.target_language
+    if getattr(args, "context_file", None):
+        config.context.session_context = _read_text_file(args.context_file)
+    if getattr(args, "glossary_file", None):
+        config.context.glossary = _read_text_file(args.glossary_file)
     config.validate()
     return config
+
+
+def _read_text_file(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ConfigurationError(f"cannot read {path}: {type(error).__name__}") from error
 
 
 def _route(config):
@@ -143,6 +166,9 @@ async def _run_source(source, args) -> Path:
     )
     asr = BackendFactory(config).asr(route.asr_provider)
     translation_backend = BackendFactory(config).translation(route.translation_provider)
+    session_context = parse_session_context(
+        config.context.session_context, config.context.glossary
+    )
     translation = None
     if translation_backend is not None:
         translation = StreamingTranslationCoordinator(
@@ -150,6 +176,8 @@ async def _run_source(source, args) -> Path:
             source_lang=config.asr.language,
             target_lang=config.translation.target_language,
             context_segments=config.translation.context_segments,
+            glossary=session_context.glossary,
+            domain=session_context.topic or None,
             provisional_enabled=registry.get(
                 "translation", route.translation_provider
             ).streaming_partials,
@@ -166,7 +194,14 @@ async def _run_source(source, args) -> Path:
         console=not args.quiet,
     )
     pipeline = FarFieldPipeline(
-        processor, vad, policy, asr, sink, source.sample_rate_hz, translation
+        processor,
+        vad,
+        policy,
+        asr,
+        sink,
+        source.sample_rate_hz,
+        translation,
+        session_context=session_context,
     )
     await pipeline.run(source, args.duration_limit)
     return sink.run_dir

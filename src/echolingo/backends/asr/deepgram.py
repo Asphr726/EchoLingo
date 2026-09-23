@@ -7,9 +7,14 @@ arrive as ``Results`` JSON messages: interim ones replace the unstable tail,
 and ``speech_final`` marks the end of an utterance. ``UtteranceEnd`` (from
 ``utterance_end_ms``) closes an utterance that never received ``speech_final``.
 
+Session hint terms (docs/adr/0006) are sent as repeated ``keyterm`` query
+parameters for Nova-3 models (keyterm prompting; at most 50 terms of 50 chars
+and 1000 UTF-8 bytes in total); other model families get no hint terms rather
+than the older ``keywords`` boosting.
+
 Nothing but the API key header, the query parameters and the audio ever
 leaves the machine; the key is never placed in the URL, in log lines or in
-exception messages.
+exception messages, and the hint terms are never logged.
 """
 
 from __future__ import annotations
@@ -18,10 +23,11 @@ import asyncio
 import json
 import logging
 import os
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from ...errors import AuthenticationError, BackendError, RateLimitError
 from ...models import AsrAudioChunk, AsrSessionConfig
+from ._context import hint_terms
 from .cloud_streaming import CloudStreamingAsrBase, ProviderTranscriptDelta
 
 logger = logging.getLogger(__name__)
@@ -53,6 +59,15 @@ MODEL_LANGUAGE_FALLBACK: dict[tuple[str, str], str] = {
     ("nova-3", "zh"): "nova-2",
     ("nova-3", "ko"): "nova-2",
 }
+
+# Model families that accept ``keyterm`` prompting, and its limits.
+KEYTERM_MODEL_FAMILIES: tuple[str, ...] = ("nova-3",)
+MAX_KEYTERMS = 50
+MAX_KEYTERM_CHARS = 50
+# Deepgram caps keyterm prompting at 500 tokens per request and the terms
+# travel in the URL; 1000 UTF-8 bytes keeps both well inside their limits
+# (about 250 English tokens, a 3 KB percent-encoded query at worst).
+MAX_KEYTERM_TOTAL_BYTES = 1_000
 
 _RECOVERABLE_HINTS = ("rate", "timeout", "busy", "overload", "temporar", "try again")
 
@@ -142,30 +157,46 @@ class DeepgramAsrBackend(CloudStreamingAsrBase):
         language = language or self._session_language()
         return language_code(self.effective_model(language), language)
 
-    def query_parameters(self) -> dict[str, str]:
+    def keyterms(self, language: str | None = None) -> list[str]:
+        """Session hint terms sent as ``keyterm`` (Nova-3 family only)."""
+        if self.config is None or not self.config.terms:
+            return []
+        if model_family(self.effective_model(language)) not in KEYTERM_MODEL_FAMILIES:
+            return []
+        return hint_terms(
+            self.config.terms,
+            max_terms=MAX_KEYTERMS,
+            max_chars=MAX_KEYTERM_CHARS,
+            max_total_bytes=MAX_KEYTERM_TOTAL_BYTES,
+        )
+
+    def query_parameters(self) -> list[tuple[str, str]]:
+        """Query pairs in wire order; ``keyterm`` may repeat."""
         language = self._session_language()
-        params: dict[str, str] = {"model": self.effective_model(language)}
+        params: list[tuple[str, str]] = [("model", self.effective_model(language))]
         code = self.effective_language_code(language)
         if code is not None:
-            params["language"] = code
-        params.update(
-            {
-                "encoding": "linear16",
-                "sample_rate": str(self.provider_sample_rate_hz),
-                "channels": "1",
-                "interim_results": "true",
-                "punctuate": "true",
-                "smart_format": "true" if self.smart_format else "false",
-                "endpointing": str(self.endpointing_ms) if self.endpointing_ms > 0 else "false",
-                "vad_events": "true",
-            }
+            params.append(("language", code))
+        params.extend(
+            [
+                ("encoding", "linear16"),
+                ("sample_rate", str(self.provider_sample_rate_hz)),
+                ("channels", "1"),
+                ("interim_results", "true"),
+                ("punctuate", "true"),
+                ("smart_format", "true" if self.smart_format else "false"),
+                ("endpointing", str(self.endpointing_ms) if self.endpointing_ms > 0 else "false"),
+                ("vad_events", "true"),
+            ]
         )
         if self.utterance_end_ms > 0:
-            params["utterance_end_ms"] = str(self.utterance_end_ms)
+            params.append(("utterance_end_ms", str(self.utterance_end_ms)))
+        params.extend(("keyterm", term) for term in self.keyterms(language))
         return params
 
     def build_url(self) -> str:
-        return f"{LISTEN_URL}?{urlencode(self.query_parameters())}"
+        # ``quote`` (not ``quote_plus``): a multi-word keyterm travels as %20.
+        return f"{LISTEN_URL}?{urlencode(self.query_parameters(), doseq=True, quote_via=quote)}"
 
     def connect_headers(self) -> dict[str, str]:
         return {"Authorization": f"Token {self.api_key}"}
@@ -210,10 +241,15 @@ class DeepgramAsrBackend(CloudStreamingAsrBase):
             )
         if status == 400:
             language = self.effective_language_code() or "default"
+            keyterm_hint = (
+                " and keyterm prompting (clear the session terms to rule it out)"
+                if self.keyterms()
+                else ""
+            )
             return BackendError(
                 "Deepgram rejected the stream parameters (HTTP 400). Check that model "
                 f"{self.effective_model()!r} supports streaming for language "
-                f"{language!r}; see docs/providers/deepgram.md."
+                f"{language!r}{keyterm_hint}; see docs/providers/deepgram.md."
             )
         if status is not None:
             return ConnectionError(

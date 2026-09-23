@@ -19,7 +19,9 @@ Protocol summary (``wss://api.openai.com/v1/realtime?intent=transcription``):
   error (nothing left to commit) resolves the finish handshake; a clean server
   close while finishing resolves it as well;
 * there is no application-level keepalive; the WebSocket ping/pong keeps the
-  connection alive.
+  connection alive;
+* the session context (topic and hint terms, docs/adr/0006) is sent as
+  ``session.audio.input.transcription.prompt`` (at most 1000 chars).
 
 Language table: EchoLingo ``en``/``zh``/``ja``/``ko`` map to the same ISO 639-1
 codes; ``auto`` omits the language so the model detects it. Every session
@@ -37,6 +39,7 @@ from base64 import b64encode
 from dataclasses import dataclass
 
 from ...errors import AuthenticationError, RateLimitError
+from ._context import bounded_context
 from .cloud_streaming import CloudStreamingAsrBase, ProviderTranscriptDelta, json_message
 
 REALTIME_HOST = "api.openai.com"
@@ -45,6 +48,8 @@ BETA_HEADER = "realtime=v1"
 DEFAULT_MODEL = "gpt-4o-transcribe"
 SAMPLE_RATE_HZ = 24_000
 NOISE_REDUCTION_TYPES = ("near_field", "far_field")
+# Budget for ``transcription.prompt`` (the session topic and hint terms).
+PROMPT_MAX_CHARS = 1000
 
 # EchoLingo session language -> ISO 639-1 code for
 # ``session.audio.input.transcription.language``. ``None`` omits the key so
@@ -271,6 +276,11 @@ class OpenAiRealtimeAsrBackend(CloudStreamingAsrBase):
         code = language_code(language)
         if code:
             transcription["language"] = code
+        prompt = bounded_context(
+            self.config.context if self.config is not None else "", PROMPT_MAX_CHARS
+        )
+        if prompt:
+            transcription["prompt"] = prompt
         audio_input: dict[str, object] = {
             "format": {"type": "audio/pcm", "rate": SAMPLE_RATE_HZ},
             "transcription": transcription,
