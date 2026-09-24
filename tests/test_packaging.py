@@ -301,6 +301,30 @@ def test_onedir_sidecar_replaces_the_staged_resource_directory(monkeypatch, tmp_
     assert "apps/desktop/src-tauri/sidecar/" in (ROOT / ".gitignore").read_text().splitlines()
 
 
+def test_onedir_zips_license_trees_too_deep_for_windows(tmp_path) -> None:
+    build = load_script("build_sidecar")
+    bundle = tmp_path / "echolingo-sidecar"
+    deep = bundle / "_internal" / "torch-2.13.0.dist-info" / "licenses" / "third_party" / ("x" * 90)
+    deep.mkdir(parents=True)
+    (deep / "LICENSE.txt").write_text("deep license")
+    (deep.parents[1] / "LICENSE").write_text("top license")
+    shallow = bundle / "_internal" / "numpy-2.5.2.dist-info" / "licenses"
+    shallow.mkdir(parents=True)
+    (shallow / "LICENSE.txt").write_text("numpy license")
+
+    compacted = build.compact_license_trees(bundle)
+
+    torch_info = bundle / "_internal" / "torch-2.13.0.dist-info"
+    assert compacted == [torch_info / "licenses.zip"]
+    assert not (torch_info / "licenses").exists()
+    with zipfile.ZipFile(torch_info / "licenses.zip") as archive:
+        assert sorted(archive.namelist()) == ["LICENSE", f"third_party/{'x' * 90}/LICENSE.txt"]
+        assert archive.read("LICENSE") == b"top license"
+    assert (shallow / "LICENSE.txt").read_text() == "numpy license"
+    longest = max(len(path.relative_to(bundle).as_posix()) for path in bundle.rglob("*"))
+    assert longest <= build.ONEDIR_RELATIVE_PATH_LIMIT
+
+
 # --- Tauri configuration -------------------------------------------------------------
 
 

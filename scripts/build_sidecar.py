@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import urllib.request
+import zipfile
 from pathlib import Path
 
 
@@ -26,6 +27,10 @@ SILERO_VAD_URL = (
 SILERO_VAD_SHA256 = "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
 EXECUTABLE_NAME = "echolingo-sidecar"
 NAGISA_DATA_FILES = ("nagisa_v001.dict", "nagisa_v001.hp", "nagisa_v001.model")
+# Deepest path allowed inside the one-folder build, relative to its root. The
+# longest install prefix (a per-user install, or the GPU pack's staging
+# directory under LocalAppData) must still fit Windows' 259-character MAX_PATH.
+ONEDIR_RELATIVE_PATH_LIMIT = 120
 
 
 def target_triple() -> str:
@@ -173,11 +178,38 @@ def install_onefile(dist: Path, out: Path) -> Path:
     return destination
 
 
+def compact_license_trees(bundle: Path, limit: int = ONEDIR_RELATIVE_PATH_LIMIT) -> list[Path]:
+    """Zip license folders whose files sit too deep for Windows paths.
+
+    Wheels such as torch keep each vendored project's license under its source
+    path (``torch-*.dist-info/licenses/third_party/kineto/.../LICENSE.txt``),
+    far past MAX_PATH once installed. The texts stay in the package, as
+    ``licenses.zip`` next to the folder they replace.
+    """
+    compacted = []
+    for licenses in sorted(bundle.rglob("*.dist-info/licenses")):
+        if not licenses.is_dir():
+            continue
+        files = [path for path in sorted(licenses.rglob("*")) if path.is_file()]
+        deepest = max((len(path.relative_to(bundle).as_posix()) for path in files), default=0)
+        if deepest <= limit:
+            continue
+        archive = licenses.with_name("licenses.zip")
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundled:
+            for path in files:
+                bundled.write(path, path.relative_to(licenses).as_posix())
+        shutil.rmtree(licenses)
+        compacted.append(archive)
+    return compacted
+
+
 def install_onedir(dist: Path, out: Path) -> Path:
     source = dist / EXECUTABLE_NAME
     executable = source / f"{EXECUTABLE_NAME}{executable_suffix()}"
     if not executable.is_file():
         raise RuntimeError(f"PyInstaller did not produce {executable}")
+    for archive in compact_license_trees(source):
+        print(f"zipped deep license tree: {archive.relative_to(source)}")
     staging = out.with_name(f".{out.name}.installing")
     if staging.exists():
         shutil.rmtree(staging)
