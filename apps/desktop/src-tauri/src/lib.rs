@@ -9,7 +9,7 @@ use audio_core::{
     list_audio_devices as enumerate_audio_devices, preferred_capture_format,
     request_audio_permission as request_native_audio_permission, start_microphone,
     start_system_audio, AudioCaptureSession, AudioDevice, AudioPermissionStatus, AudioSourceEvent,
-    PermissionKind, PermissionState,
+    CaptureFormat, PermissionKind, PermissionState,
 };
 use inference_ipc::{
     append_log_chunk, AudioFrameHeader, InferenceSupervisor, SidecarCommand, SidecarEvent,
@@ -20,12 +20,12 @@ use inference_ipc::{
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use runtime_manager::gpu_pack::{GpuAccelerationStatus, GpuPackManager, GpuPackState};
 use runtime_manager::{
-    GpuRuntimeLayout, LocalRuntimeLayout, LocalRuntimeManager, ModelManager, ModelProgress,
-    ModelStatus, QwenStreamingProfile, RuntimeCommand,
+    GpuRuntimeLayout, LocalRuntimeLayout, LocalRuntimeManager, ModelInstallState, ModelManager,
+    ModelProgress, ModelStatus, QwenStreamingProfile, RuntimeCommand,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -41,6 +41,9 @@ const UI_EVENT_CHANNEL: &str = "echolingo://ui-event";
 const MODEL_PROGRESS_CHANNEL: &str = "echolingo://model-progress";
 const KEYCHAIN_SERVICE: &str = "app.echolingo.desktop";
 const DESKTOP_LOG_FILE: &str = "desktop.log";
+/// Forced alignment runs after a session finished and reports no end; it
+/// counts as running until no alignment update arrived for this long.
+const ALIGNMENT_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_secs(90);
 const SIDECAR_LOG_FILE: &str = "sidecar.log";
 
 /// Non-secret provider settings, keyed by credential group id and then by
@@ -552,6 +555,12 @@ struct RuntimeState {
     gpu_pack: std::sync::OnceLock<GpuPackManager>,
     /// The secure-store failure has been logged once this run.
     credential_store_failure_reported: std::sync::atomic::AtomicBool,
+    /// Models being installed or deleted right now; their services are not
+    /// started meanwhile.
+    changing_models: Mutex<HashSet<String>>,
+    /// Finished sessions whose forced alignment may still run, with the time
+    /// of the last sign of it.
+    alignment_activity: Mutex<HashMap<uuid::Uuid, std::time::Instant>>,
     onboarding_complete: std::sync::atomic::AtomicBool,
     persistence_throttle: Mutex<PersistenceThrottle>,
     runtime_preferences: Mutex<RuntimePreferences>,
@@ -633,6 +642,8 @@ impl Default for RuntimeState {
             local_runtimes: std::sync::OnceLock::new(),
             gpu_pack: std::sync::OnceLock::new(),
             credential_store_failure_reported: std::sync::atomic::AtomicBool::new(false),
+            changing_models: Mutex::new(HashSet::new()),
+            alignment_activity: Mutex::new(HashMap::new()),
             onboarding_complete: std::sync::atomic::AtomicBool::new(false),
             persistence_throttle: Mutex::new(PersistenceThrottle::default()),
             runtime_preferences: Mutex::new(RuntimePreferences::default()),
@@ -981,6 +992,42 @@ impl RuntimeState {
         self.local_runtimes
             .get()
             .ok_or_else(|| "local runtime manager is not initialized".to_string())
+    }
+
+    /// The model being installed or deleted that `service` needs, if any.
+    fn changing_model_for(&self, service: &str) -> Option<String> {
+        let changing = self.changing_models.lock().ok()?;
+        changing
+            .iter()
+            .find(|model| services_using_model(model).contains(&service))
+            .cloned()
+    }
+
+    fn model_changing(&self, model_id: &str) -> bool {
+        self.changing_models
+            .lock()
+            .is_ok_and(|changing| changing.contains(model_id))
+    }
+
+    /// Note sidecar activity for a finished session's forced alignment;
+    /// `None` forgets all of it (the alignment failed or the sidecar went
+    /// away).
+    fn note_alignment_activity(&self, session_id: Option<uuid::Uuid>) {
+        if let Ok(mut activity) = self.alignment_activity.lock() {
+            match session_id {
+                Some(session_id) => {
+                    activity.insert(session_id, std::time::Instant::now());
+                }
+                None => activity.clear(),
+            }
+        }
+    }
+
+    fn alignment_running(&self) -> bool {
+        self.alignment_activity.lock().is_ok_and(|mut activity| {
+            activity.retain(|_, at| at.elapsed() < ALIGNMENT_QUIET_PERIOD);
+            !activity.is_empty()
+        })
     }
 
     fn gpu_pack(&self) -> Result<&GpuPackManager, String> {
@@ -1646,30 +1693,75 @@ fn services_using_model(model_id: &str) -> &'static [&'static str] {
 
 const MODEL_SESSION_BUSY: &str = "Stop the current session before changing local models";
 
-/// Stop every process that has files of `model_id` open, so the files can
-/// be replaced or deleted (Windows refuses to while they are open). Refused
-/// during a session and while assistant jobs use the sidecar.
-async fn release_model_files(state: &RuntimeState, model_id: &str) -> Result<(), String> {
+/// A model install or delete in progress; while it lives, the services
+/// that need the model are not started.
+struct ModelChange<'a> {
+    state: &'a RuntimeState,
+    model_id: String,
+}
+
+impl Drop for ModelChange<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut changing) = self.state.changing_models.lock() {
+            changing.remove(&self.model_id);
+        }
+    }
+}
+
+/// Claim `model_id` for an install or delete and stop every process that
+/// has its files open, so they can be replaced or deleted (Windows refuses
+/// to while they are open). Refused during a session, a background warm-up,
+/// another change of the same model, and, for the aligner, while assistant
+/// jobs or a forced alignment use the sidecar.
+async fn begin_model_change<'a>(
+    state: &'a RuntimeState,
+    model_id: &str,
+) -> Result<ModelChange<'a>, String> {
     let _lifecycle = state.sidecar_lifecycle.lock().await;
     if !state.is_idle() {
         return Err(MODEL_SESSION_BUSY.into());
     }
-    let in_sidecar = state
+    if state.warmup_in_progress.load(Ordering::Acquire) {
+        return Err(
+            "Local models are loading in the background; try again when they are ready".into(),
+        );
+    }
+    let status = state
         .models()?
         .status(model_id)
-        .map_err(|error| error.to_string())?
-        .role
-        == runtime_manager::ModelRole::Alignment;
-    if in_sidecar {
+        .map_err(|error| error.to_string())?;
+    let busy = format!("{} is already being installed or removed", status.display_name);
+    if status.state == ModelInstallState::Installing {
+        return Err(busy);
+    }
+    if !state
+        .changing_models
+        .lock()
+        .map_err(|_| "model change lock poisoned".to_string())?
+        .insert(model_id.to_string())
+    {
+        return Err(busy);
+    }
+    let change = ModelChange {
+        state,
+        model_id: model_id.to_string(),
+    };
+    if status.role == runtime_manager::ModelRole::Alignment {
         if state.assistant.any_running() {
             return Err(assistant::ASSISTANT_BUSY.into());
+        }
+        if state.alignment_running() {
+            return Err(
+                "Word timings of the last session are still being aligned; try again in a minute"
+                    .into(),
+            );
         }
         state.supervisor().shutdown().await;
     }
     for service in services_using_model(model_id) {
         state.local_runtimes()?.stop_service(service).await;
     }
-    Ok(())
+    Ok(change)
 }
 
 #[tauri::command]
@@ -1678,7 +1770,7 @@ async fn install_model(
     state: State<'_, RuntimeState>,
     model_id: String,
 ) -> Result<ModelStatus, String> {
-    release_model_files(&state, &model_id).await?;
+    let _change = begin_model_change(&state, &model_id).await?;
     let progress_app = app.clone();
     let callback = Arc::new(move |progress: ModelProgress| {
         let _ = progress_app.emit(MODEL_PROGRESS_CHANNEL, progress);
@@ -1708,7 +1800,7 @@ async fn delete_model(
     state: State<'_, RuntimeState>,
     model_id: String,
 ) -> Result<ModelStatus, String> {
-    release_model_files(&state, &model_id).await?;
+    let _change = begin_model_change(&state, &model_id).await?;
     // Deleting gigabytes can take a while; keep it off the async runtime.
     tauri::async_runtime::spawn_blocking(move || {
         app.state::<RuntimeState>()
@@ -2148,6 +2240,8 @@ fn forward_sidecar_events(app: AppHandle) {
             };
             let state = app.state::<RuntimeState>();
             if let SidecarEvent::SessionFinished { session_id } = &event {
+                // Forced alignment starts in the sidecar now.
+                state.note_alignment_activity(Some(*session_id));
                 // Queued behind the session's last transcript/translation
                 // events (auto title); never shown in the UI.
                 if persist_tx.send((*session_id, event.clone())).await.is_err() {
@@ -2208,6 +2302,12 @@ fn forward_sidecar_events(app: AppHandle) {
                 }
                 SidecarEvent::SegmentCommitted(payload) => (UiEventKind::SegmentCommitted, payload),
                 SidecarEvent::AlignmentUpdate(payload) => {
+                    if let Some(session_id) = payload["session_id"]
+                        .as_str()
+                        .and_then(|value| value.parse().ok())
+                    {
+                        state.note_alignment_activity(Some(session_id));
+                    }
                     // Alignment refines persisted timings only; it is not a
                     // live transcript revision and must never touch live text.
                     suppress_ui = true;
@@ -2219,6 +2319,9 @@ fn forward_sidecar_events(app: AppHandle) {
                     message,
                     recoverable,
                 } => {
+                    if code == "sidecar_disconnected" || code == "alignment_failed" {
+                        state.note_alignment_activity(None);
+                    }
                     if code == "sidecar_disconnected" {
                         let recovery = state.core.lock().ok().and_then(|mut core| {
                             if core.snapshot().phase == SessionPhase::Listening {
@@ -2290,10 +2393,15 @@ fn emit_audio_event(
     )
 }
 
+/// Start the session's audio source. `planned` is the format the sidecar
+/// session was set up for; a source that opens in another format (the
+/// output device's mix format changed in between) is refused, because the
+/// sidecar cannot switch formats mid-session.
 async fn start_audio_capture(
     app: &AppHandle,
     state: &RuntimeState,
     request: &StartSessionRequest,
+    planned: CaptureFormat,
 ) -> Result<(), String> {
     let mut capture = match request.audio_source {
         AppAudioSourceKind::Microphone => start_microphone(request.audio_device_id.as_deref()),
@@ -2305,6 +2413,14 @@ async fn start_audio_capture(
         }
     }
     .map_err(|error| error.to_string())?;
+    let actual = capture.format();
+    if actual != planned {
+        let _ = capture.stop();
+        return Err(format!(
+            "The audio device changed its format ({} Hz, {} channels instead of {} Hz, {} channels); stop and start the session again",
+            actual.sample_rate_hz, actual.channels, planned.sample_rate_hz, planned.channels
+        ));
+    }
     let mut events = capture
         .take_events()
         .ok_or_else(|| "audio event receiver is unavailable".to_string())?;
@@ -2414,12 +2530,33 @@ fn forward_audio_events(app: AppHandle, mut events: tokio::sync::mpsc::Receiver<
     });
 }
 
-async fn stop_audio_capture(state: &RuntimeState) -> Result<(), String> {
-    let mut capture = state.audio.lock().await.take();
-    if let Some(capture) = capture.as_mut() {
-        capture.stop().map_err(|error| error.to_string())?;
+/// Stop and release the audio source. Best effort: a source whose device
+/// failed may not stop cleanly, and that must never keep a session from
+/// finishing.
+async fn stop_audio_capture(state: &RuntimeState) {
+    let capture = state.audio.lock().await.take();
+    if let Some(mut capture) = capture {
+        if let Err(error) = capture.stop() {
+            eprintln!("audio source did not stop cleanly: {error}");
+            state.log_desktop_event(&format!("audio_stop_failed error={error}"));
+        }
     }
-    Ok(())
+}
+
+/// Replace an audio source that failed (its device was removed, or the
+/// default output of a loopback capture changed) with a new one before the
+/// session resumes. The new source must deliver the session's format.
+async fn restart_failed_audio_capture(app: &AppHandle, state: &RuntimeState) -> Result<(), String> {
+    let planned = match state.audio.lock().await.as_ref() {
+        Some(capture) if capture.is_invalidated() => capture.format(),
+        _ => return Ok(()),
+    };
+    stop_audio_capture(state).await;
+    let config = state
+        .snapshot()?
+        .config
+        .ok_or_else(|| "missing session config".to_string())?;
+    start_audio_capture(app, state, &config, planned).await
 }
 
 async fn shutdown_application(app: &AppHandle) {
@@ -2440,7 +2577,7 @@ async fn shutdown_application(app: &AppHandle) {
                 .and_then(|mut core| core.begin_stop(snapshot.state_revision).map_err(|_| ()))
             {
                 let _ = state.emit_snapshot(app, &stopping);
-                let _ = stop_audio_capture(&state).await;
+                stop_audio_capture(&state).await;
                 if let Some(session_id) = stopping.session_id {
                     let mut receiver = state.supervisor().subscribe();
                     if state
@@ -2473,7 +2610,7 @@ async fn shutdown_application(app: &AppHandle) {
             }
         }
     } else {
-        let _ = stop_audio_capture(&state).await;
+        stop_audio_capture(&state).await;
     }
     state.supervisor().shutdown().await;
     if let Ok(runtimes) = state.local_runtimes() {
@@ -2670,6 +2807,16 @@ async fn prepare_inference_runtimes(
     // arrived while one did.
     state.apply_gpu_runtime().await?;
     for service in &services_to_start {
+        if let Some(model_id) = state.changing_model_for(service) {
+            let name = state
+                .models()?
+                .status(&model_id)
+                .map(|status| status.display_name)
+                .unwrap_or(model_id);
+            return Err(format!(
+                "{name} is being installed or removed; start again when it has finished"
+            ));
+        }
         state.emit_event(
             app,
             Some(session_id),
@@ -2677,10 +2824,10 @@ async fn prepare_inference_runtimes(
             json!({"service": service, "state": "starting"}),
         )?;
         let runtimes = state.local_runtimes()?;
-        let accelerated = runtimes.gpu_active();
+        let accelerated = runtimes.uses_gpu(service);
         let started = runtimes.ensure_service(service).await;
         if accelerated {
-            if let Some(reason) = runtimes.gpu_fallback_reason() {
+            if let Some(reason) = runtimes.gpu_fallback_for(service) {
                 state.log_desktop_event(&format!("gpu_fallback {reason}"));
                 let _ = state.emit_event(
                     app,
@@ -2689,7 +2836,7 @@ async fn prepare_inference_runtimes(
                     json!({
                         "code": "gpu_fallback",
                         "message": format!(
-                            "GPU acceleration could not start, so the CPU is used for now. {reason}"
+                            "GPU acceleration could not start for this model, so it runs on the CPU for now. {reason}"
                         ),
                         "recoverable": true
                     }),
@@ -2814,6 +2961,10 @@ async fn start_session(
             json!(capture_format.sample_rate_hz),
         );
         object.insert("channels".into(), json!(capture_format.channels));
+        if state.model_changing("qwen3-forced-aligner-0.6b") {
+            // The aligner's files are being replaced or deleted.
+            object.insert("alignment_enabled".into(), json!(false));
+        }
         let mut receiver = state.supervisor().subscribe();
         prepare_inference_runtimes(&app, &state, session_id, &payload).await?;
         state
@@ -2826,7 +2977,13 @@ async fn start_session(
                 Ok(Ok(SidecarEvent::Ready { session_id, route }))
                     if Some(session_id) == starting.session_id =>
                 {
-                    start_audio_capture(&app, &state, starting.config.as_ref().unwrap()).await?;
+                    start_audio_capture(
+                        &app,
+                        &state,
+                        starting.config.as_ref().unwrap(),
+                        capture_format,
+                    )
+                    .await?;
                     break Ok(route);
                 }
                 Ok(Ok(SidecarEvent::Error { message, .. })) => break Err(message),
@@ -2879,7 +3036,7 @@ async fn start_session(
             Ok(snapshot)
         }
         Err(error) => {
-            let _ = stop_audio_capture(&state).await;
+            stop_audio_capture(&state).await;
             let snapshot = state
                 .core
                 .lock()
@@ -2933,6 +3090,7 @@ async fn resume_session(
         .snapshot()?
         .session_id
         .ok_or_else(|| "no active session".to_string())?;
+    restart_failed_audio_capture(&app, &state).await?;
     state
         .supervisor()
         .send_command(SidecarCommand::Resume {
@@ -2967,7 +3125,7 @@ async fn stop_session(
         .begin_stop(expected_state_revision)
         .map_err(|error| error.to_string())?;
     state.emit_snapshot(&app, &stopping)?;
-    stop_audio_capture(&state).await?;
+    stop_audio_capture(&state).await;
     let mut warnings = Vec::new();
     if let Some(session_id) = stopping.session_id {
         let mut receiver = state.supervisor().subscribe();
@@ -3925,6 +4083,71 @@ mod tests {
                 || spec.role == runtime_manager::ModelRole::Alignment;
             assert!(covered, "{} has no owner to stop", spec.id);
         }
+    }
+
+    #[tokio::test]
+    async fn model_changes_are_exclusive_and_hold_back_the_services_that_need_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = RuntimeState::default();
+        let model_root = directory.path().join("models");
+        assert!(state.models.set(ModelManager::new(model_root.clone())).is_ok());
+        assert!(state
+            .local_runtimes
+            .set(LocalRuntimeManager::new(local_runtime_layout(
+                model_root,
+                directory.path(),
+                directory.path(),
+                None,
+                1,
+                2,
+            )))
+            .is_ok());
+
+        let change = begin_model_change(&state, "hymt2-1.8b").await.unwrap();
+        assert_eq!(state.changing_model_for("hymt").as_deref(), Some("hymt2-1.8b"));
+        assert_eq!(state.changing_model_for("qwen_asr"), None);
+        assert!(begin_model_change(&state, "hymt2-1.8b")
+            .await
+            .err()
+            .unwrap()
+            .contains("already being installed or removed"));
+        drop(change);
+        assert_eq!(state.changing_model_for("hymt"), None);
+
+        state.warmup_in_progress.store(true, Ordering::Release);
+        assert!(begin_model_change(&state, "hymt2-1.8b")
+            .await
+            .err()
+            .unwrap()
+            .contains("loading in the background"));
+        state.warmup_in_progress.store(false, Ordering::Release);
+
+        // Forced alignment of a finished session keeps the aligner busy.
+        let aligner = "qwen3-forced-aligner-0.6b";
+        state.note_alignment_activity(Some(uuid::Uuid::new_v4()));
+        assert!(state.alignment_running());
+        assert!(begin_model_change(&state, aligner)
+            .await
+            .err()
+            .unwrap()
+            .contains("still being aligned"));
+        assert!(!state.model_changing(aligner));
+        state.note_alignment_activity(None);
+        assert!(!state.alignment_running());
+        let change = begin_model_change(&state, aligner).await.unwrap();
+        assert!(state.model_changing(aligner));
+        drop(change);
+
+        state
+            .core
+            .lock()
+            .unwrap()
+            .start(StartSessionRequest::default())
+            .unwrap();
+        assert_eq!(
+            begin_model_change(&state, "hymt2-1.8b").await.err().unwrap(),
+            MODEL_SESSION_BUSY
+        );
     }
 
     #[test]

@@ -4,14 +4,17 @@
 //! build of llama.cpp (for Hy-MT2). It is too large for the installers, so it
 //! is published as split, individually hashed parts next to a manifest,
 //! downloaded on demand (resumable), verified, streamed through zstd and tar
-//! into a staging directory, self-tested and only then activated.
+//! into a staging directory, checked and only then activated.
 
-use crate::{activate_directory, remove_scoped_directory, GpuRuntimeLayout, ModelProgress};
+use crate::{
+    activate_directory_retrying, remove_scoped_directory, GpuRuntimeLayout, ModelProgress,
+};
 use process_support::configure_background;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
@@ -26,8 +29,8 @@ use tokio::process::Command;
 /// `model_id` of the pack's progress events on the model-progress channel.
 pub const GPU_PACK_PROGRESS_ID: &str = "gpu-pack";
 pub const GPU_PACK_SCHEMA_VERSION: u16 = 1;
-/// Overrides where manifests and parts come from: an http(s) URL prefix, a
-/// `file://` URL or a plain local directory.
+/// Overrides where manifests and parts come from: an https URL prefix (plain
+/// http only for localhost), a `file://` URL or a local directory.
 pub const GPU_PACK_BASE_URL_ENV: &str = "ECHOLINGO_GPU_PACK_BASE_URL";
 const RELEASE_DOWNLOAD_URL: &str = "https://github.com/Asphr726/EchoLingo/releases/download";
 /// CUDA 13.x runs on R580+ drivers (minor-version compatibility) on both
@@ -48,10 +51,17 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 /// The first start of a frozen CUDA torch can be slow (antivirus scans of
 /// every DLL on Windows).
 const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(900);
+const LLAMA_CHECK_TIMEOUT: Duration = Duration::from_secs(120);
 const DETECTION_TIMEOUT: Duration = Duration::from_secs(15);
+/// A failed `nvidia-smi` query is asked again after this long.
+const DETECTION_RETRY: Duration = Duration::from_secs(60);
+/// Activation renames are retried while antivirus scanners on Windows still
+/// hold files of the freshly tested staging tree.
+const ACTIVATION_ATTEMPTS: u32 = 10;
+const ACTIVATION_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 type ProgressCallback = Arc<dyn Fn(ModelProgress) + Send + Sync>;
-type SelfTestHook = Arc<dyn Fn(&Path) -> Result<Value, GpuPackError> + Send + Sync>;
+type CheckHook = Arc<dyn Fn(&Path) -> Result<PackChecks, GpuPackError> + Send + Sync>;
 
 /// The pack platform of this build, or `None` where no pack exists (macOS
 /// uses Metal through the regular runtime).
@@ -71,6 +81,8 @@ pub enum GpuPackError {
     UnsupportedPlatform,
     #[error("the GPU acceleration pack is already being installed")]
     AlreadyInstalling,
+    #[error("GPU acceleration pack source is invalid: {0}")]
+    Source(String),
     #[error("GPU acceleration pack manifest is invalid: {0}")]
     Manifest(String),
     #[error("the GPU acceleration pack is for EchoLingo {found}, this is {expected}")]
@@ -95,8 +107,9 @@ pub enum GpuPackError {
 }
 
 impl GpuPackError {
-    fn is_transient(&self) -> bool {
-        matches!(self, Self::Download(_) | Self::Io(_))
+    /// Worth another download attempt.
+    fn is_retryable(&self) -> bool {
+        matches!(self, Self::Download(_) | Self::Io(_) | Self::CorruptPart(_))
     }
 }
 
@@ -147,9 +160,13 @@ impl GpuPackManifest {
         if !is_sha256(&self.archive_sha256) {
             return invalid("archive_sha256 is not a SHA-256 digest".into());
         }
+        let mut names = HashSet::new();
         for part in &self.parts {
             if !is_plain_file_name(&part.name) {
                 return invalid(format!("part name {:?} is not a plain file name", part.name));
+            }
+            if !names.insert(part.name.to_ascii_lowercase()) {
+                return invalid(format!("part {} is listed twice", part.name));
             }
             if !is_sha256(&part.sha256) {
                 return invalid(format!("part {} has no SHA-256 digest", part.name));
@@ -205,7 +222,15 @@ impl GpuPackManifest {
 pub struct GpuPackRecord {
     pub manifest: GpuPackManifest,
     pub installed_at: String,
+    /// `echolingo-sidecar self-test --qwen-runtime --cuda` of the pack.
     pub self_test: Value,
+    /// Whether the pack's Vulkan `llama-server --version` ran at install
+    /// time; `None` for records written before that check existed.
+    #[serde(default)]
+    pub llama_ok: Option<bool>,
+    /// What that check printed or why it failed.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub llama_check: Value,
 }
 
 impl GpuPackRecord {
@@ -218,6 +243,13 @@ impl GpuPackRecord {
             .as_str()
             .map(str::to_string)
     }
+}
+
+/// What the install-time checks of an unpacked pack found.
+struct PackChecks {
+    self_test: Value,
+    llama_ok: bool,
+    llama_check: Value,
 }
 
 /// The first NVIDIA GPU as `nvidia-smi` reports it.
@@ -252,11 +284,15 @@ pub struct GpuAccelerationStatus {
     pub installed_bytes: Option<u64>,
     pub cuda_available: Option<bool>,
     pub device_name: Option<String>,
+    /// The install-time check of the pack's Vulkan llama-server; `None`
+    /// without a pack or for a pack installed before the check existed.
+    pub llama_gpu_ok: Option<bool>,
     /// The user preference.
     pub enabled: bool,
-    /// The local model services start on the pack now.
+    /// Some local model service starts on the pack now.
     pub active: bool,
-    /// Set when the pack failed to start and the app fell back to the CPU.
+    /// Set when part of the pack failed to start and the app fell back to
+    /// the CPU for it.
     pub fallback_reason: Option<String>,
 }
 
@@ -330,6 +366,9 @@ pub async fn detect_nvidia_gpu() -> Result<Option<GpuInfo>, String> {
             return Ok(Some(gpu));
         }
     }
+    if stdout.contains("No devices were found") {
+        return Ok(None);
+    }
     let stderr = String::from_utf8_lossy(&output.stderr);
     let detail = [stdout.trim(), stderr.trim()]
         .into_iter()
@@ -337,34 +376,48 @@ pub async fn detect_nvidia_gpu() -> Result<Option<GpuInfo>, String> {
         .and_then(|text| text.lines().next())
         .unwrap_or("no output")
         .to_string();
-    if stdout.contains("No devices were found") {
-        return Ok(None);
-    }
     Err(detail)
 }
 
+#[derive(Debug, PartialEq)]
 enum PackSource {
     Remote(String),
     Local(PathBuf),
 }
 
+/// Plain http is only accepted for a server on this computer (tests).
+fn is_loopback_url(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+
 fn parse_source(raw: &str) -> Result<PackSource, GpuPackError> {
     let raw = raw.trim();
-    if raw.starts_with("http://") || raw.starts_with("https://") {
-        let mut base = raw.to_string();
-        if !base.ends_with('/') {
-            base.push('/');
-        }
-        return Ok(PackSource::Remote(base));
+    let invalid = || {
+        GpuPackError::Source(format!(
+            "{raw:?} is not an https URL, a file:// URL or a local directory \
+             (plain http is accepted for localhost only)"
+        ))
+    };
+    if !raw.contains("://") && !raw.starts_with("file:") {
+        return Ok(PackSource::Local(PathBuf::from(raw)));
     }
-    if raw.starts_with("file:") {
-        let path = url::Url::parse(raw)
-            .ok()
-            .and_then(|url| url.to_file_path().ok())
-            .ok_or_else(|| GpuPackError::Download(format!("invalid file URL {raw}")))?;
-        return Ok(PackSource::Local(path));
+    let url = url::Url::parse(raw).map_err(|_| invalid())?;
+    match url.scheme() {
+        "https" => {}
+        "http" if is_loopback_url(&url) => {}
+        "file" => return url.to_file_path().map(PackSource::Local).map_err(|_| invalid()),
+        _ => return Err(invalid()),
     }
-    Ok(PackSource::Local(PathBuf::from(raw)))
+    let mut base = raw.to_string();
+    if !base.ends_with('/') {
+        base.push('/');
+    }
+    Ok(PackSource::Remote(base))
 }
 
 #[derive(Default)]
@@ -373,6 +426,8 @@ struct RemoteManifest {
     failed_at: Option<Instant>,
 }
 
+type Detection = Result<Option<GpuInfo>, String>;
+
 /// Installs, reports and removes the pack under `<runtimes_root>/gpu-pack`.
 pub struct GpuPackManager {
     runtimes_root: PathBuf,
@@ -380,10 +435,10 @@ pub struct GpuPackManager {
     platform: Option<&'static str>,
     source: Option<String>,
     installing: AtomicBool,
-    detection: tokio::sync::OnceCell<Result<Option<GpuInfo>, String>>,
+    detection: tokio::sync::Mutex<Option<(Detection, Instant)>>,
     remote: tokio::sync::Mutex<RemoteManifest>,
     retry_delay: Duration,
-    self_test: Option<SelfTestHook>,
+    checks: Option<CheckHook>,
 }
 
 struct InstallingGuard<'a>(&'a AtomicBool);
@@ -406,15 +461,15 @@ impl GpuPackManager {
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
             installing: AtomicBool::new(false),
-            detection: tokio::sync::OnceCell::new(),
+            detection: tokio::sync::Mutex::new(None),
             remote: tokio::sync::Mutex::new(RemoteManifest::default()),
             retry_delay: Duration::from_secs(2),
-            self_test: None,
+            checks: None,
         }
     }
 
-    /// Read manifests and parts from `source` (URL prefix, `file://` URL or
-    /// local directory) instead of the release.
+    /// Read manifests and parts from `source` (see [`GPU_PACK_BASE_URL_ENV`])
+    /// instead of the release.
     pub fn with_source(mut self, source: impl Into<String>) -> Self {
         self.source = Some(source.into());
         self
@@ -427,9 +482,9 @@ impl GpuPackManager {
     }
 
     #[cfg(test)]
-    fn with_test_hooks(mut self, self_test: Option<SelfTestHook>) -> Self {
+    fn with_test_hooks(mut self, checks: Option<CheckHook>) -> Self {
         self.retry_delay = Duration::from_millis(10);
-        self.self_test = self_test;
+        self.checks = checks;
         self
     }
 
@@ -488,28 +543,35 @@ impl GpuPackManager {
         (GpuPackState::Ready, Some(record))
     }
 
-    /// The pack runtime to use when the pack is ready and its self-test found
-    /// a usable CUDA device.
+    /// The parts of a ready pack that passed their install checks: the CUDA
+    /// sidecar when its self-test found a usable device, the Vulkan
+    /// llama-server when it ran. `None` when neither did.
     pub fn runtime_layout(&self) -> Option<GpuRuntimeLayout> {
         let (state, record) = self.installed();
-        if state != GpuPackState::Ready || record?.cuda_available() != Some(true) {
-            return None;
-        }
-        Some(pack_runtime_layout(&self.install_directory()))
+        let record = record.filter(|_| state == GpuPackState::Ready)?;
+        let pack = self.install_directory();
+        let layout = GpuRuntimeLayout {
+            sidecar: (record.cuda_available() == Some(true)).then(|| pack_sidecar(&pack)),
+            llama_server: (record.llama_ok == Some(true)).then(|| pack_llama_server(&pack)),
+        };
+        (layout.sidecar.is_some() || layout.llama_server.is_some()).then_some(layout)
     }
 
-    /// The first NVIDIA GPU, detected once per app run.
-    pub async fn detect_gpu(&self) -> Result<Option<GpuInfo>, String> {
-        self.detection
-            .get_or_init(|| async {
-                if self.platform.is_none() {
-                    Ok(None)
-                } else {
-                    detect_nvidia_gpu().await
-                }
-            })
-            .await
-            .clone()
+    /// The first NVIDIA GPU. A successful query holds for the app run; a
+    /// failed one is asked again after [`DETECTION_RETRY`].
+    pub async fn detect_gpu(&self) -> Detection {
+        if self.platform.is_none() {
+            return Ok(None);
+        }
+        let mut cached = self.detection.lock().await;
+        if let Some((detection, at)) = cached.as_ref() {
+            if detection.is_ok() || at.elapsed() < DETECTION_RETRY {
+                return detection.clone();
+            }
+        }
+        let detection = detect_nvidia_gpu().await;
+        *cached = Some((detection.clone(), Instant::now()));
+        detection
     }
 
     /// The release manifest, fetched once per run (a failure is retried after
@@ -563,6 +625,7 @@ impl GpuPackManager {
                 installed_bytes: None,
                 cuda_available: None,
                 device_name: None,
+                llama_gpu_ok: None,
                 enabled,
                 active: false,
                 fallback_reason: None,
@@ -603,6 +666,7 @@ impl GpuPackManager {
             installed_bytes: record.as_ref().map(|record| record.manifest.unpacked_bytes),
             cuda_available: record.as_ref().and_then(GpuPackRecord::cuda_available),
             device_name: record.as_ref().and_then(GpuPackRecord::device_name),
+            llama_gpu_ok: record.as_ref().and_then(|record| record.llama_ok),
             enabled,
             active,
             fallback_reason,
@@ -624,8 +688,21 @@ impl GpuPackManager {
     }
 
     fn http_client(&self) -> Result<reqwest::Client, GpuPackError> {
+        // Redirects (GitHub hands downloads to its CDN) must stay on https.
+        let redirects = reqwest::redirect::Policy::custom(|attempt| {
+            let allowed = attempt.url().scheme() == "https"
+                || (attempt.url().scheme() == "http" && is_loopback_url(attempt.url()));
+            if attempt.previous().len() >= 10 {
+                attempt.error("too many redirects")
+            } else if allowed {
+                attempt.follow()
+            } else {
+                attempt.error("refusing a redirect away from https")
+            }
+        });
         reqwest::Client::builder()
             .user_agent(format!("echolingo/{}", self.app_version))
+            .redirect(redirects)
             .connect_timeout(Duration::from_secs(30))
             .read_timeout(Duration::from_secs(60))
             .build()
@@ -638,55 +715,74 @@ impl GpuPackManager {
         platform: &str,
     ) -> Result<GpuPackManifest, GpuPackError> {
         let name = self.manifest_name(platform);
+        let too_large = || GpuPackError::Manifest("manifest is too large".into());
         let bytes = match source {
             PackSource::Remote(base) => {
                 let url = format!("{base}{name}");
-                let response = self
+                let failed = |error: reqwest::Error| GpuPackError::Download(format!("{url}: {error}"));
+                let mut response = self
                     .http_client()?
                     .get(&url)
                     .timeout(Duration::from_secs(60))
                     .send()
                     .await
-                    .map_err(|error| GpuPackError::Download(format!("{url}: {error}")))?;
+                    .map_err(failed)?;
                 if !response.status().is_success() {
                     return Err(GpuPackError::Download(format!(
                         "{url}: HTTP {}",
                         response.status()
                     )));
                 }
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|error| GpuPackError::Download(format!("{url}: {error}")))?;
-                if bytes.len() > MANIFEST_LIMIT_BYTES {
-                    return Err(GpuPackError::Manifest("manifest is too large".into()));
+                let mut body = Vec::new();
+                while let Some(chunk) = response.chunk().await.map_err(failed)? {
+                    if body.len() + chunk.len() > MANIFEST_LIMIT_BYTES {
+                        return Err(too_large());
+                    }
+                    body.extend_from_slice(&chunk);
                 }
-                bytes.to_vec()
+                body
             }
-            PackSource::Local(directory) => tokio::fs::read(directory.join(&name))
-                .await
-                .map_err(|error| {
-                    GpuPackError::Download(format!("{}: {error}", directory.join(&name).display()))
-                })?,
+            PackSource::Local(directory) => {
+                let path = directory.join(&name);
+                let failed =
+                    |error: io::Error| GpuPackError::Download(format!("{}: {error}", path.display()));
+                if tokio::fs::metadata(&path).await.map_err(failed)?.len()
+                    > MANIFEST_LIMIT_BYTES as u64
+                {
+                    return Err(too_large());
+                }
+                tokio::fs::read(&path).await.map_err(failed)?
+            }
         };
         GpuPackManifest::parse(&bytes)
     }
 
-    /// Download (or read), verify, unpack, self-test and activate the pack
-    /// for this app version. Progress is reported with `model_id`
-    /// [`GPU_PACK_PROGRESS_ID`] and the phases `starting`, `downloading`,
-    /// `verifying`, `extracting`, `testing` and `ready`. Downloaded parts are
-    /// kept after a failure so the next attempt resumes.
+    /// Download (or read), verify, unpack, check and activate the pack for
+    /// this app version. Progress is reported with `model_id`
+    /// [`GPU_PACK_PROGRESS_ID`] and the phases `starting`, `downloading`
+    /// (release downloads, verified part by part), `verifying` (local parts),
+    /// `extracting`, `testing`, `ready`, or finally `failed` with the error
+    /// as `message`. Downloaded parts are kept after a failure so the next
+    /// attempt resumes.
     pub async fn install(&self, callback: ProgressCallback) -> Result<GpuPackRecord, GpuPackError> {
         let platform = self.platform.ok_or(GpuPackError::UnsupportedPlatform)?;
         if self.installing.swap(true, Ordering::AcqRel) {
             return Err(GpuPackError::AlreadyInstalling);
         }
-        let _guard = InstallingGuard(&self.installing);
+        let guard = InstallingGuard(&self.installing);
         let staging = self.staging_directory();
-        let result = self.install_inner(platform, &staging, callback).await;
-        if result.is_err() {
-            let _ = remove_scoped_directory(&self.runtimes_root, &staging);
+        let result = self.install_inner(platform, &staging, callback.clone()).await;
+        if let Err(error) = &result {
+            let _ = remove_blocking(&self.runtimes_root, &staging).await;
+            drop(guard);
+            callback(ModelProgress {
+                model_id: GPU_PACK_PROGRESS_ID.into(),
+                bytes_completed: 0,
+                total_bytes: 0,
+                bytes_per_second: None,
+                phase: "failed".into(),
+                message: Some(error.to_string()),
+            });
         }
         result
     }
@@ -700,6 +796,8 @@ impl GpuPackManager {
         let mut progress = Progress::new(callback.clone());
         progress.phase("starting", 0, 0);
         std::fs::create_dir_all(&self.runtimes_root)?;
+        // An interrupted earlier attempt may have left gigabytes behind.
+        remove_blocking(&self.runtimes_root, staging).await?;
         let source = self.source()?;
         let manifest = self.fetch_manifest(&source, platform).await?;
         manifest.check_compatible(&self.app_version, platform)?;
@@ -747,45 +845,40 @@ impl GpuPackManager {
             });
         }
 
-        if let PackSource::Remote(base) = &source {
-            let client = self.http_client()?;
-            progress.phase(
-                "downloading",
-                manifest.archive_bytes - remaining_download,
-                manifest.archive_bytes,
-            );
-            for (part, path) in manifest.parts.iter().zip(&parts) {
-                self.download_part(&client, &format!("{base}{}", part.name), path, part, &mut progress)
-                    .await?;
-            }
-        }
-
-        progress.phase("verifying", 0, manifest.archive_bytes);
-        for (part, path) in manifest.parts.iter().zip(&parts) {
-            let expected = part.sha256.to_ascii_lowercase();
-            let path_for_hash = path.clone();
-            let size = part.bytes;
-            let hashed = tokio::task::spawn_blocking(move || sha256_file(&path_for_hash, size))
-                .await
-                .map_err(|error| io::Error::other(error.to_string()))?;
-            match hashed {
-                Ok(digest) if digest == expected => progress.advance(size),
-                Err(error) if matches!(source, PackSource::Local(_)) => {
-                    return Err(GpuPackError::Download(format!("{}: {error}", path.display())));
+        match &source {
+            PackSource::Remote(base) => {
+                let client = self.http_client()?;
+                progress.phase(
+                    "downloading",
+                    manifest.archive_bytes - remaining_download,
+                    manifest.archive_bytes,
+                );
+                for (part, path) in manifest.parts.iter().zip(&parts) {
+                    let url = format!("{base}{}", part.name);
+                    self.download_verified_part(&client, &url, path, part, &mut progress)
+                        .await?;
                 }
-                Ok(_) | Err(_) => {
-                    // A bad download is fetched again on the next attempt;
-                    // local parts are never touched.
-                    if matches!(source, PackSource::Remote(_)) {
-                        let _ = std::fs::remove_file(path);
+            }
+            PackSource::Local(_) => {
+                progress.phase("verifying", 0, manifest.archive_bytes);
+                for (part, path) in manifest.parts.iter().zip(&parts) {
+                    match sha256_blocking(path, part.bytes).await {
+                        Ok(digest) if digest == part.sha256.to_ascii_lowercase() => {
+                            progress.advance(part.bytes)
+                        }
+                        Ok(_) => return Err(GpuPackError::CorruptPart(part.name.clone())),
+                        Err(error) => {
+                            return Err(GpuPackError::Download(format!(
+                                "{}: {error}",
+                                path.display()
+                            )))
+                        }
                     }
-                    return Err(GpuPackError::CorruptPart(part.name.clone()));
                 }
             }
         }
 
         progress.phase("extracting", 0, manifest.archive_bytes);
-        remove_scoped_directory(&self.runtimes_root, staging)?;
         std::fs::create_dir_all(staging)?;
         let extract_parts = parts.clone();
         let extract_target = staging.to_path_buf();
@@ -808,42 +901,43 @@ impl GpuPackManager {
         check_unpacked_pack(staging, &self.app_version, platform)?;
 
         progress.phase("testing", manifest.archive_bytes, manifest.archive_bytes);
-        let self_test = match &self.self_test {
+        let checks = match &self.checks {
             Some(hook) => hook(staging)?,
-            None => run_self_test(staging).await?,
+            None => run_pack_checks(staging).await?,
         };
         let record = GpuPackRecord {
             manifest: manifest.clone(),
             installed_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            self_test,
+            self_test: checks.self_test,
+            llama_ok: Some(checks.llama_ok),
+            llama_check: checks.llama_check,
         };
         write_record(staging, &record)?;
-        self.activate(staging).await?;
+        let root = self.runtimes_root.clone();
+        let staged = staging.to_path_buf();
+        let destination = self.install_directory();
+        tokio::task::spawn_blocking(move || {
+            activate_directory_retrying(
+                &root,
+                &staged,
+                &destination,
+                ACTIVATION_ATTEMPTS,
+                ACTIVATION_RETRY_DELAY,
+            )
+        })
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))??;
         if matches!(source, PackSource::Remote(_)) {
-            let _ = remove_scoped_directory(&self.downloads_root(), &self.download_cache());
+            let _ = remove_blocking(&self.downloads_root(), &self.download_cache()).await;
         }
         progress.phase("ready", manifest.archive_bytes, manifest.archive_bytes);
         Ok(record)
     }
 
-    /// Move the tested staging directory into place. Right after the
-    /// self-test, antivirus scanners on Windows may still hold files of the
-    /// staging tree open for a moment, so the rename is retried briefly.
-    async fn activate(&self, staging: &Path) -> Result<(), GpuPackError> {
-        let mut attempt = 1;
-        loop {
-            match activate_directory(&self.runtimes_root, staging, &self.install_directory()) {
-                Ok(()) => return Ok(()),
-                Err(_) if attempt < 10 => {
-                    attempt += 1;
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-    }
-
-    async fn download_part(
+    /// Download `part` (resuming what is on disk) and check its digest right
+    /// away; a corrupt copy is deleted and fetched again within the same
+    /// attempts budget.
+    async fn download_verified_part(
         &self,
         client: &reqwest::Client,
         url: &str,
@@ -851,21 +945,33 @@ impl GpuPackManager {
         part: &GpuPackPart,
         progress: &mut Progress,
     ) -> Result<(), GpuPackError> {
+        let expected = part.sha256.to_ascii_lowercase();
         let mut attempt = 1;
         loop {
-            match download_attempt(client, url, path, part, progress).await {
-                Ok(()) => return Ok(()),
-                Err(error) if attempt < DOWNLOAD_ATTEMPTS && error.is_transient() => {
+            let result = match download_attempt(client, url, path, part, progress).await {
+                Ok(()) => match sha256_blocking(path, part.bytes).await {
+                    Ok(digest) if digest == expected => return Ok(()),
+                    _ => {
+                        progress.retract(part.bytes);
+                        remove_part(path);
+                        Err(GpuPackError::CorruptPart(part.name.clone()))
+                    }
+                },
+                Err(error) => Err(error),
+            };
+            match result {
+                Err(error) if attempt < DOWNLOAD_ATTEMPTS && error.is_retryable() => {
                     attempt += 1;
                     tokio::time::sleep(self.retry_delay * attempt).await;
                 }
-                Err(error) => return Err(error),
+                other => return other,
             }
         }
     }
 
     /// Delete the installed pack, an interrupted staging directory and any
-    /// downloaded parts. Callers stop the services that use the pack first.
+    /// downloaded parts. Callers stop the services that use the pack first
+    /// and run this off the async runtime (it deletes gigabytes).
     pub fn remove(&self) -> Result<(), GpuPackError> {
         if self.is_installing() {
             return Err(GpuPackError::AlreadyInstalling);
@@ -886,22 +992,20 @@ impl GpuPackManager {
     }
 }
 
-/// Where the runtime lives inside an unpacked pack.
-pub fn pack_runtime_layout(pack: &Path) -> GpuRuntimeLayout {
-    let suffix = std::env::consts::EXE_SUFFIX;
-    GpuRuntimeLayout {
-        sidecar: pack
-            .join("sidecar")
-            .join(format!("echolingo-sidecar{suffix}")),
-        llama_server: pack
-            .join("llama.cpp")
-            .join(format!("llama-server{suffix}")),
-    }
+/// The pack's CUDA sidecar.
+pub fn pack_sidecar(pack: &Path) -> PathBuf {
+    pack.join("sidecar")
+        .join(format!("echolingo-sidecar{}", std::env::consts::EXE_SUFFIX))
+}
+
+/// The pack's Vulkan llama-server.
+pub fn pack_llama_server(pack: &Path) -> PathBuf {
+    pack.join("llama.cpp")
+        .join(format!("llama-server{}", std::env::consts::EXE_SUFFIX))
 }
 
 fn pack_files_present(pack: &Path) -> bool {
-    let layout = pack_runtime_layout(pack);
-    layout.sidecar.is_file() && layout.llama_server.is_file()
+    pack_sidecar(pack).is_file() && pack_llama_server(pack).is_file()
 }
 
 fn read_record(pack: &Path) -> Option<GpuPackRecord> {
@@ -919,8 +1023,46 @@ fn write_record(pack: &Path, record: &GpuPackRecord) -> Result<(), GpuPackError>
     Ok(())
 }
 
-/// One download attempt of `part` into `path`, resuming from the bytes
-/// already on disk with an HTTP Range request.
+/// Remove `target` (a directory directly below `root`) off the async runtime.
+async fn remove_blocking(root: &Path, target: &Path) -> Result<(), GpuPackError> {
+    let (root, target) = (root.to_path_buf(), target.to_path_buf());
+    tokio::task::spawn_blocking(move || remove_scoped_directory(&root, &target))
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))??;
+    Ok(())
+}
+
+/// The file next to a downloaded part that holds its ETag.
+fn etag_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".etag");
+    path.with_file_name(name)
+}
+
+fn remove_part(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(etag_path(path));
+}
+
+/// The first byte of a `Content-Range: bytes START-END/TOTAL` answer.
+fn content_range_start(response: &reqwest::Response) -> Option<u64> {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?
+        .trim()
+        .strip_prefix("bytes ")?
+        .split('-')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// One download attempt of `part` into `path`. Bytes already on disk are
+/// resumed with an HTTP Range request (guarded by the ETag of the first
+/// response through `If-Range`, so a changed file restarts from zero).
 async fn download_attempt(
     client: &reqwest::Client,
     url: &str,
@@ -933,7 +1075,7 @@ async fn download_attempt(
         .unwrap_or(0);
     if existing > part.bytes {
         progress.retract(part.bytes);
-        std::fs::remove_file(path)?;
+        remove_part(path);
         existing = 0;
     }
     if existing == part.bytes {
@@ -942,27 +1084,48 @@ async fn download_attempt(
     let mut request = client.get(url);
     if existing > 0 {
         request = request.header(reqwest::header::RANGE, format!("bytes={existing}-"));
+        if let Ok(etag) = std::fs::read_to_string(etag_path(path)) {
+            request = request.header(reqwest::header::IF_RANGE, etag.trim());
+        }
     }
     let mut response = request
         .send()
         .await
         .map_err(|error| GpuPackError::Download(format!("{url}: {error}")))?;
     let status = response.status();
-    let resumed = existing > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
     if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
         progress.retract(existing);
-        std::fs::remove_file(path)?;
+        remove_part(path);
         return Err(GpuPackError::Download(format!("{url}: resume was refused")));
     }
     if !status.is_success() {
         return Err(GpuPackError::Download(format!("{url}: HTTP {status}")));
     }
+    let resumed = existing > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
+    if resumed && content_range_start(&response) != Some(existing) {
+        progress.retract(existing);
+        remove_part(path);
+        return Err(GpuPackError::Download(format!(
+            "{url}: the server resumed at the wrong offset"
+        )));
+    }
     let mut file = if resumed {
         tokio::fs::OpenOptions::new().append(true).open(path).await?
     } else {
-        // The server ignored the range: start this part again.
+        // A fresh download (or the server ignored the range, for example
+        // because the file changed): start this part again.
         progress.retract(existing);
         existing = 0;
+        match response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+        {
+            Some(etag) => std::fs::write(etag_path(path), etag)?,
+            None => {
+                let _ = std::fs::remove_file(etag_path(path));
+            }
+        }
         tokio::fs::File::create(path).await?
     };
     let mut written = existing;
@@ -979,7 +1142,7 @@ async fn download_attempt(
         if written > part.bytes {
             drop(file);
             progress.retract(written - chunk.len() as u64);
-            std::fs::remove_file(path)?;
+            remove_part(path);
             return Err(GpuPackError::CorruptPart(part.name.clone()));
         }
         file.write_all(&chunk).await?;
@@ -996,10 +1159,20 @@ async fn download_attempt(
     Ok(())
 }
 
+async fn sha256_blocking(path: &Path, expected_bytes: u64) -> io::Result<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || sha256_file(&path, expected_bytes))
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?
+}
+
 fn sha256_file(path: &Path, expected_bytes: u64) -> io::Result<String> {
     let mut file = File::open(path)?;
     if file.metadata()?.len() != expected_bytes {
-        return Err(io::Error::other("unexpected size"));
+        return Err(io::Error::other(format!(
+            "expected {expected_bytes} bytes, found {}",
+            file.metadata()?.len()
+        )));
     }
     let mut digest = Sha256::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
@@ -1047,32 +1220,29 @@ impl<F: FnMut(u64)> Read for PartsReader<F> {
 
 /// Stream the parts through zstd and tar into `destination`, dropping the
 /// archive's `echolingo-gpu-pack/` root, and check the whole-archive digest.
+/// Every entry must stay inside the pack: paths are rebuilt from plain
+/// components only, and symbolic links must resolve inside the pack.
 fn extract_archive(
     parts: Vec<PathBuf>,
     archive_sha256: &str,
     destination: &Path,
     report: impl FnMut(u64),
 ) -> Result<(), GpuPackError> {
+    let archive_error = |error: io::Error| GpuPackError::Archive(error.to_string());
     let reader = PartsReader {
         pending: parts.into(),
         current: None,
         digest: Sha256::new(),
         report,
     };
-    let decoder = zstd::stream::read::Decoder::new(reader)
-        .map_err(|error| GpuPackError::Archive(error.to_string()))?;
+    let decoder = zstd::stream::read::Decoder::new(reader).map_err(archive_error)?;
     let mut archive = tar::Archive::new(decoder);
-    let entries = archive
-        .entries()
-        .map_err(|error| GpuPackError::Archive(error.to_string()))?;
-    // Symbolic links are created last, when their targets exist.
+    // Symbolic links are created last, once their targets exist, so no
+    // entry is ever written through one.
     let mut symlinks = Vec::new();
-    for entry in entries {
-        let mut entry = entry.map_err(|error| GpuPackError::Archive(error.to_string()))?;
-        let path = entry
-            .path()
-            .map_err(|error| GpuPackError::Archive(error.to_string()))?
-            .into_owned();
+    for entry in archive.entries().map_err(archive_error)? {
+        let mut entry = entry.map_err(archive_error)?;
+        let path = entry.path().map_err(archive_error)?.into_owned();
         let kind = entry.header().entry_type();
         if matches!(
             kind,
@@ -1085,6 +1255,12 @@ fn extract_archive(
             continue;
         }
         let target = destination.join(&relative);
+        if !target.starts_with(destination) {
+            return Err(GpuPackError::Archive(format!(
+                "{} is outside the pack",
+                path.display()
+            )));
+        }
         if kind.is_dir() {
             std::fs::create_dir_all(&target)?;
             continue;
@@ -1092,45 +1268,37 @@ fn extract_archive(
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        if kind.is_hard_link() {
+        if kind.is_hard_link() || kind.is_symlink() {
             let link = entry
                 .link_name()
-                .map_err(|error| GpuPackError::Archive(error.to_string()))?
-                .ok_or_else(|| GpuPackError::Archive(format!("{} has no link target", path.display())))?;
-            let source = destination.join(pack_relative_path(&link)?);
-            if std::fs::hard_link(&source, &target).is_err() {
-                std::fs::copy(&source, &target)?;
+                .map_err(archive_error)?
+                .ok_or_else(|| {
+                    GpuPackError::Archive(format!("{} has no link target", path.display()))
+                })?
+                .into_owned();
+            if kind.is_hard_link() {
+                // Hard link names are archive paths like entry names.
+                let source = destination.join(pack_relative_path(&link)?);
+                if std::fs::hard_link(&source, &target).is_err() {
+                    std::fs::copy(&source, &target)?;
+                }
+            } else {
+                let resolved = resolve_link_target(&relative, &link).ok_or_else(|| {
+                    GpuPackError::Archive(format!("{} links outside the pack", path.display()))
+                })?;
+                symlinks.push((target, link, destination.join(resolved)));
             }
             continue;
         }
-        if kind.is_symlink() {
-            let link = entry
-                .link_name()
-                .map_err(|error| GpuPackError::Archive(error.to_string()))?
-                .ok_or_else(|| GpuPackError::Archive(format!("{} has no link target", path.display())))?
-                .into_owned();
-            // Only links that stay below their own directory (shared-library
-            // aliases) are accepted.
-            if !link
-                .components()
-                .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
-            {
-                return Err(GpuPackError::Archive(format!(
-                    "{} links outside the pack",
-                    path.display()
-                )));
-            }
-            symlinks.push((target, link));
-            continue;
-        } else if !kind.is_file() && kind != tar::EntryType::Continuous {
+        if !kind.is_file() && kind != tar::EntryType::Continuous {
             continue;
         }
         entry
             .unpack(&target)
             .map_err(|error| GpuPackError::Archive(format!("{}: {error}", path.display())))?;
     }
-    for (target, link) in symlinks {
-        create_symlink(&link, &target)?;
+    for (target, link, resolved) in symlinks {
+        create_symlink(&link, &resolved, &target)?;
     }
     // Consume whatever follows the tar end marker so the digest covers the
     // whole archive.
@@ -1145,24 +1313,37 @@ fn extract_archive(
     Ok(())
 }
 
+/// Create the symbolic link `target` → `link` (relative, already known to
+/// resolve to `resolved` inside the pack).
 #[cfg(unix)]
-fn create_symlink(link: &Path, target: &Path) -> io::Result<()> {
+fn create_symlink(link: &Path, _resolved: &Path, target: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(link, target)
 }
 
 /// Symbolic links need a privilege on Windows; a copy of the file works the
 /// same for a shared-library alias.
 #[cfg(not(unix))]
-fn create_symlink(link: &Path, target: &Path) -> io::Result<()> {
-    let source = target.parent().unwrap_or(Path::new("")).join(link);
+fn create_symlink(link: &Path, resolved: &Path, target: &Path) -> io::Result<()> {
     #[cfg(windows)]
     if std::os::windows::fs::symlink_file(link, target).is_ok() {
         return Ok(());
     }
-    std::fs::copy(source, target).map(|_| ())
+    #[cfg(not(windows))]
+    let _ = link;
+    std::fs::copy(resolved, target).map(|_| ())
 }
 
-/// The path of an archive entry below the `echolingo-gpu-pack/` root.
+/// A single path component that means the same on every platform: no
+/// separator, no drive or stream colon, no `.`/`..`, valid UTF-8.
+fn is_plain_component(part: &OsStr) -> bool {
+    part.to_str().is_some_and(|text| {
+        !text.is_empty() && text != "." && text != ".." && !text.contains([':', '\\', '/'])
+    })
+}
+
+/// The path of an archive entry below the `echolingo-gpu-pack/` root, built
+/// from plain components only (a `C:` component would otherwise replace
+/// the whole path on Windows).
 fn pack_relative_path(path: &Path) -> Result<PathBuf, GpuPackError> {
     let mut components = path
         .components()
@@ -1175,11 +1356,39 @@ fn pack_relative_path(path: &Path) -> Result<PathBuf, GpuPackError> {
     let mut relative = PathBuf::new();
     for component in components {
         match component {
-            Component::Normal(part) => relative.push(part),
+            Component::Normal(part) if is_plain_component(part) => relative.push(part),
             _ => return Err(outside()),
         }
     }
     Ok(relative)
+}
+
+/// Where the symbolic link at `relative` (inside the pack) points, as a path
+/// inside the pack, or `None` when it would leave the pack. `..` is fine as
+/// long as it stays inside (`llama.cpp/lib.so -> ../sidecar/_internal/...`).
+fn resolve_link_target(relative: &Path, link: &Path) -> Option<PathBuf> {
+    let mut resolved: Vec<&OsStr> = relative
+        .parent()?
+        .components()
+        .map(|component| match component {
+            Component::Normal(part) => Some(part),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    for component in link.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop()?;
+            }
+            Component::Normal(part) if is_plain_component(part) => resolved.push(part),
+            _ => return None,
+        }
+    }
+    if resolved.is_empty() {
+        return None;
+    }
+    Some(resolved.into_iter().collect())
 }
 
 /// The unpacked pack must be the one this app asked for and contain both
@@ -1211,14 +1420,33 @@ fn check_unpacked_pack(pack: &Path, app_version: &str, platform: &str) -> Result
     Ok(())
 }
 
-/// Run `sidecar/echolingo-sidecar self-test --cuda` from the unpacked pack.
-/// A machine without a usable GPU passes (with `cuda.available: false`); a
-/// failed import does not.
+/// The end of a process's output, for diagnostics.
+fn output_tail(output: &std::process::Output, limit: usize) -> String {
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    let text = text.trim();
+    let skip = text.chars().count().saturating_sub(limit);
+    text.chars().skip(skip).collect()
+}
+
+async fn run_pack_checks(pack: &Path) -> Result<PackChecks, GpuPackError> {
+    let self_test = run_self_test(pack).await?;
+    let (llama_ok, llama_check) = check_llama_server(pack).await;
+    Ok(PackChecks {
+        self_test,
+        llama_ok,
+        llama_check,
+    })
+}
+
+/// Run `sidecar/echolingo-sidecar self-test --qwen-runtime --cuda` from the
+/// unpacked pack. A machine without a usable GPU passes (with
+/// `cuda.available: false`); a failed import does not.
 async fn run_self_test(pack: &Path) -> Result<Value, GpuPackError> {
-    let executable = pack_runtime_layout(pack).sidecar;
+    let executable = pack_sidecar(pack);
     let mut command = Command::new(&executable);
     command
-        .args(["self-test", "--cuda"])
+        .args(["self-test", "--qwen-runtime", "--cuda"])
         .current_dir(executable.parent().unwrap_or(pack))
         .env("PYTHONUTF8", "1")
         .env("PYTHONIOENCODING", "utf-8")
@@ -1237,19 +1465,10 @@ async fn run_self_test(pack: &Path) -> Result<Value, GpuPackError> {
         .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
         .find(Value::is_object);
     let Some(report) = report else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let tail: String = stderr
-            .trim()
-            .chars()
-            .rev()
-            .take(800)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
         return Err(GpuPackError::SelfTest(format!(
-            "no report ({}): {tail}",
-            output.status
+            "no report ({}): {}",
+            output.status,
+            output_tail(&output, 800)
         )));
     };
     if !output.status.success() || report["ok"].as_bool() != Some(true) {
@@ -1270,6 +1489,36 @@ async fn run_self_test(pack: &Path) -> Result<Value, GpuPackError> {
         return Err(GpuPackError::SelfTest(failed));
     }
     Ok(report)
+}
+
+/// Run the pack's `llama-server --version`. A failure (for example a
+/// missing Vulkan loader) only keeps translation on the CPU runtime, so it
+/// is recorded instead of failing the install.
+async fn check_llama_server(pack: &Path) -> (bool, Value) {
+    let executable = pack_llama_server(pack);
+    let mut command = Command::new(&executable);
+    command
+        .arg("--version")
+        .current_dir(executable.parent().unwrap_or(pack))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_background(&mut command);
+    match tokio::time::timeout(LLAMA_CHECK_TIMEOUT, command.output()).await {
+        Err(_) => (false, json!({"ok": false, "detail": "timed out"})),
+        Ok(Err(error)) => (false, json!({"ok": false, "detail": error.to_string()})),
+        Ok(Ok(output)) => {
+            let ok = output.status.success();
+            (
+                ok,
+                json!({
+                    "ok": ok,
+                    "status": output.status.to_string(),
+                    "output": output_tail(&output, 1000),
+                }),
+            )
+        }
+    }
 }
 
 /// Throttled progress events with a transfer rate over the last interval.
@@ -1334,6 +1583,7 @@ impl Progress {
             total_bytes: self.total,
             bytes_per_second: self.bytes_per_second,
             phase: self.phase.into(),
+            message: None,
         });
     }
 }
@@ -1343,12 +1593,7 @@ fn is_sha256(value: &str) -> bool {
 }
 
 fn is_plain_file_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.starts_with('.')
-        && !name.contains(['/', '\\', ':'])
-        && Path::new(name)
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
+    !name.starts_with('.') && is_plain_component(OsStr::new(name))
 }
 
 /// Numeric components of a dotted version (`"580.65.06"` → `[580, 65, 6]`).
@@ -1374,7 +1619,6 @@ fn version_less(version: &str, minimum: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -1404,9 +1648,36 @@ mod tests {
         builder.append_data(&mut header, path, contents).unwrap();
     }
 
+    /// An entry with a raw (unvalidated) name, as a hostile archive would
+    /// carry it.
+    fn add_raw(
+        builder: &mut tar::Builder<Vec<u8>>,
+        name: &str,
+        kind: tar::EntryType,
+        contents: &[u8],
+        link: Option<&str>,
+    ) {
+        let mut header = tar::Header::new_gnu();
+        header.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+        if let Some(link) = link {
+            header.as_old_mut().linkname[..link.len()].copy_from_slice(link.as_bytes());
+        }
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o755);
+        header.set_entry_type(kind);
+        header.set_cksum();
+        builder.append(&header, contents).unwrap();
+    }
+
     /// A tiny pack: tar → zstd → parts of `part_bytes`, with the manifest the
-    /// release would carry. `sidecar` becomes `sidecar/echolingo-sidecar`.
-    fn build_fixture(app_version: &str, platform: &str, part_bytes: usize, sidecar: &[u8]) -> Fixture {
+    /// release would carry. `sidecar` and `llama` become the two runtimes.
+    fn build_fixture(
+        app_version: &str,
+        platform: &str,
+        part_bytes: usize,
+        sidecar: &[u8],
+        llama: &[u8],
+    ) -> Fixture {
         let mut builder = tar::Builder::new(Vec::new());
         let mut directory = tar::Header::new_gnu();
         directory.set_entry_type(tar::EntryType::Directory);
@@ -1457,8 +1728,29 @@ mod tests {
         add_file(
             &mut builder,
             &format!("echolingo-gpu-pack/llama.cpp/{}", llama_name()),
-            b"llama",
+            llama,
             0o755,
+        );
+        add_file(
+            &mut builder,
+            "echolingo-gpu-pack/sidecar/_internal/libcudart.so.13",
+            b"cuda runtime",
+            0o644,
+        );
+        // Library aliases, one reaching into a sibling directory.
+        add_raw(
+            &mut builder,
+            "echolingo-gpu-pack/llama.cpp/libggml-vulkan.so",
+            tar::EntryType::Symlink,
+            b"",
+            Some("libggml-vulkan.so.0"),
+        );
+        add_raw(
+            &mut builder,
+            "echolingo-gpu-pack/llama.cpp/libcudart.so",
+            tar::EntryType::Symlink,
+            b"",
+            Some("../sidecar/_internal/libcudart.so.13"),
         );
         add_file(
             &mut builder,
@@ -1466,17 +1758,6 @@ mod tests {
             b"library",
             0o644,
         );
-        let mut link = tar::Header::new_gnu();
-        link.set_entry_type(tar::EntryType::Symlink);
-        link.set_size(0);
-        link.set_mode(0o777);
-        builder
-            .append_link(
-                &mut link,
-                "echolingo-gpu-pack/llama.cpp/libggml-vulkan.so",
-                "libggml-vulkan.so.0",
-            )
-            .unwrap();
         let archive = zstd::stream::encode_all(&builder.into_inner().unwrap()[..], 3).unwrap();
         let archive_name = format!("echolingo-gpu-pack-{app_version}-{platform}.tar.zst");
         let parts: Vec<(String, Vec<u8>)> = archive
@@ -1526,15 +1807,19 @@ mod tests {
         .unwrap();
     }
 
-    fn cuda_self_test() -> Option<SelfTestHook> {
+    fn passing_checks() -> Option<CheckHook> {
         Some(Arc::new(|pack: &Path| {
-            assert!(pack_runtime_layout(pack).sidecar.is_file());
-            Ok(json!({
-                "ok": true,
-                "version": VERSION,
-                "checks": {"torch": {"ok": true, "detail": "2.13.0+cu130"}},
-                "cuda": {"available": true, "device_name": "Test GPU", "capability": "8.6"}
-            }))
+            assert!(pack_sidecar(pack).is_file());
+            Ok(PackChecks {
+                self_test: json!({
+                    "ok": true,
+                    "version": VERSION,
+                    "checks": {"torch": {"ok": true, "detail": "2.13.0+cu130"}},
+                    "cuda": {"available": true, "device_name": "Test GPU", "capability": "8.6"}
+                }),
+                llama_ok: true,
+                llama_check: json!({"ok": true, "output": "version: 10516"}),
+            })
         }))
     }
 
@@ -1558,9 +1843,16 @@ mod tests {
         phases
     }
 
+    fn manager(runtimes: &Path, source: impl Into<String>) -> GpuPackManager {
+        GpuPackManager::new(runtimes.to_path_buf(), VERSION)
+            .with_source(source)
+            .with_platform(PLATFORM)
+            .with_test_hooks(passing_checks())
+    }
+
     #[test]
     fn manifest_parsing_validates_parts_and_digests() {
-        let fixture = build_fixture(VERSION, PLATFORM, 4096, b"sidecar");
+        let fixture = build_fixture(VERSION, PLATFORM, 4096, b"sidecar", b"llama");
         let bytes = serde_json::to_vec(&fixture.manifest).unwrap();
         let parsed = GpuPackManifest::parse(&bytes).unwrap();
         assert_eq!(parsed, fixture.manifest);
@@ -1579,26 +1871,21 @@ mod tests {
             edit(&mut value);
             GpuPackManifest::parse(value.to_string().as_bytes()).unwrap_err()
         };
-        assert!(matches!(
-            invalid(&|value| value["parts"][0]["name"] = json!("../escape.part01")),
-            GpuPackError::Manifest(_)
-        ));
-        assert!(matches!(
-            invalid(&|value| value["parts"][0]["sha256"] = json!("abc")),
-            GpuPackError::Manifest(_)
-        ));
-        assert!(matches!(
-            invalid(&|value| value["archive_bytes"] = json!(1)),
-            GpuPackError::Manifest(_)
-        ));
-        assert!(matches!(
-            invalid(&|value| value["schema_version"] = json!(2)),
-            GpuPackError::Manifest(_)
-        ));
-        assert!(matches!(
-            invalid(&|value| value["parts"] = json!([])),
-            GpuPackError::Manifest(_)
-        ));
+        for edit in [
+            &(|value: &mut Value| value["parts"][0]["name"] = json!("../escape.part01"))
+                as &dyn Fn(&mut Value),
+            &|value: &mut Value| value["parts"][0]["name"] = json!("C:evil.part01"),
+            &|value: &mut Value| value["parts"][0]["sha256"] = json!("abc"),
+            &|value: &mut Value| value["archive_bytes"] = json!(1),
+            &|value: &mut Value| value["schema_version"] = json!(2),
+            &|value: &mut Value| value["parts"] = json!([]),
+            &|value: &mut Value| {
+                let first = value["parts"][0].clone();
+                value["parts"][1]["name"] = first["name"].clone();
+            },
+        ] {
+            assert!(matches!(invalid(edit), GpuPackError::Manifest(_)));
+        }
         assert!(matches!(
             fixture.manifest.check_compatible("0.3.0", PLATFORM),
             Err(GpuPackError::VersionMismatch { .. })
@@ -1648,17 +1935,139 @@ mod tests {
         assert_eq!(parse_nvidia_smi(""), None);
     }
 
+    #[test]
+    fn pack_sources_are_https_file_urls_or_directories() {
+        assert_eq!(
+            parse_source("https://example.com/releases/v0.2.0").unwrap(),
+            PackSource::Remote("https://example.com/releases/v0.2.0/".into())
+        );
+        assert_eq!(
+            parse_source("http://127.0.0.1:8123").unwrap(),
+            PackSource::Remote("http://127.0.0.1:8123/".into())
+        );
+        assert!(parse_source("http://localhost:8123/packs/").is_ok());
+        assert!(parse_source("http://[::1]:8123/").is_ok());
+        assert!(matches!(
+            parse_source("http://mirror.example.com/packs/"),
+            Err(GpuPackError::Source(_))
+        ));
+        assert!(matches!(parse_source("ftp://example.com/"), Err(GpuPackError::Source(_))));
+        let directory = std::env::temp_dir().join("gpu packs");
+        let url = url::Url::from_file_path(&directory).unwrap().to_string();
+        assert_eq!(parse_source(&url).unwrap(), PackSource::Local(directory.clone()));
+        assert_eq!(
+            parse_source(&directory.to_string_lossy()).unwrap(),
+            PackSource::Local(directory)
+        );
+    }
+
+    #[test]
+    fn archive_paths_and_links_stay_inside_the_pack() {
+        let accepted = |path: &str| pack_relative_path(Path::new(path)).ok();
+        assert_eq!(
+            accepted("./echolingo-gpu-pack/sidecar/_internal/torch.dll"),
+            Some(PathBuf::from("sidecar").join("_internal").join("torch.dll"))
+        );
+        assert_eq!(accepted("echolingo-gpu-pack/"), Some(PathBuf::new()));
+        for hostile in [
+            "echolingo-gpu-pack/C:/Windows/evil.dll",
+            "echolingo-gpu-pack/C:evil.dll",
+            "echolingo-gpu-pack/data.bin:stream",
+            "echolingo-gpu-pack/../evil",
+            "echolingo-gpu-pack/a\\..\\..\\evil",
+            "/echolingo-gpu-pack/evil",
+            "other/evil",
+            "evil",
+        ] {
+            assert_eq!(accepted(hostile), None, "{hostile}");
+        }
+
+        let link = |from: &str, to: &str| resolve_link_target(Path::new(from), Path::new(to));
+        assert_eq!(
+            link("llama.cpp/libcudart.so", "../sidecar/_internal/libcudart.so.13"),
+            Some(PathBuf::from("sidecar").join("_internal").join("libcudart.so.13"))
+        );
+        assert_eq!(
+            link("llama.cpp/libggml.so", "./libggml.so.0"),
+            Some(PathBuf::from("llama.cpp").join("libggml.so.0"))
+        );
+        assert_eq!(link("libggml.so", "libggml.so.0"), Some(PathBuf::from("libggml.so.0")));
+        for hostile in ["../../outside.so", "/usr/lib/libc.so", "..", "C:/x.dll", "a/C:x"] {
+            assert_eq!(link("llama.cpp/lib.so", hostile), None, "{hostile}");
+        }
+    }
+
+    /// Run `extract_archive` on a one-part archive built by `build`.
+    fn extract(build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> (tempfile::TempDir, Result<(), GpuPackError>) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        build(&mut builder);
+        let archive = zstd::stream::encode_all(&builder.into_inner().unwrap()[..], 3).unwrap();
+        let part = directory.path().join("pack.tar.zst.part01");
+        std::fs::write(&part, &archive).unwrap();
+        let destination = directory.path().join("staging");
+        std::fs::create_dir_all(&destination).unwrap();
+        let result = extract_archive(
+            vec![part],
+            &format!("{:x}", Sha256::digest(&archive)),
+            &destination,
+            |_| {},
+        );
+        (directory, result)
+    }
+
+    #[test]
+    fn hostile_archive_entries_are_rejected() {
+        for name in [
+            "echolingo-gpu-pack/C:/evil.dll",
+            "echolingo-gpu-pack/../evil.dll",
+            "other/evil.dll",
+        ] {
+            let (directory, result) = extract(|builder| {
+                add_raw(builder, name, tar::EntryType::Regular, b"evil", None)
+            });
+            assert!(matches!(result, Err(GpuPackError::Archive(_))), "{name}");
+            assert!(!directory.path().join("evil.dll").exists());
+        }
+        let (directory, result) = extract(|builder| {
+            add_raw(
+                builder,
+                "echolingo-gpu-pack/llama.cpp/libevil.so",
+                tar::EntryType::Symlink,
+                b"",
+                Some("../../../outside.so"),
+            )
+        });
+        assert!(matches!(result, Err(GpuPackError::Archive(_))));
+        assert!(!directory
+            .path()
+            .join("staging")
+            .join("llama.cpp")
+            .join("libevil.so")
+            .exists());
+        // A tampered archive fails its digest even when every entry is fine.
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = build_fixture(VERSION, PLATFORM, 1 << 20, b"sidecar", b"llama");
+        let part = directory.path().join("part");
+        std::fs::write(&part, &fixture.parts[0].1).unwrap();
+        let destination = directory.path().join("staging");
+        std::fs::create_dir_all(&destination).unwrap();
+        assert!(matches!(
+            extract_archive(vec![part], &"0".repeat(64), &destination, |_| {}),
+            Err(GpuPackError::Archive(message)) if message.contains("SHA-256")
+        ));
+    }
+
     #[tokio::test]
     async fn installs_from_a_local_directory_of_parts() {
         let directory = tempfile::tempdir().unwrap();
-        let fixture = build_fixture(VERSION, PLATFORM, 4096, b"sidecar");
+        let fixture = build_fixture(VERSION, PLATFORM, 4096, b"sidecar", b"llama");
         let source = directory.path().join("release parts ü");
         write_fixture(&fixture, &source);
         let runtimes = directory.path().join("runtimes");
-        let manager = GpuPackManager::new(runtimes.clone(), VERSION)
-            .with_source(source.to_string_lossy())
-            .with_platform(PLATFORM)
-            .with_test_hooks(cuda_self_test());
+        // An interrupted earlier install left a staging tree behind.
+        std::fs::create_dir_all(runtimes.join(".gpu-pack.installing").join("sidecar")).unwrap();
+        let manager = manager(&runtimes, source.to_string_lossy());
         assert_eq!(manager.pack_state(), GpuPackState::NotInstalled);
         assert!(manager.runtime_layout().is_none());
 
@@ -1671,29 +2080,48 @@ mod tests {
         );
         let last = events.lock().unwrap().last().cloned().unwrap();
         assert_eq!(last.bytes_completed, fixture.manifest.archive_bytes);
+        assert_eq!(last.message, None);
         assert_eq!(record.manifest, fixture.manifest);
         assert_eq!(record.cuda_available(), Some(true));
+        assert_eq!(record.llama_ok, Some(true));
         assert_eq!(manager.pack_state(), GpuPackState::Ready);
         let pack = runtimes.join("gpu-pack");
         assert_eq!(manager.record().unwrap(), record);
-        let layout = manager.runtime_layout().unwrap();
-        assert_eq!(layout, pack_runtime_layout(&pack));
-        assert_eq!(std::fs::read(&layout.sidecar).unwrap(), b"sidecar");
-        assert_eq!(std::fs::read(&layout.llama_server).unwrap(), b"llama");
+        assert_eq!(
+            manager.runtime_layout().unwrap(),
+            GpuRuntimeLayout {
+                sidecar: Some(pack_sidecar(&pack)),
+                llama_server: Some(pack_llama_server(&pack)),
+            }
+        );
+        assert_eq!(std::fs::read(pack_sidecar(&pack)).unwrap(), b"sidecar");
+        assert_eq!(std::fs::read(pack_llama_server(&pack)).unwrap(), b"llama");
         assert_eq!(
             std::fs::metadata(pack.join("sidecar/_internal/torch_cuda.bin"))
                 .unwrap()
                 .len(),
             24_000
         );
+        // Aliases resolve (as links, or as copies where links need a privilege).
+        assert_eq!(
+            std::fs::read(pack.join("llama.cpp").join("libcudart.so")).unwrap(),
+            b"cuda runtime"
+        );
+        assert_eq!(
+            std::fs::read(pack.join("llama.cpp").join("libggml-vulkan.so")).unwrap(),
+            b"library"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(
-                std::fs::read_link(pack.join("llama.cpp/libggml-vulkan.so")).unwrap(),
-                Path::new("libggml-vulkan.so.0")
+                std::fs::read_link(pack.join("llama.cpp/libcudart.so")).unwrap(),
+                Path::new("../sidecar/_internal/libcudart.so.13")
             );
-            let mode = std::fs::metadata(&layout.sidecar).unwrap().permissions().mode();
+            let mode = std::fs::metadata(pack_sidecar(&pack))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o111, 0o111);
         }
         assert!(!runtimes.join(".gpu-pack.installing").exists());
@@ -1706,19 +2134,34 @@ mod tests {
         assert_eq!(status.pack_state, GpuPackState::Ready);
         assert_eq!(status.pack_version.as_deref(), Some(VERSION));
         assert_eq!(status.cuda_available, Some(true));
+        assert_eq!(status.llama_gpu_ok, Some(true));
         assert_eq!(status.device_name.as_deref(), Some("Test GPU"));
         assert_eq!(status.download_bytes, Some(fixture.manifest.archive_bytes));
         let serialized = serde_json::to_value(&status).unwrap();
         assert_eq!(serialized["pack_state"], "ready");
+        assert_eq!(serialized["llama_gpu_ok"], true);
         assert!(serialized.get("fallback_reason").is_some());
+
+        // Records written before the llama check existed still load.
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        legacy.as_object_mut().unwrap().remove("llama_ok");
+        legacy.as_object_mut().unwrap().remove("llama_check");
+        let legacy: GpuPackRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.llama_ok, None);
 
         // A newer app needs a new pack.
         let newer = GpuPackManager::new(runtimes.clone(), "0.3.0").with_platform(PLATFORM);
         assert_eq!(newer.pack_state(), GpuPackState::UpdateRequired);
         assert!(newer.runtime_layout().is_none());
 
+        // Reinstalling replaces the active pack in place.
+        let (callback, _) = recorder();
+        manager.install(callback).await.unwrap();
+        assert_eq!(manager.pack_state(), GpuPackState::Ready);
+        assert!(!runtimes.join(".gpu-pack.previous").exists());
+
         // A pack whose runtime vanished is corrupt.
-        std::fs::remove_file(&layout.llama_server).unwrap();
+        std::fs::remove_file(pack_llama_server(&pack)).unwrap();
         assert_eq!(manager.pack_state(), GpuPackState::Corrupt);
 
         manager.remove().unwrap();
@@ -1727,18 +2170,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_corrupt_part_is_rejected_and_nothing_is_activated() {
+    async fn a_corrupt_part_is_rejected_and_the_install_reports_failure() {
         let directory = tempfile::tempdir().unwrap();
-        let mut fixture = build_fixture(VERSION, PLATFORM, 4096, b"sidecar");
+        let mut fixture = build_fixture(VERSION, PLATFORM, 4096, b"sidecar", b"llama");
         fixture.parts[1].1[10] ^= 0xff;
         let source = directory.path().join("parts");
         write_fixture(&fixture, &source);
         let runtimes = directory.path().join("runtimes");
-        let manager = GpuPackManager::new(runtimes.clone(), VERSION)
-            .with_source(url::Url::from_file_path(&source).unwrap().to_string())
-            .with_platform(PLATFORM)
-            .with_test_hooks(cuda_self_test());
-        let (callback, _) = recorder();
+        let manager = manager(
+            &runtimes,
+            url::Url::from_file_path(&source).unwrap().to_string(),
+        );
+        let (callback, events) = recorder();
 
         let error = manager.install(callback).await.unwrap_err();
 
@@ -1746,6 +2189,11 @@ mod tests {
             matches!(&error, GpuPackError::CorruptPart(name) if *name == fixture.parts[1].0),
             "{error}"
         );
+        let last = events.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(last.phase, "failed");
+        assert!(last.message.unwrap().contains(&fixture.parts[1].0));
+        let serialized = serde_json::to_value(&events.lock().unwrap()[0]).unwrap();
+        assert!(serialized.get("message").is_none());
         assert_eq!(manager.pack_state(), GpuPackState::NotInstalled);
         assert!(!runtimes.join(".gpu-pack.installing").exists());
         assert!(!manager.is_installing());
@@ -1756,7 +2204,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("parts");
         // The release manifest names the wrong app version.
-        let fixture = build_fixture("0.1.9", PLATFORM, 4096, b"sidecar");
+        let fixture = build_fixture("0.1.9", PLATFORM, 4096, b"sidecar", b"llama");
         write_fixture(&fixture, &source);
         std::fs::rename(
             source.join(&fixture.manifest_name),
@@ -1764,26 +2212,19 @@ mod tests {
         )
         .unwrap();
         let runtimes = directory.path().join("runtimes");
-        let manager = GpuPackManager::new(runtimes.clone(), VERSION)
-            .with_source(source.to_string_lossy())
-            .with_platform(PLATFORM)
-            .with_test_hooks(cuda_self_test());
         let (callback, _) = recorder();
         assert!(matches!(
-            manager.install(callback.clone()).await,
+            manager(&runtimes, source.to_string_lossy()).install(callback.clone()).await,
             Err(GpuPackError::VersionMismatch { found, .. }) if found == "0.1.9"
         ));
 
         // The manifest is right but the unpacked pack is not.
-        let mut fixture = build_fixture(VERSION, "windows-x64", 4096, b"sidecar");
+        let mut fixture = build_fixture(VERSION, "windows-x64", 4096, b"sidecar", b"llama");
         fixture.manifest.platform = PLATFORM.into();
         fixture.manifest_name = format!("echolingo-gpu-pack-{VERSION}-{PLATFORM}.json");
         let source = directory.path().join("mislabelled");
         write_fixture(&fixture, &source);
-        let manager = GpuPackManager::new(runtimes.clone(), VERSION)
-            .with_source(source.to_string_lossy())
-            .with_platform(PLATFORM)
-            .with_test_hooks(cuda_self_test());
+        let manager = manager(&runtimes, source.to_string_lossy());
         assert!(matches!(
             manager.install(callback).await,
             Err(GpuPackError::PlatformMismatch { found, .. }) if found == "windows-x64"
@@ -1792,24 +2233,32 @@ mod tests {
         assert!(!runtimes.join(".gpu-pack.installing").exists());
     }
 
-    type RequestLog = Arc<Mutex<Vec<(String, Option<String>)>>>;
+    type RequestLog = Arc<Mutex<Vec<(String, Option<String>, Option<String>)>>>;
 
-    /// A minimal HTTP/1.1 file server with Range support. The first request
-    /// for `cut.0` is closed after `cut.1` body bytes.
-    async fn serve(files: HashMap<String, Vec<u8>>, cut: Option<(String, usize)>) -> (String, RequestLog) {
+    #[derive(Clone)]
+    enum Quirk {
+        /// Close the connection after this many body bytes.
+        Cut(usize),
+        /// Serve the file with one byte flipped.
+        Corrupt,
+    }
+
+    /// A minimal HTTP/1.1 file server with Range/If-Range support and an
+    /// ETag per file. Each quirk applies to the first request of its path.
+    async fn serve(files: HashMap<String, Vec<u8>>, quirks: HashMap<String, Quirk>) -> (String, RequestLog) {
         use tokio::io::AsyncReadExt;
 
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let base = format!("http://{}/", listener.local_addr().unwrap());
         let log: RequestLog = Arc::new(Mutex::new(Vec::new()));
         let files = Arc::new(files);
-        let cut = Arc::new(Mutex::new(cut));
+        let quirks = Arc::new(Mutex::new(quirks));
         let requests = log.clone();
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let files = files.clone();
                 let requests = requests.clone();
-                let cut = cut.clone();
+                let quirks = quirks.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buffer = [0_u8; 1024];
@@ -1826,23 +2275,31 @@ mod tests {
                         .unwrap_or("/")
                         .trim_start_matches('/')
                         .to_string();
-                    let range = text.lines().find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("range")
-                            .then(|| value.trim().to_string())
-                    });
-                    requests.lock().unwrap().push((path.clone(), range.clone()));
+                    let header = |wanted: &str| {
+                        text.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case(wanted)
+                                .then(|| value.trim().to_string())
+                        })
+                    };
+                    let (range, if_range) = (header("range"), header("if-range"));
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push((path.clone(), range.clone(), if_range.clone()));
                     let Some(body) = files.get(&path) else {
                         let _ = stream
                             .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                             .await;
                         return;
                     };
+                    let etag = format!("\"{:x}\"", Sha256::digest(body));
                     let start = range
                         .as_deref()
                         .and_then(|range| range.strip_prefix("bytes="))
                         .and_then(|range| range.strip_suffix('-'))
-                        .and_then(|start| start.parse::<usize>().ok());
+                        .and_then(|start| start.parse::<usize>().ok())
+                        .filter(|_| if_range.as_deref().is_none_or(|tag| tag == etag));
                     let mut head = match start {
                         Some(start) => format!(
                             "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{}/{}\r\nContent-Length: {}\r\n",
@@ -1852,21 +2309,19 @@ mod tests {
                         ),
                         None => format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n", body.len()),
                     };
-                    head.push_str("Connection: close\r\n\r\n");
-                    let body = &body[start.unwrap_or(0)..];
-                    let limit = {
-                        let mut cut = cut.lock().unwrap();
-                        match cut.as_ref() {
-                            Some((name, bytes)) if *name == path => {
-                                let bytes = *bytes;
-                                *cut = None;
-                                bytes
-                            }
-                            _ => body.len(),
+                    head.push_str(&format!("ETag: {etag}\r\nConnection: close\r\n\r\n"));
+                    let mut body = body[start.unwrap_or(0)..].to_vec();
+                    let quirk = quirks.lock().unwrap().remove(&path);
+                    let limit = match quirk {
+                        Some(Quirk::Cut(bytes)) => bytes.min(body.len()),
+                        Some(Quirk::Corrupt) => {
+                            body[0] ^= 0xff;
+                            body.len()
                         }
+                        None => body.len(),
                     };
                     let _ = stream.write_all(head.as_bytes()).await;
-                    let _ = stream.write_all(&body[..limit.min(body.len())]).await;
+                    let _ = stream.write_all(&body[..limit]).await;
                     let _ = stream.shutdown().await;
                 });
             }
@@ -1874,27 +2329,36 @@ mod tests {
         (base, log)
     }
 
-    #[tokio::test]
-    async fn http_downloads_resume_with_range_requests() {
-        let directory = tempfile::tempdir().unwrap();
-        let fixture = build_fixture(VERSION, PLATFORM, 4096, b"sidecar");
+    fn served(fixture: &Fixture) -> HashMap<String, Vec<u8>> {
         let mut files: HashMap<String, Vec<u8>> = fixture.parts.iter().cloned().collect();
         files.insert(
             fixture.manifest_name.clone(),
             serde_json::to_vec(&fixture.manifest).unwrap(),
         );
+        files
+    }
+
+    #[tokio::test]
+    async fn http_downloads_resume_verify_and_refetch_corrupt_parts() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = build_fixture(VERSION, PLATFORM, 4096, b"sidecar", b"llama");
         let first = fixture.parts[0].0.clone();
         let second = fixture.parts[1].0.clone();
-        let (base, requests) = serve(files, Some((first.clone(), 1_000))).await;
+        let third = fixture.parts[2].0.clone();
+        let (base, requests) = serve(
+            served(&fixture),
+            HashMap::from([
+                (first.clone(), Quirk::Cut(1_000)),
+                (third.clone(), Quirk::Corrupt),
+            ]),
+        )
+        .await;
         let runtimes = directory.path().join("runtimes");
-        // An earlier run left half of part 2 behind.
+        // An earlier run left half of part 2 behind, without an ETag.
         let cache = runtimes.join(".downloads").join("gpu-pack");
         std::fs::create_dir_all(&cache).unwrap();
         std::fs::write(cache.join(&second), &fixture.parts[1].1[..1_500]).unwrap();
-        let manager = GpuPackManager::new(runtimes.clone(), VERSION)
-            .with_source(base.trim_end_matches('/'))
-            .with_platform(PLATFORM)
-            .with_test_hooks(cuda_self_test());
+        let manager = manager(&runtimes, base.trim_end_matches('/'));
         let (callback, events) = recorder();
 
         let record = manager.install(callback).await.unwrap();
@@ -1904,15 +2368,22 @@ mod tests {
         let for_part = |name: &str| {
             requests
                 .iter()
-                .filter(|(path, _)| path == name)
-                .map(|(_, range)| range.clone())
+                .filter(|(path, ..)| path == name)
+                .map(|(_, range, if_range)| (range.clone(), if_range.clone()))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(for_part(&first), [None, Some("bytes=1000-".to_string())]);
-        assert_eq!(for_part(&second), [Some("bytes=1500-".to_string())]);
+        let etag = format!("\"{:x}\"", Sha256::digest(&fixture.parts[0].1));
+        // Resumed where the connection dropped, guarded by the ETag.
+        assert_eq!(
+            for_part(&first),
+            [(None, None), (Some("bytes=1000-".to_string()), Some(etag))]
+        );
+        assert_eq!(for_part(&second), [(Some("bytes=1500-".to_string()), None)]);
+        // The corrupt copy was caught right away and fetched again.
+        assert_eq!(for_part(&third), [(None, None), (None, None)]);
         assert_eq!(
             phases(&events),
-            ["starting", "downloading", "verifying", "extracting", "testing", "ready"]
+            ["starting", "downloading", "extracting", "testing", "ready"]
         );
         assert_eq!(manager.pack_state(), GpuPackState::Ready);
         // Parts are discarded once the pack is active.
@@ -1922,20 +2393,18 @@ mod tests {
     #[tokio::test]
     async fn a_missing_release_is_reported_without_touching_the_install() {
         let directory = tempfile::tempdir().unwrap();
-        let (base, _) = serve(HashMap::new(), None).await;
-        let manager = GpuPackManager::new(directory.path().join("runtimes"), VERSION)
-            .with_source(base)
-            .with_platform(PLATFORM)
-            .with_test_hooks(cuda_self_test());
-        let (callback, _) = recorder();
+        let (base, _) = serve(HashMap::new(), HashMap::new()).await;
+        let manager = manager(&directory.path().join("runtimes"), base);
+        let (callback, events) = recorder();
         let error = manager.install(callback).await.unwrap_err();
         assert!(matches!(&error, GpuPackError::Download(message) if message.contains("404")));
+        assert_eq!(events.lock().unwrap().last().unwrap().phase, "failed");
         assert_eq!(manager.pack_state(), GpuPackState::NotInstalled);
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn the_unpacked_sidecar_runs_its_cuda_self_test() {
+    async fn install_checks_run_the_unpacked_sidecar_and_llama_server() {
         let directory = tempfile::tempdir().unwrap();
         let report = json!({
             "ok": true, "version": VERSION, "platform": "linux", "frozen": true,
@@ -1943,10 +2412,11 @@ mod tests {
             "checks": {"torch": {"ok": true, "detail": "2.13.0+cu130"}},
             "cuda": {"available": false, "device_name": null, "error": null}
         });
-        let script = format!(
-            "#!/bin/sh\n[ \"$1 $2\" = 'self-test --cuda' ] || exit 9\n[ \"$PYTHONUTF8\" = 1 ] || exit 8\necho 'loading torch' >&2\necho '{report}'\n"
+        let sidecar = format!(
+            "#!/bin/sh\n[ \"$*\" = 'self-test --qwen-runtime --cuda' ] || exit 9\n[ \"$PYTHONUTF8\" = 1 ] || exit 8\necho 'loading torch' >&2\necho '{report}'\n"
         );
-        let fixture = build_fixture(VERSION, PLATFORM, 8192, script.as_bytes());
+        let llama = "#!/bin/sh\n[ \"$1\" = --version ] || exit 7\necho 'version: 10516 (vulkan)'\n";
+        let fixture = build_fixture(VERSION, PLATFORM, 8192, sidecar.as_bytes(), llama.as_bytes());
         let source = directory.path().join("parts");
         write_fixture(&fixture, &source);
         let manager = GpuPackManager::new(directory.path().join("runtimes"), VERSION)
@@ -1956,9 +2426,43 @@ mod tests {
         let record = manager.install(callback).await.unwrap();
         assert_eq!(record.self_test, report);
         assert_eq!(record.cuda_available(), Some(false));
-        // Installed, but without a usable GPU the CPU runtime stays in use.
-        assert_eq!(manager.pack_state(), GpuPackState::Ready);
-        assert!(manager.runtime_layout().is_none());
+        assert_eq!(record.llama_ok, Some(true));
+        assert!(record.llama_check["output"]
+            .as_str()
+            .unwrap()
+            .contains("10516"));
+        // Without CUDA only the Vulkan llama-server is used.
+        let pack = manager.install_directory();
+        assert_eq!(
+            manager.runtime_layout(),
+            Some(GpuRuntimeLayout {
+                sidecar: None,
+                llama_server: Some(pack_llama_server(&pack)),
+            })
+        );
+
+        // A llama-server that cannot run keeps the pack, without llama.
+        let broken_llama = "#!/bin/sh\necho 'vulkan-1 not found' >&2\nexit 1\n";
+        let fixture = build_fixture(
+            VERSION,
+            PLATFORM,
+            8192,
+            sidecar.as_bytes(),
+            broken_llama.as_bytes(),
+        );
+        let source = directory.path().join("no-vulkan");
+        write_fixture(&fixture, &source);
+        let manager = GpuPackManager::new(directory.path().join("no-vulkan-runtimes"), VERSION)
+            .with_source(source.to_string_lossy())
+            .with_platform(PLATFORM);
+        let (callback, _) = recorder();
+        let record = manager.install(callback).await.unwrap();
+        assert_eq!(record.llama_ok, Some(false));
+        assert!(record.llama_check["output"]
+            .as_str()
+            .unwrap()
+            .contains("vulkan-1 not found"));
+        assert_eq!(manager.runtime_layout(), None);
 
         let failing = json!({
             "ok": false,
@@ -1966,7 +2470,7 @@ mod tests {
             "cuda": null
         });
         let script = format!("#!/bin/sh\necho '{failing}'\nexit 1\n");
-        let fixture = build_fixture(VERSION, PLATFORM, 8192, script.as_bytes());
+        let fixture = build_fixture(VERSION, PLATFORM, 8192, script.as_bytes(), llama.as_bytes());
         let source = directory.path().join("broken");
         write_fixture(&fixture, &source);
         let runtimes = directory.path().join("broken-runtimes");
@@ -1992,6 +2496,7 @@ mod tests {
         assert!(!status.supported_platform);
         assert!(!status.eligible);
         assert_eq!(status.pack_state, GpuPackState::NotInstalled);
+        assert_eq!(status.llama_gpu_ok, None);
         let (callback, _) = recorder();
         assert!(matches!(
             manager.install(callback).await,
@@ -2019,21 +2524,31 @@ mod tests {
         let record = manager
             .install(Arc::new(|progress: ModelProgress| {
                 eprintln!(
-                    "gpu-pack {} {}/{}",
-                    progress.phase, progress.bytes_completed, progress.total_bytes
+                    "gpu-pack {} {}/{} {}",
+                    progress.phase,
+                    progress.bytes_completed,
+                    progress.total_bytes,
+                    progress.message.unwrap_or_default()
                 );
             }))
             .await
             .unwrap();
         println!("GPU_PACK_SELF_TEST={}", record.self_test);
+        println!("GPU_PACK_LLAMA_CHECK={}", record.llama_check);
         assert_eq!(record.self_test["ok"], true);
         assert!(record.self_test["cuda"].is_object());
+        assert!(record.llama_ok.is_some());
         assert_eq!(manager.pack_state(), GpuPackState::Ready);
-        let layout = pack_runtime_layout(&manager.install_directory());
-        assert!(layout.sidecar.is_file() && layout.llama_server.is_file());
+        let pack = manager.install_directory();
+        assert!(pack_sidecar(&pack).is_file() && pack_llama_server(&pack).is_file());
+        let layout = manager.runtime_layout();
         assert_eq!(
-            manager.runtime_layout().is_some(),
+            layout.as_ref().is_some_and(|layout| layout.sidecar.is_some()),
             record.cuda_available() == Some(true)
+        );
+        assert_eq!(
+            layout.as_ref().is_some_and(|layout| layout.llama_server.is_some()),
+            record.llama_ok == Some(true)
         );
     }
 }

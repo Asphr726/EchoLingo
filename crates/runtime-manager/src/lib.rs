@@ -78,6 +78,9 @@ pub struct ModelProgress {
     pub total_bytes: u64,
     pub bytes_per_second: Option<f64>,
     pub phase: String,
+    /// Why an install failed (`phase: "failed"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,15 +198,28 @@ where
         .unwrap_or(default)
 }
 
-/// The NVIDIA acceleration pack's runtime (see [`gpu_pack`]): used in place
-/// of the bundled CPU runtime while it is selected.
+/// The parts of the NVIDIA acceleration pack (see [`gpu_pack`]) that passed
+/// their install checks, used in place of the bundled CPU runtime per
+/// service while selected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpuRuntimeLayout {
     /// The pack's CUDA build of the sidecar, run as `qwen-asr-server`.
-    pub sidecar: PathBuf,
+    pub sidecar: Option<PathBuf>,
     /// The pack's Vulkan `llama-server`.
-    pub llama_server: PathBuf,
+    pub llama_server: Option<PathBuf>,
 }
+
+impl GpuRuntimeLayout {
+    fn executable_for(&self, service: &str) -> Option<&Path> {
+        match service {
+            "qwen_asr" => self.sidecar.as_deref(),
+            "hymt" => self.llama_server.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+const LOCAL_SERVICES: [&str; 2] = ["qwen_asr", "hymt"];
 
 #[derive(Debug, Clone)]
 pub struct LocalRuntimeLayout {
@@ -277,8 +293,9 @@ impl LocalRuntimeError {
 #[derive(Debug, Default)]
 struct GpuSelection {
     runtime: Option<GpuRuntimeLayout>,
-    /// Why the GPU runtime was abandoned for the rest of this app run.
-    fallback_reason: Option<String>,
+    /// Services that failed on the GPU runtime and use the CPU runtime until
+    /// the selection changes, with why.
+    fallbacks: std::collections::BTreeMap<String, String>,
 }
 
 pub struct LocalRuntimeManager {
@@ -355,9 +372,10 @@ impl LocalRuntimeManager {
 
     /// Use `runtime` (the GPU pack) for the model services from now on, or
     /// the bundled CPU runtime for `None`. A change stops every running
-    /// service so the next start uses the new runtime, and gives a runtime
-    /// that failed earlier another chance; returns whether anything changed.
-    /// Callers only switch while no session uses the services.
+    /// service so the next start uses the new runtime, and gives services
+    /// that failed on the GPU earlier another chance; returns whether
+    /// anything changed. Callers only switch while no session uses the
+    /// services.
     pub async fn select_gpu_runtime(&self, runtime: Option<GpuRuntimeLayout>) -> bool {
         let mut services = self.services.lock().await;
         {
@@ -368,7 +386,7 @@ impl LocalRuntimeManager {
                 return false;
             }
             selection.runtime = runtime;
-            selection.fallback_reason = None;
+            selection.fallbacks.clear();
         }
         for (_, mut process) in services.drain() {
             let _ = process.terminate(SERVICE_STOP_GRACE).await;
@@ -376,50 +394,65 @@ impl LocalRuntimeManager {
         true
     }
 
-    /// Forget an earlier GPU failure so the next start tries the GPU runtime
-    /// again (after the user reinstalled or re-enabled the pack).
+    /// Forget earlier GPU failures so the next start of each service tries
+    /// the GPU runtime again (after the user reinstalled the pack).
     pub fn clear_gpu_fallback(&self) {
         if let Ok(mut selection) = self.gpu.lock() {
-            selection.fallback_reason = None;
+            selection.fallbacks.clear();
         }
     }
 
-    /// Whether services start on the GPU runtime now.
+    /// Whether `service` starts on the GPU runtime now.
+    pub fn uses_gpu(&self, service: &str) -> bool {
+        self.gpu_executable(service).is_some()
+    }
+
+    /// Whether any service starts on the GPU runtime now.
     pub fn gpu_active(&self) -> bool {
-        self.active_gpu_runtime().is_some()
+        LOCAL_SERVICES.iter().any(|service| self.uses_gpu(service))
     }
 
-    /// Why the GPU runtime was abandoned for this app run, if it was.
+    /// Why services fell back to the CPU runtime, if any did.
     pub fn gpu_fallback_reason(&self) -> Option<String> {
-        self.gpu
-            .lock()
-            .ok()
-            .and_then(|selection| selection.fallback_reason.clone())
+        let selection = self.gpu.lock().ok()?;
+        (!selection.fallbacks.is_empty())
+            .then(|| selection.fallbacks.values().cloned().collect::<Vec<_>>().join("; "))
     }
 
-    fn active_gpu_runtime(&self) -> Option<GpuRuntimeLayout> {
+    /// Why `service` fell back to the CPU runtime, if it did.
+    pub fn gpu_fallback_for(&self, service: &str) -> Option<String> {
+        self.gpu.lock().ok()?.fallbacks.get(service).cloned()
+    }
+
+    fn gpu_executable(&self, service: &str) -> Option<PathBuf> {
         let selection = self.gpu.lock().ok()?;
-        if selection.fallback_reason.is_some() {
+        if selection.fallbacks.contains_key(service) {
             return None;
         }
-        selection.runtime.clone()
+        selection
+            .runtime
+            .as_ref()?
+            .executable_for(service)
+            .map(Path::to_path_buf)
     }
 
-    fn record_gpu_fallback(&self, reason: String) {
+    fn record_gpu_fallback(&self, service: &str, reason: String) {
         if let Ok(mut selection) = self.gpu.lock() {
-            selection.fallback_reason.get_or_insert(reason);
+            selection.fallbacks.entry(service.into()).or_insert(reason);
         }
     }
 
     /// The command that starts `service` on the runtime selected now.
     pub fn command_for(&self, service: &str) -> Result<RuntimeCommand, LocalRuntimeError> {
-        self.command_on(service, self.active_gpu_runtime().as_ref())
+        self.command_on(service, self.gpu_executable(service).as_deref())
     }
 
+    /// The command for `service`; `gpu` is the pack executable to run it
+    /// with, `None` for the CPU runtime.
     fn command_on(
         &self,
         service: &str,
-        gpu: Option<&GpuRuntimeLayout>,
+        gpu: Option<&Path>,
     ) -> Result<RuntimeCommand, LocalRuntimeError> {
         match service {
             "qwen_asr" => {
@@ -428,9 +461,9 @@ impl LocalRuntimeManager {
                     return Err(LocalRuntimeError::ModelUnavailable("qwen3-asr-0.6b".into()));
                 }
                 let (mut command, device) = match gpu {
-                    Some(gpu) => (
+                    Some(sidecar) => (
                         RuntimeCommand {
-                            executable: gpu.sidecar.clone(),
+                            executable: sidecar.to_path_buf(),
                             args: vec!["qwen-asr-server".into()],
                             environment: HashMap::new(),
                         },
@@ -481,7 +514,7 @@ impl LocalRuntimeManager {
             }
             "hymt" => {
                 let executable = gpu
-                    .map(|gpu| gpu.llama_server.clone())
+                    .map(Path::to_path_buf)
                     .or_else(|| self.layout.llama_server.clone())
                     .ok_or_else(|| LocalRuntimeError::RuntimeUnavailable("llama-server".into()))?;
                 let model = self
@@ -558,16 +591,20 @@ impl LocalRuntimeManager {
         if let Some(mut previous) = services.remove(service) {
             let _ = previous.terminate(SERVICE_STOP_GRACE).await;
         }
-        let gpu = self.active_gpu_runtime();
-        let process = match self.launch(service, port, health_path, gpu.as_ref()).await {
+        let gpu = self.gpu_executable(service);
+        let process = match self.launch(service, port, health_path, gpu.as_deref()).await {
             Ok(process) => process,
             Err(error) if gpu.is_some() && error.is_process_failure() => {
                 // The GPU runtime is optional: keep the session working on
-                // the CPU runtime and stay there for the rest of this run.
-                self.record_gpu_fallback(format!(
-                    "{service} could not start with GPU acceleration: {}",
-                    error.summary()
-                ));
+                // the CPU runtime. Only this service falls back; the other
+                // keeps its GPU runtime.
+                self.record_gpu_fallback(
+                    service,
+                    format!(
+                        "{service} could not start with GPU acceleration: {}",
+                        error.summary()
+                    ),
+                );
                 self.launch(service, port, health_path, None).await?
             }
             Err(error) => return Err(error),
@@ -584,7 +621,7 @@ impl LocalRuntimeManager {
         service: &str,
         port: u16,
         health_path: &str,
-        gpu: Option<&GpuRuntimeLayout>,
+        gpu: Option<&Path>,
     ) -> Result<ProcessTree, LocalRuntimeError> {
         let spec = self.command_on(service, gpu)?;
         std::fs::create_dir_all(&self.layout.log_root)?;
@@ -807,6 +844,7 @@ impl ModelManager {
             total_bytes: spec.expected_bytes,
             bytes_per_second: None,
             phase: "starting".into(),
+            message: None,
         });
 
         let client = HFClient::builder()
@@ -856,6 +894,7 @@ impl ModelManager {
             total_bytes: spec.expected_bytes,
             bytes_per_second: None,
             phase: "verifying".into(),
+            message: None,
         });
         verify_required_file(&staging, spec)?;
         write_manifest(&staging, spec)?;
@@ -866,6 +905,7 @@ impl ModelManager {
             total_bytes: spec.expected_bytes,
             bytes_per_second: None,
             phase: "ready".into(),
+            message: None,
         });
         Ok(())
     }
@@ -905,6 +945,7 @@ impl ProgressHandler for ModelProgressHandler {
                 total_bytes: *total_bytes,
                 bytes_per_second: None,
                 phase: "downloading".into(),
+                message: None,
             },
             ProgressEvent::Download(DownloadEvent::Progress { files }) => {
                 let mut cumulative = match self.files.lock() {
@@ -923,6 +964,7 @@ impl ProgressHandler for ModelProgressHandler {
                     total_bytes: cumulative.values().map(|value| value.1).sum(),
                     bytes_per_second: None,
                     phase: "downloading".into(),
+                    message: None,
                 }
             }
             ProgressEvent::Download(DownloadEvent::AggregateProgress {
@@ -935,6 +977,7 @@ impl ProgressHandler for ModelProgressHandler {
                 total_bytes: *total_bytes,
                 bytes_per_second: *bytes_per_sec,
                 phase: "downloading".into(),
+                message: None,
             },
             ProgressEvent::Download(DownloadEvent::Complete) => ModelProgress {
                 model_id: self.model_id.clone(),
@@ -942,6 +985,7 @@ impl ProgressHandler for ModelProgressHandler {
                 total_bytes: 0,
                 bytes_per_second: None,
                 phase: "downloaded".into(),
+                message: None,
             },
             _ => return,
         };
@@ -1069,6 +1113,22 @@ fn write_manifest(directory: &Path, spec: &ModelSpec) -> Result<(), ModelManager
 }
 
 fn activate_directory(root: &Path, staging: &Path, destination: &Path) -> io::Result<()> {
+    activate_directory_retrying(root, staging, destination, 1, Duration::ZERO)
+}
+
+/// Replace `destination` with `staging`: the current copy moves aside to
+/// `.<name>.previous`, `staging` takes its place (the old copy is put back
+/// if that fails) and the old copy is deleted last. Each rename is tried up
+/// to `attempts` times, `delay` apart, and not again once its source is
+/// gone. Deleting the old copy is best effort; the next activation removes
+/// a leftover.
+fn activate_directory_retrying(
+    root: &Path,
+    staging: &Path,
+    destination: &Path,
+    attempts: u32,
+    delay: Duration,
+) -> io::Result<()> {
     let previous = root.join(format!(
         ".{}.previous",
         destination
@@ -1076,17 +1136,44 @@ fn activate_directory(root: &Path, staging: &Path, destination: &Path) -> io::Re
             .and_then(|name| name.to_str())
             .unwrap_or("model")
     ));
-    remove_scoped_directory(root, &previous)?;
-    if destination.exists() {
-        std::fs::rename(destination, &previous)?;
+    if !staging.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{} does not exist", staging.display()),
+        ));
     }
-    if let Err(error) = std::fs::rename(staging, destination) {
-        if previous.exists() {
+    remove_scoped_directory(root, &previous)?;
+    let moved_aside = destination.exists();
+    if moved_aside {
+        retry_rename(destination, &previous, attempts, delay)?;
+    }
+    if let Err(error) = retry_rename(staging, destination, attempts, delay) {
+        if moved_aside && !destination.exists() {
             let _ = std::fs::rename(&previous, destination);
         }
         return Err(error);
     }
-    remove_scoped_directory(root, &previous)
+    if let Err(error) = remove_scoped_directory(root, &previous) {
+        eprintln!(
+            "could not remove {} ({error}); the next update removes it",
+            previous.display()
+        );
+    }
+    Ok(())
+}
+
+fn retry_rename(from: &Path, to: &Path, attempts: u32, delay: Duration) -> io::Result<()> {
+    let mut attempt = 1;
+    loop {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(_) if attempt < attempts && from.exists() && !to.exists() => {
+                attempt += 1;
+                std::thread::sleep(delay);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn remove_scoped_directory(root: &Path, target: &Path) -> io::Result<()> {
@@ -1292,21 +1379,25 @@ mod tests {
         std::fs::create_dir_all(&gguf).unwrap();
         std::fs::write(gguf.join("Hy-MT2-1.8B-Q4_K_M.gguf"), b"model").unwrap();
         let cpu_sidecar = directory.path().join("echolingo-sidecar");
+        let cpu_llama = directory.path().join("cpu-llama-server");
         let mut layout = runtime_layout(directory.path(), cpu_sidecar.clone());
         layout.worker_wrapper = Some(cpu_sidecar.clone());
-        layout.llama_server = Some(directory.path().join("cpu-llama-server"));
+        layout.llama_server = Some(cpu_llama.clone());
         let manager = LocalRuntimeManager::new(layout);
+        let gpu_sidecar = directory.path().join("gpu").join("echolingo-sidecar");
+        let gpu_llama = directory.path().join("gpu").join("llama-server");
         let pack = GpuRuntimeLayout {
-            sidecar: directory.path().join("gpu").join("echolingo-sidecar"),
-            llama_server: directory.path().join("gpu").join("llama-server"),
+            sidecar: Some(gpu_sidecar.clone()),
+            llama_server: Some(gpu_llama.clone()),
         };
 
         assert!(!manager.gpu_active());
         assert!(manager.select_gpu_runtime(Some(pack.clone())).await);
         assert!(!manager.select_gpu_runtime(Some(pack.clone())).await);
         assert!(manager.gpu_active());
+        assert!(manager.uses_gpu("qwen_asr") && manager.uses_gpu("hymt"));
         let qwen = manager.command_for("qwen_asr").unwrap();
-        assert_eq!(qwen.executable, pack.sidecar);
+        assert_eq!(qwen.executable, gpu_sidecar);
         assert_eq!(qwen.args[0], "qwen-asr-server");
         assert!(qwen
             .args
@@ -1315,9 +1406,26 @@ mod tests {
         let hymt = manager.command_for("hymt").unwrap();
         // The pack's llama-server still runs under the owner watchdog.
         assert_eq!(hymt.executable, cpu_sidecar);
-        assert_eq!(Path::new(&hymt.args[1]), pack.llama_server);
+        assert_eq!(Path::new(&hymt.args[1]), gpu_llama);
+
+        // A pack whose llama-server failed its install check keeps CUDA for
+        // Qwen and leaves translation on the CPU build.
+        assert!(
+            manager
+                .select_gpu_runtime(Some(GpuRuntimeLayout {
+                    sidecar: Some(gpu_sidecar.clone()),
+                    llama_server: None,
+                }))
+                .await
+        );
+        assert!(manager.uses_gpu("qwen_asr") && !manager.uses_gpu("hymt"));
+        assert_eq!(
+            Path::new(&manager.command_for("hymt").unwrap().args[1]),
+            cpu_llama
+        );
 
         assert!(manager.select_gpu_runtime(None).await);
+        assert!(!manager.gpu_active());
         let qwen = manager.command_for("qwen_asr").unwrap();
         assert_eq!(qwen.executable, cpu_sidecar);
         assert!(qwen
@@ -1328,7 +1436,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn failed_gpu_start_falls_back_to_the_cpu_runtime_for_the_run() {
+    async fn a_failed_gpu_start_falls_back_for_that_service_only() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().unwrap();
@@ -1343,15 +1451,18 @@ mod tests {
             std::fs::set_permissions(&path, permissions).unwrap();
             path
         };
-        let gpu_sidecar = script("gpu-sidecar", "echo 'CUDA driver version is insufficient' >&2\nexit 3");
+        let gpu_sidecar = script(
+            "gpu-sidecar",
+            "echo 'CUDA driver version is insufficient' >&2\nexit 3",
+        );
         let cpu_sidecar = script("cpu-sidecar", "echo 'cpu runtime ran' >&2\nexit 5");
         let manager = LocalRuntimeManager::new(runtime_layout(directory.path(), cpu_sidecar));
-        manager
-            .select_gpu_runtime(Some(GpuRuntimeLayout {
-                sidecar: gpu_sidecar,
-                llama_server: directory.path().join("llama-server"),
-            }))
-            .await;
+        let gpu_llama = directory.path().join("llama-server");
+        let pack = GpuRuntimeLayout {
+            sidecar: Some(gpu_sidecar),
+            llama_server: Some(gpu_llama.clone()),
+        };
+        manager.select_gpu_runtime(Some(pack.clone())).await;
 
         let error = manager.ensure_service("qwen_asr").await.unwrap_err();
         // The CPU runtime was tried after the GPU failure.
@@ -1360,9 +1471,13 @@ mod tests {
             LocalRuntimeError::StartupExit { status, diagnostics, .. }
                 if status.contains('5') && diagnostics.contains("cpu runtime ran")
         ));
-        let reason = manager.gpu_fallback_reason().unwrap();
-        assert!(reason.contains("qwen_asr"), "{reason}");
-        assert!(!manager.gpu_active());
+        let reason = manager.gpu_fallback_for("qwen_asr").unwrap();
+        assert!(reason.contains("qwen_asr") && reason.contains(".gpu.log"), "{reason}");
+        assert_eq!(manager.gpu_fallback_reason(), Some(reason));
+        assert_eq!(manager.gpu_fallback_for("hymt"), None);
+        // Translation keeps the Vulkan llama-server.
+        assert!(!manager.uses_gpu("qwen_asr") && manager.uses_gpu("hymt"));
+        assert!(manager.gpu_active());
         assert!(
             std::fs::read_to_string(directory.path().join("logs").join("qwen_asr.gpu.log"))
                 .unwrap()
@@ -1374,7 +1489,39 @@ mod tests {
             directory.path().join("cpu-sidecar")
         );
         manager.clear_gpu_fallback();
-        assert!(manager.gpu_active());
+        assert!(manager.uses_gpu("qwen_asr"));
+        // Switching the runtime off and on again also retries.
+        manager.ensure_service("qwen_asr").await.unwrap_err();
+        assert!(manager.gpu_fallback_reason().is_some());
+        manager.select_gpu_runtime(None).await;
+        manager.select_gpu_runtime(Some(pack)).await;
+        assert_eq!(manager.gpu_fallback_reason(), None);
+    }
+
+    #[test]
+    fn activation_swaps_directories_and_tolerates_a_stuck_leftover() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("runtimes");
+        let staging = root.join(".pack.installing");
+        let destination = root.join("pack");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("version"), b"1").unwrap();
+        activate_directory(&root, &staging, &destination).unwrap();
+        assert_eq!(std::fs::read(destination.join("version")).unwrap(), b"1");
+
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("version"), b"2").unwrap();
+        activate_directory_retrying(&root, &staging, &destination, 3, Duration::ZERO).unwrap();
+        assert_eq!(std::fs::read(destination.join("version")).unwrap(), b"2");
+        assert!(!staging.exists() && !root.join(".pack.previous").exists());
+
+        // Without a staging tree nothing is retried and the pack stays.
+        let error =
+            activate_directory_retrying(&root, &staging, &destination, 5, Duration::from_secs(5))
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(std::fs::read(destination.join("version")).unwrap(), b"2");
+        assert!(!root.join(".pack.previous").exists());
     }
 
     #[cfg(unix)]

@@ -279,9 +279,23 @@ pub struct AudioCaptureSession {
     frames: Option<mpsc::Receiver<AudioFrame>>,
     events: Option<mpsc::Receiver<AudioSourceEvent>>,
     control: CaptureControl,
+    format: CaptureFormat,
+    /// Set once the source is gone (device removed, stream error, or the
+    /// default output of a loopback capture changed).
+    invalidated: Arc<AtomicBool>,
 }
 
 impl AudioCaptureSession {
+    /// The PCM format the frames of this capture arrive in.
+    pub fn format(&self) -> CaptureFormat {
+        self.format
+    }
+
+    /// The source failed and cannot resume; start a new capture instead.
+    pub fn is_invalidated(&self) -> bool {
+        self.invalidated.load(Ordering::Acquire)
+    }
+
     pub fn take_frames(&mut self) -> Option<mpsc::Receiver<AudioFrame>> {
         self.frames.take()
     }
@@ -298,6 +312,8 @@ impl AudioCaptureSession {
         self.control.resume()
     }
 
+    /// Stop capturing. Best effort: a stream whose device already failed
+    /// cannot be paused any more, which never keeps a session from stopping.
     pub fn stop(&mut self) -> Result<(), AudioError> {
         self.control.stop()
     }
@@ -315,7 +331,8 @@ enum CaptureControl {
         /// A silent output stream that keeps a loopback endpoint running.
         keep_alive: Option<cpal::Stream>,
         events: mpsc::Sender<AudioSourceEvent>,
-        stopped: AtomicBool,
+        stopped: Arc<AtomicBool>,
+        invalidated: Arc<AtomicBool>,
     },
     #[cfg(target_os = "macos")]
     System(macos::SystemCapture),
@@ -324,10 +341,19 @@ enum CaptureControl {
 impl CaptureControl {
     fn pause(&self) -> Result<(), AudioError> {
         match self {
-            Self::Cpal { stream, events, .. } => {
-                stream
-                    .pause()
-                    .map_err(|error| AudioError::Control(error.to_string()))?;
+            Self::Cpal {
+                stream,
+                events,
+                invalidated,
+                ..
+            } => {
+                // A failed stream delivers nothing any more; pausing it only
+                // errors.
+                if !invalidated.load(Ordering::Acquire) {
+                    stream
+                        .pause()
+                        .map_err(|error| AudioError::Control(error.to_string()))?;
+                }
                 let _ = events.try_send(AudioSourceEvent::Paused);
                 Ok(())
             }
@@ -338,7 +364,17 @@ impl CaptureControl {
 
     fn resume(&self) -> Result<(), AudioError> {
         match self {
-            Self::Cpal { stream, events, .. } => {
+            Self::Cpal {
+                stream,
+                events,
+                invalidated,
+                ..
+            } => {
+                if invalidated.load(Ordering::Acquire) {
+                    return Err(AudioError::Control(
+                        "the audio source is no longer available; start it again".into(),
+                    ));
+                }
                 stream
                     .play()
                     .map_err(|error| AudioError::Control(error.to_string()))?;
@@ -357,14 +393,19 @@ impl CaptureControl {
                 keep_alive,
                 events,
                 stopped,
+                invalidated,
             } => {
                 if !stopped.swap(true, Ordering::SeqCst) {
                     if let Some(keep_alive) = keep_alive {
                         let _ = keep_alive.pause();
                     }
-                    stream
-                        .pause()
-                        .map_err(|error| AudioError::Control(error.to_string()))?;
+                    // After a device error cpal refuses to pause the stream
+                    // forever; the stream is released on drop either way.
+                    if let Err(error) = stream.pause() {
+                        if !invalidated.load(Ordering::Acquire) {
+                            eprintln!("audio stream did not pause on stop: {error}");
+                        }
+                    }
                     let _ = events.try_send(AudioSourceEvent::Stopped);
                 }
                 Ok(())
@@ -389,27 +430,32 @@ fn start_cpal_capture(
 ) -> Result<AudioCaptureSession, AudioError> {
     let sample_format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
+    let format = CaptureFormat {
+        sample_rate_hz: config.sample_rate,
+        channels: config.channels,
+    };
     let (frame_tx, frame_rx) = mpsc::channel(CAPTURE_QUEUE_FRAMES);
     let (event_tx, event_rx) = mpsc::channel(32);
-    let dropped = Arc::new(AtomicBool::new(false));
-    let events = event_tx.clone();
+    let invalidated = Arc::new(AtomicBool::new(false));
+    let sink = StreamSink {
+        frames: frame_tx,
+        events: event_tx.clone(),
+        dropped: Arc::new(AtomicBool::new(false)),
+        invalidated: invalidated.clone(),
+    };
     let stream = match sample_format {
-        SampleFormat::F32 => build_stream::<f32>(device, &config, frame_tx, events, dropped)?,
-        SampleFormat::F64 => build_stream::<f64>(device, &config, frame_tx, events, dropped)?,
-        SampleFormat::I8 => build_stream::<i8>(device, &config, frame_tx, events, dropped)?,
-        SampleFormat::I16 => build_stream::<i16>(device, &config, frame_tx, events, dropped)?,
-        SampleFormat::I24 => {
-            build_stream::<cpal::I24>(device, &config, frame_tx, events, dropped)?
-        }
-        SampleFormat::I32 => build_stream::<i32>(device, &config, frame_tx, events, dropped)?,
-        SampleFormat::I64 => build_stream::<i64>(device, &config, frame_tx, events, dropped)?,
-        SampleFormat::U8 => build_stream::<u8>(device, &config, frame_tx, events, dropped)?,
-        SampleFormat::U16 => build_stream::<u16>(device, &config, frame_tx, events, dropped)?,
-        SampleFormat::U24 => {
-            build_stream::<cpal::U24>(device, &config, frame_tx, events, dropped)?
-        }
-        SampleFormat::U32 => build_stream::<u32>(device, &config, frame_tx, events, dropped)?,
-        SampleFormat::U64 => build_stream::<u64>(device, &config, frame_tx, events, dropped)?,
+        SampleFormat::F32 => build_stream::<f32>(device, &config, sink)?,
+        SampleFormat::F64 => build_stream::<f64>(device, &config, sink)?,
+        SampleFormat::I8 => build_stream::<i8>(device, &config, sink)?,
+        SampleFormat::I16 => build_stream::<i16>(device, &config, sink)?,
+        SampleFormat::I24 => build_stream::<cpal::I24>(device, &config, sink)?,
+        SampleFormat::I32 => build_stream::<i32>(device, &config, sink)?,
+        SampleFormat::I64 => build_stream::<i64>(device, &config, sink)?,
+        SampleFormat::U8 => build_stream::<u8>(device, &config, sink)?,
+        SampleFormat::U16 => build_stream::<u16>(device, &config, sink)?,
+        SampleFormat::U24 => build_stream::<cpal::U24>(device, &config, sink)?,
+        SampleFormat::U32 => build_stream::<u32>(device, &config, sink)?,
+        SampleFormat::U64 => build_stream::<u64>(device, &config, sink)?,
         _ => return Err(AudioError::UnsupportedFormat),
     };
     stream
@@ -423,8 +469,11 @@ fn start_cpal_capture(
             stream,
             keep_alive,
             events: event_tx,
-            stopped: AtomicBool::new(false),
+            stopped: Arc::new(AtomicBool::new(false)),
+            invalidated: invalidated.clone(),
         },
+        format,
+        invalidated,
     })
 }
 
@@ -511,12 +560,18 @@ fn select_microphone_config(
     Ok((device, fallback))
 }
 
+/// Where a cpal input stream delivers its frames and lifecycle events.
+struct StreamSink {
+    frames: mpsc::Sender<AudioFrame>,
+    events: mpsc::Sender<AudioSourceEvent>,
+    dropped: Arc<AtomicBool>,
+    invalidated: Arc<AtomicBool>,
+}
+
 fn build_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    frame_tx: mpsc::Sender<AudioFrame>,
-    event_tx: mpsc::Sender<AudioSourceEvent>,
-    dropped: Arc<AtomicBool>,
+    sink: StreamSink,
 ) -> Result<cpal::Stream, AudioError>
 where
     T: SizedSample + Sample,
@@ -525,7 +580,14 @@ where
     let channels = usize::from(config.channels);
     let output_channels = config.channels;
     let output_sample_rate = config.sample_rate;
+    let StreamSink {
+        frames: frame_tx,
+        events: event_tx,
+        dropped,
+        invalidated,
+    } = sink;
     let error_events = event_tx.clone();
+    let error_dropped = dropped.clone();
     device
         .build_input_stream::<T, _, _>(
             config,
@@ -547,10 +609,19 @@ where
                     let _ = event_tx.try_send(AudioSourceEvent::Overflow);
                 }
             },
-            move |error| {
-                let _ = error_events.try_send(AudioSourceEvent::DeviceRemoved {
-                    message: error.to_string(),
-                });
+            move |error| match error {
+                // A glitch, not a lost device: flag the gap and keep going.
+                cpal::StreamError::BufferUnderrun => {
+                    error_dropped.store(true, Ordering::Relaxed);
+                    let _ = error_events.try_send(AudioSourceEvent::Overflow);
+                }
+                error => {
+                    if !invalidated.swap(true, Ordering::AcqRel) {
+                        let _ = error_events.try_send(AudioSourceEvent::DeviceRemoved {
+                            message: error.to_string(),
+                        });
+                    }
+                }
             },
             None,
         )
@@ -605,8 +676,72 @@ mod windows_loopback {
         // A loopback stream only receives packets while the endpoint renders;
         // silence keeps it running when nothing else plays, so the pipeline
         // sees continuous (silent) audio instead of a stalled source.
-        let keep_alive = silent_output(&device, &config).ok();
-        start_cpal_capture(&device, config, keep_alive)
+        let keep_alive = match silent_output(&device, &config) {
+            Ok(stream) => Some(stream),
+            Err(error) => {
+                eprintln!(
+                    "system audio keep-alive stream unavailable ({error}); \
+                     loopback delivers audio only while something plays"
+                );
+                None
+            }
+        };
+        let session = start_cpal_capture(&device, config, keep_alive)?;
+        if let (Ok(id), CaptureControl::Cpal {
+            events, stopped, ..
+        }) = (device.id(), &session.control)
+        {
+            watch_default_output(
+                id.to_string(),
+                events.clone(),
+                stopped.clone(),
+                session.invalidated.clone(),
+            );
+        }
+        Ok(session)
+    }
+
+    /// Loopback stays bound to the endpoint it was opened on. When the user
+    /// switches the default output (say, to headphones) the capture would go
+    /// silent without an error, so report it as a removed device: the
+    /// session pauses for recovery and Resume opens the new default.
+    fn watch_default_output(
+        device_id: String,
+        events: mpsc::Sender<AudioSourceEvent>,
+        stopped: Arc<AtomicBool>,
+        invalidated: Arc<AtomicBool>,
+    ) {
+        const POLL: std::time::Duration = std::time::Duration::from_millis(1500);
+        const STEP: std::time::Duration = std::time::Duration::from_millis(100);
+        let watcher = std::thread::Builder::new()
+            .name("echolingo-loopback-watch".into())
+            .spawn(move || loop {
+                let mut waited = std::time::Duration::ZERO;
+                while waited < POLL {
+                    if stopped.load(Ordering::Acquire) || invalidated.load(Ordering::Acquire) {
+                        return;
+                    }
+                    std::thread::sleep(STEP);
+                    waited += STEP;
+                }
+                let current = cpal::default_host()
+                    .default_output_device()
+                    .and_then(|device| device.id().ok())
+                    .map(|id| id.to_string());
+                if current.as_deref() != Some(device_id.as_str()) {
+                    if !invalidated.swap(true, Ordering::AcqRel) {
+                        let _ = events.try_send(AudioSourceEvent::DeviceRemoved {
+                            message: "The default output device changed; resume to capture \
+                                      the new one"
+                                .into(),
+                        });
+                    }
+                    return;
+                }
+            });
+        if let Err(error) = watcher {
+            eprintln!("cannot watch the default output device: {error}");
+        }
     }
 
     fn silent_output(
@@ -682,6 +817,7 @@ mod macos {
         events: mpsc::Sender<AudioSourceEvent>,
         paused: AtomicBool,
         dropped: AtomicBool,
+        invalidated: Arc<AtomicBool>,
     }
 
     pub(super) struct SystemCapture {
@@ -769,7 +905,10 @@ mod macos {
             3 => AudioSourceEvent::Started,
             4 => AudioSourceEvent::Stopped,
             5 => AudioSourceEvent::PickerCancelled,
-            -2 => AudioSourceEvent::DeviceRemoved { message },
+            -2 => {
+                context.invalidated.store(true, Ordering::Release);
+                AudioSourceEvent::DeviceRemoved { message }
+            }
             _ => AudioSourceEvent::Error {
                 message,
                 recoverable: true,
@@ -779,13 +918,16 @@ mod macos {
     }
 
     pub(super) fn start() -> Result<AudioCaptureSession, AudioError> {
+        let format = system_audio_format()?;
         let (frame_tx, frame_rx) = mpsc::channel(CAPTURE_QUEUE_FRAMES);
         let (event_tx, event_rx) = mpsc::channel(32);
+        let invalidated = Arc::new(AtomicBool::new(false));
         let context = Box::into_raw(Box::new(CallbackContext {
             frames: frame_tx,
             events: event_tx.clone(),
             paused: AtomicBool::new(false),
             dropped: AtomicBool::new(false),
+            invalidated: invalidated.clone(),
         }));
         let handle = unsafe {
             el_macos_system_audio_create(audio_callback, state_callback, context.cast::<c_void>())
@@ -804,6 +946,8 @@ mod macos {
                 events: event_tx,
                 stopped: AtomicBool::new(false),
             }),
+            format,
+            invalidated,
         })
     }
 }

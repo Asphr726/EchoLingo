@@ -1,4 +1,5 @@
 fn main() {
+    println!("cargo:rerun-if-changed=native/macos_capture.mm");
     // Build scripts run on the host; key the native capture on the target so
     // cross-checks for Windows or Linux from a Mac skip it.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
@@ -22,5 +23,4 @@ fn main() {
     ] {
         println!("cargo:rustc-link-lib=framework={framework}");
     }
-    println!("cargo:rerun-if-changed=native/macos_capture.mm");
 }

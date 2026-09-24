@@ -11,6 +11,11 @@ use std::process::ExitStatus;
 use std::time::Duration;
 use tokio::process::{Child, Command};
 
+/// How long [`ProcessTree::terminate`] waits on Windows for every process
+/// of a terminated job to be gone.
+#[cfg(windows)]
+const JOB_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Prepare `command` for a background helper: no console window on Windows,
 /// a fresh process group on Unix, and a kill when the handle is dropped.
 pub fn configure_background(command: &mut Command) -> &mut Command {
@@ -68,7 +73,9 @@ impl ProcessTree {
     /// `grace` to exit before SIGKILL; on Windows, which has no equivalent
     /// signal for windowless processes, the job is terminated at once (ask
     /// the process to exit through its own channel and [`Self::wait_timeout`]
-    /// first when it supports a graceful shutdown).
+    /// first when it supports a graceful shutdown). On Windows the call also
+    /// waits (bounded) until the job is empty, because `TerminateJobObject`
+    /// returns before the grandchildren have exited and released their files.
     pub async fn terminate(&mut self, grace: Duration) -> io::Result<ExitStatus> {
         #[cfg(unix)]
         {
@@ -89,6 +96,8 @@ impl ProcessTree {
             }
         }
         let status = self.child.wait().await?;
+        #[cfg(windows)]
+        self.group.wait_until_empty(JOB_EXIT_TIMEOUT).await;
         self.finished = true;
         Ok(status)
     }
@@ -165,6 +174,19 @@ impl Group {
             let _ = job.terminate();
         }
     }
+
+    /// Poll the job until no process is left in it, for at most `timeout`.
+    async fn wait_until_empty(&self, timeout: Duration) {
+        let Some(job) = &self.job else {
+            return;
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        while job.active_processes().is_ok_and(|active| active > 0)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -235,7 +257,6 @@ mod job {
             Ok(())
         }
 
-        #[cfg_attr(not(test), allow(dead_code))]
         pub(crate) fn active_processes(&self) -> io::Result<u32> {
             let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
             let queried = unsafe {
@@ -377,15 +398,8 @@ mod tests {
         }
         assert!(active >= 2, "expected cmd and ping in the job, saw {active}");
         tree.terminate(Duration::from_millis(300)).await.unwrap();
+        // terminate() only returns once the grandchild is gone as well.
         let job = tree.group.job.as_ref().unwrap();
-        let mut remaining = u32::MAX;
-        for _ in 0..100 {
-            remaining = job.active_processes().unwrap();
-            if remaining == 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert_eq!(remaining, 0);
+        assert_eq!(job.active_processes().unwrap(), 0);
     }
 }
