@@ -275,7 +275,21 @@ def wait_healthy(services: list[Service], timeout_s: float) -> dict[str, float]:
         time.sleep(0.5)
 
 
-def qwen_command(sidecar: Path, model: Path, port: int, device: str) -> list[str]:
+def streaming_args(overrides: list[str]) -> list[str]:
+    """QWEN_STREAMING_ARGS with ``name=value`` overrides (e.g. ``chunk-sec=2``)."""
+    values = dict(zip(QWEN_STREAMING_ARGS[0::2], QWEN_STREAMING_ARGS[1::2]))
+    for override in overrides:
+        name, _, value = override.partition("=")
+        flag = f"--qwen3-streaming-{name}"
+        if flag not in values or not value:
+            raise SystemExit(f"unknown streaming override {override!r}")
+        values[flag] = value
+    return [item for pair in values.items() for item in pair]
+
+
+def qwen_command(
+    sidecar: Path, model: Path, port: int, device: str, streaming: list[str] | None = None
+) -> list[str]:
     # Same arguments as LocalRuntimeManager::command_for("qwen_asr").
     return [
         str(sidecar), "qwen-asr-server",
@@ -287,7 +301,7 @@ def qwen_command(sidecar: Path, model: Path, port: int, device: str) -> list[str
         "--pcm-input", "--no-vac", "--no-vad",
         "--warmup-file", "",
         "--qwen3-streaming-device", device,
-        *QWEN_STREAMING_ARGS,
+        *(streaming or QWEN_STREAMING_ARGS),
         "--log-level", "INFO",
     ]  # fmt: skip
 
@@ -456,6 +470,13 @@ def main() -> int:
     parser.add_argument("--gpu-pack-manifest", type=Path, help="outer GPU pack manifest next to its parts")
     parser.add_argument("--gpu-pack-dest", type=Path, help="where to unpack the GPU pack")
     parser.add_argument("--device", default="auto", help="--qwen3-streaming-device")
+    parser.add_argument(
+        "--qwen-streaming",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="override a desktop streaming default, e.g. chunk-sec=2 or left-context-sec=8",
+    )
     parser.add_argument("--pace", type=float, default=1.0, help="audio speed; 0 sends as fast as possible")
     parser.add_argument("--cache", type=Path, default=ROOT / "target" / "smoke-cache")
     parser.add_argument("--log-dir", type=Path, default=ROOT / "target" / "smoke-logs")
@@ -484,7 +505,7 @@ def main() -> int:
         qwen_port, mt_port = free_port(), free_port()
         qwen = Service(
             "qwen-asr-server",
-            qwen_command(sidecar, asr_model, qwen_port, args.device),
+            qwen_command(sidecar, asr_model, qwen_port, args.device, streaming_args(args.qwen_streaming)),
             child_environment({"WLK_API_TOKEN": token}),
             qwen_port,
             args.log_dir / "qwen_asr.log",

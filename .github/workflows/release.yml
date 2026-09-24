@@ -277,6 +277,18 @@ jobs:
           python scripts/smoke_models.py --install-root "$INSTALL_ROOT"
           --models-dir "$RUNNER_TEMP/模型 目录"
           --log-dir "$RUNNER_TEMP/smoke-logs/cpu" --label "${{ matrix.name }} installed CPU runtime"
+      # Report only: how lighter streaming profiles keep up on a small CPU.
+      - name: CPU streaming profiles (report only)
+        continue-on-error: true
+        shell: bash
+        run: |
+          for profile in "chunk-sec=2" "chunk-sec=2 left-context-sec=8" "chunk-sec=2 left-context-sec=6"; do
+            args=()
+            for value in $profile; do args+=(--qwen-streaming "$value"); done
+            python scripts/smoke_models.py --install-root "$INSTALL_ROOT" \
+              --models-dir "$RUNNER_TEMP/模型 目录" --log-dir "$RUNNER_TEMP/smoke-logs/profiles" \
+              --label "${{ matrix.name }} CPU, $profile" "${args[@]}"
+          done
       - uses: actions/download-artifact@v8
         if: needs.gpu-pack.result == 'success'
         with:
