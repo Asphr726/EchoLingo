@@ -1,19 +1,22 @@
 import { Warning } from "@phosphor-icons/react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/bridge";
-import { gpuCardView, gpuProgress } from "../lib/gpu";
+import { GPU_STATUS_POLL_MS, gpuCardView, gpuInstallQuiet, gpuProgress, gpuProgressOutcome } from "../lib/gpu";
 import type { GpuAccelerationStatus, ModelProgress } from "../types";
 
 type GpuAction = "install" | "remove" | "toggle";
 
 /** GPU pack status plus its actions. The status reloads when a download
- *  reports ready and when a session starts or stops, since the runtime may
- *  fall back to the CPU while one starts. A shell without the commands
- *  leaves the status null, so nothing is shown. */
+ *  reports ready or failed and when a session starts or stops, since the
+ *  runtime may fall back to the CPU while one starts. A shell without the
+ *  commands leaves the status null, so nothing is shown. */
 export function useGpuAcceleration(progress: ModelProgress | undefined, sessionActive: boolean) {
   const [status, setStatus] = useState<GpuAccelerationStatus | null>(null);
   const [pending, setPending] = useState<GpuAction | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const lastProgressAt = useRef(0);
+  // The last event from before this card mounted is history, not news.
+  const seenProgress = useRef(progress);
 
   const reload = useCallback(async () => {
     try {
@@ -27,10 +30,31 @@ export function useGpuAcceleration(progress: ModelProgress | undefined, sessionA
     void reload();
   }, [reload, sessionActive]);
 
-  const phase = progress?.phase;
+  // Every event is a new object, so a failure right after another one
+  // still counts.
   useEffect(() => {
-    if (phase === "ready") void reload();
-  }, [phase, reload]);
+    if (!progress || progress === seenProgress.current) return;
+    seenProgress.current = progress;
+    lastProgressAt.current = Date.now();
+    const outcome = gpuProgressOutcome(progress);
+    if (outcome.error) {
+      setError(outcome.error);
+      // The install command may still be settling; the buttons come back now.
+      setPending((current) => (current === "install" ? null : current));
+    }
+    if (outcome.reload) void reload();
+  }, [progress, reload]);
+
+  // An install this window did not start (or one whose events stopped) must
+  // not leave the card on "Installing…": ask for the status while it lasts.
+  const shellInstalling = status?.pack_state === "installing";
+  useEffect(() => {
+    if (!shellInstalling) return;
+    const timer = window.setInterval(() => {
+      if (gpuInstallQuiet("installing", lastProgressAt.current, Date.now())) void reload();
+    }, GPU_STATUS_POLL_MS);
+    return () => window.clearInterval(timer);
+  }, [reload, shellInstalling]);
 
   const run = async (action: GpuAction, call: () => Promise<GpuAccelerationStatus>) => {
     setPending(action);
@@ -82,8 +106,7 @@ export function GpuAccelerationCard({
   const view = gpuCardView(status, { installing, sessionActive });
   if (!view) return null;
   const locked = Boolean(view.lockedReason) || pending !== null || installing;
-  // A finished earlier download must not show as the start of a new one.
-  const bar = gpuProgress(progress?.phase === "ready" ? undefined : progress);
+  const bar = gpuProgress(progress);
   return (
     <>
       <div className="model-list">

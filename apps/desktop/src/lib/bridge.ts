@@ -134,8 +134,9 @@ function previewPlatformFixtures() {
 }
 
 // GPU acceleration pack of the preview. `&gpu=eligible|ineligible|none|
-// installed|update|fallback` shows the Windows and Linux card; without it the
-// platform has none, as on macOS.
+// installed|update|fallback|failing` shows the Windows and Linux card
+// (`failing` fails its download halfway); without it the platform has none,
+// as on macOS.
 const previewRtx = { name: "NVIDIA GeForce RTX 3060 Laptop GPU", compute_capability: "8.6", driver_version: "581.15" };
 const previewGpuUnsupported: GpuAccelerationStatus = {
   supported_platform: false,
@@ -174,6 +175,7 @@ function previewGpu(): GpuAccelerationStatus {
   if (previewGpuState) return previewGpuState;
   switch (previewParam("gpu")) {
     case "eligible":
+    case "failing":
       return (previewGpuState = previewGpuEligible);
     case "ineligible":
       return (previewGpuState = {
@@ -203,13 +205,19 @@ function previewGpu(): GpuAccelerationStatus {
 async function previewInstallGpuPack(): Promise<GpuAccelerationStatus> {
   const total = previewGpu().download_bytes ?? 2_791_728_742;
   const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
-  const emit = (phase: string, bytes: number) =>
-    emitPreviewProgress({ model_id: "gpu-pack", bytes_completed: bytes, total_bytes: total, bytes_per_second: 48_000_000, phase });
+  const emit = (phase: string, bytes: number, message?: string) =>
+    emitPreviewProgress({ model_id: "gpu-pack", bytes_completed: bytes, total_bytes: total, bytes_per_second: 48_000_000, phase, message });
   previewGpuState = { ...previewGpu(), pack_state: "installing" };
   emit("starting", 0);
   for (let step = 1; step <= 20; step += 1) {
     await sleep(160);
     emit("downloading", Math.round((total * step) / 20));
+    if (step === 10 && previewParam("gpu") === "failing") {
+      const message = "Part 2 of 2 failed its SHA-256 check; download it again.";
+      previewGpuState = previewGpuEligible;
+      emit("failed", Math.round(total / 2), message);
+      throw new Error(message);
+    }
   }
   for (const phase of ["verifying", "extracting", "testing"]) {
     await sleep(700);
@@ -427,7 +435,8 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
       case "set_gpu_acceleration": {
         const enabled = Boolean(args?.enabled);
         const current = previewGpu();
-        previewGpuState = { ...current, enabled, active: enabled && current.pack_state === "ready" && !current.fallback_reason };
+        // Switching clears a fallback, as the shell does.
+        previewGpuState = { ...current, enabled, fallback_reason: null, active: enabled && current.pack_state === "ready" };
         return previewGpuState as T;
       }
     }

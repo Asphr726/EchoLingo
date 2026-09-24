@@ -314,16 +314,17 @@ export function SettingsView() {
                         {model.state === "ready" ? (
                           <>
                             <button className="button" type="button" disabled={busy} onClick={() => void updateModel(model.id, "verify")}>Verify</button>
-                            <button className="button" type="button" disabled={busy} onClick={() => void updateModel(model.id, "delete")}>Delete</button>
+                            <button className="button" type="button" disabled={busy || sessionActive} title={sessionActive ? modelsLockedReason : undefined} onClick={() => void updateModel(model.id, "delete")}>Delete</button>
                           </>
                         ) : (
-                          <button className="button button--primary" type="button" disabled={busy} onClick={() => void updateModel(model.id, "install")}>{model.state === "corrupt" ? "Retry" : "Download"}</button>
+                          <button className="button button--primary" type="button" disabled={busy || sessionActive} title={sessionActive ? modelsLockedReason : undefined} onClick={() => void updateModel(model.id, "install")}>{model.state === "corrupt" ? "Retry" : "Download"}</button>
                         )}
                       </div>
                     </article>
                   );
                 })}
               </div>
+              {sessionActive && <p className="settings-helper">{modelsLockedReason}</p>}
               {modelError && <p className="settings-error" role="alert">{modelError}</p>}
             </SettingsGroup>
             <GpuAccelerationSettings progress={modelProgress[GPU_PACK_PROGRESS_ID]} sessionActive={sessionActive} />
@@ -486,6 +487,10 @@ export function SettingsView() {
     </div>
   );
 }
+
+/** The running session's local services hold the model files, so the
+ *  shell refuses downloads and deletions until it stops. */
+const modelsLockedReason = "Stop the current session to download or delete models.";
 
 /** Settings → Models: the NVIDIA GPU acceleration pack, shown only where it
  *  exists (Windows and Linux). */

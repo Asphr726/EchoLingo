@@ -505,7 +505,7 @@ function TranscriptStage() {
             onTouchMove={(event) => {
               const y = event.touches[0]?.clientY;
               // A finger moving down drags older lines into view.
-              if (touchYRef.current !== null && y !== undefined && y > touchYRef.current + 2) scrollBack();
+              if (touchYRef.current !== null && y !== undefined && y > touchYRef.current + 2 && event.currentTarget.scrollTop > 0) scrollBack();
             }}
             onScroll={(event) => {
               const feed = event.currentTarget;

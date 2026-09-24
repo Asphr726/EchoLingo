@@ -418,6 +418,8 @@ export interface ModelProgress {
   total_bytes: number;
   bytes_per_second: number | null;
   phase: string;
+  /** Why a `failed` phase failed, when the shell says. */
+  message?: string | null;
 }
 
 export type GpuPackState = "not_installed" | "installing" | "ready" | "update_required" | "corrupt";
@@ -448,6 +450,9 @@ export interface GpuAccelerationStatus {
   active: boolean;
   /** Set when the GPU runtime failed and the app went back to the CPU. */
   fallback_reason: string | null;
+  /** Whether the pack's Vulkan translation runtime passed its own check,
+   *  apart from CUDA; missing from shells that do not report it. */
+  llama_gpu_ok?: boolean | null;
 }
 
 export interface SessionRecord {

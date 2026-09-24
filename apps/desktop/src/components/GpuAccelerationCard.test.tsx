@@ -30,14 +30,19 @@ const installed: GpuAccelerationStatus = {
 
 function render(
   status: GpuAccelerationStatus,
-  { pending = null, progress, sessionActive = false }: { pending?: "install" | "remove" | "toggle" | null; progress?: ModelProgress; sessionActive?: boolean } = {},
+  {
+    error = null,
+    pending = null,
+    progress,
+    sessionActive = false,
+  }: { error?: string | null; pending?: "install" | "remove" | "toggle" | null; progress?: ModelProgress; sessionActive?: boolean } = {},
 ) {
   return renderToStaticMarkup(
     <GpuAccelerationCard
       status={status}
       progress={progress}
       pending={pending}
-      error={null}
+      error={error}
       sessionActive={sessionActive}
       onInstall={() => undefined}
       onRemove={() => undefined}
@@ -89,6 +94,16 @@ describe("GpuAccelerationCard", () => {
     const html = render({ ...installed, active: false, fallback_reason: "CUDA error: out of memory" });
     expect(html).toContain('class="settings-note settings-note--warning" role="status"');
     expect(html).toContain("CUDA error: out of memory");
+  });
+
+  it("shows a failed install and offers the download again", () => {
+    const html = render(eligible, {
+      error: "Part 2 of 2 failed its SHA-256 check; download it again.",
+      progress: { model_id: "gpu-pack", phase: "failed", bytes_completed: 0, total_bytes: 0, bytes_per_second: null, message: "x" },
+    });
+    expect(html).toContain('<p class="settings-error" role="alert">Part 2 of 2 failed its SHA-256 check; download it again.</p>');
+    expect(html).toContain('<button class="button button--primary" type="button">Download</button>');
+    expect(html).not.toContain("model-progress");
   });
 
   it("asks for an update of an outdated pack", () => {
