@@ -17,6 +17,7 @@ import importlib
 import json
 import os
 import platform
+import re
 import ssl
 import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -178,6 +179,10 @@ def check_ssl() -> str:
     count = ssl_ca_certificate_count()
     source = "SSL_CERT_FILE" if os.environ.get("SSL_CERT_FILE") else "default paths"
     if count <= 0:
+        # OpenSSL loads an SSL_CERT_DIR lazily, so its roots are not counted.
+        directory = os.environ.get("SSL_CERT_DIR")
+        if directory and os.path.isdir(directory):
+            return f"{ssl.OPENSSL_VERSION}; CA directory from SSL_CERT_DIR"
         raise RuntimeError(f"no CA certificates loaded from {source}")
     return f"{ssl.OPENSSL_VERSION}; {count} CA certificates from {source}"
 
@@ -263,6 +268,51 @@ def _matmul_matches(torch: Any, device: str, dtype: Any) -> bool:
     return bool(torch.equal(actual.float().cpu(), expected))
 
 
+_ARCH_TOKEN = re.compile(r"(sm|compute)_(\d+[a-z]?)")
+_ARCH_VERSION = re.compile(r"(\d+)\.(\d+)([a-z]?)(\+ptx)?")
+
+
+def normalise_arch_flags(flags: object) -> list[str]:
+    """``sm_XX`` entries (``compute_XX`` for PTX) from torch's arch flag string.
+
+    Accepts the ``sm_75 sm_80 … compute_120`` form torch reports as well as
+    ``TORCH_CUDA_ARCH_LIST``-style ``7.5;8.6+PTX`` entries.
+    """
+    archs: list[str] = []
+
+    def add(arch: str) -> None:
+        if arch not in archs:
+            archs.append(arch)
+
+    for token in re.split(r"[\s;,]+", str(flags or "").strip().lower()):
+        if match := _ARCH_TOKEN.fullmatch(token):
+            add(f"{match.group(1)}_{match.group(2)}")
+        elif match := _ARCH_VERSION.fullmatch(token):
+            number = f"{match.group(1)}{match.group(2)}{match.group(3)}"
+            add(f"sm_{number}")
+            if match.group(4):
+                add(f"compute_{number}")
+    return archs
+
+
+def compiled_arch_list(torch: Any) -> list[str]:
+    """CUDA architectures compiled into torch, also on a machine without a GPU.
+
+    ``torch.cuda.get_arch_list()`` returns [] whenever CUDA is unavailable, so
+    fall back to the build's arch flags for the install record.
+    """
+    try:
+        archs = [str(arch) for arch in torch.cuda.get_arch_list()]
+    except Exception:
+        archs = []
+    if archs:
+        return archs
+    try:
+        return normalise_arch_flags(torch._C._cuda_getArchFlags())
+    except Exception:
+        return []
+
+
 def cuda_report(torch_module: Any | None = None) -> dict[str, Any]:
     report: dict[str, Any] = {
         "torch_version": None,
@@ -271,6 +321,7 @@ def cuda_report(torch_module: Any | None = None) -> dict[str, Any]:
         "device_name": None,
         "capability": None,
         "bf16": None,
+        "model_dtype": None,
         "arch_list": [],
         "matmul_ok": None,
         "error": None,
@@ -280,7 +331,7 @@ def cuda_report(torch_module: Any | None = None) -> dict[str, Any]:
         report["torch_version"] = str(torch.__version__)
         cuda_version = getattr(torch.version, "cuda", None)
         report["cuda_version"] = str(cuda_version) if cuda_version else None
-        report["arch_list"] = [str(arch) for arch in torch.cuda.get_arch_list()]
+        report["arch_list"] = compiled_arch_list(torch)
         report["available"] = bool(torch.cuda.is_available())
     except Exception as error:
         report["error"] = _error_detail(error)
@@ -288,16 +339,18 @@ def cuda_report(torch_module: Any | None = None) -> dict[str, Any]:
     if not report["available"]:
         return report
     try:
-        from .qwen_server import cuda_bf16_supported
+        from .qwen_server import cuda_bf16_supported, cuda_model_dtype
 
         report["device_name"] = str(torch.cuda.get_device_name(0))
         major, minor = torch.cuda.get_device_capability(0)
         report["capability"] = f"{major}.{minor}"
         report["bf16"] = cuda_bf16_supported(torch)
         # float32 plus the dtype the Qwen server will load the model in.
-        model_dtype = torch.bfloat16 if report["bf16"] else torch.float16
+        model_dtype = cuda_model_dtype(torch)
+        report["model_dtype"] = str(model_dtype).removeprefix("torch.")
         report["matmul_ok"] = all(
-            _matmul_matches(torch, "cuda", dtype) for dtype in (torch.float32, model_dtype)
+            _matmul_matches(torch, "cuda", dtype)
+            for dtype in dict.fromkeys((torch.float32, model_dtype))
         )
     except Exception as error:
         report["error"] = _error_detail(error)
@@ -359,21 +412,31 @@ def _safe_ca_count() -> int:
         return 0
 
 
-def _flush_c_stdio() -> None:
-    if sys.platform == "win32":
-        return
+def _flush_stdio() -> None:
+    """Flush Python's and the C runtime's stdout/stderr buffers."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
     try:
         import ctypes
-
-        ctypes.CDLL(None).fflush(None)
-    except Exception:
-        pass
+    except ImportError:
+        return
+    # Extension modules share the Universal CRT on Windows (older MinGW
+    # builds use msvcrt); elsewhere the process's libc.
+    runtimes = ("ucrtbase", "msvcrt") if sys.platform == "win32" else (None,)
+    for runtime in runtimes:
+        try:
+            ctypes.CDLL(runtime).fflush(None)
+        except Exception:
+            pass
 
 
 @contextlib.contextmanager
 def _stdout_to_stderr() -> Iterator[None]:
     """Route Python and native writes to stdout into stderr for the block."""
-    sys.stdout.flush()
+    _flush_stdio()
     try:
         saved = os.dup(1)
         os.dup2(2, 1)
@@ -383,10 +446,23 @@ def _stdout_to_stderr() -> Iterator[None]:
         with contextlib.redirect_stdout(sys.stderr):
             yield
     finally:
-        _flush_c_stdio()
+        # Buffered native output must drain into stderr, not the JSON line.
+        _flush_stdio()
         if saved is not None:
             os.dup2(saved, 1)
             os.close(saved)
+
+
+def _seal_stdout() -> None:
+    """Point fd 1 at stderr for the rest of the process after the JSON line.
+
+    Whatever a native library prints while the interpreter shuts down then
+    cannot follow the report on stdout.
+    """
+    try:
+        os.dup2(2, 1)
+    except OSError:
+        pass
 
 
 def main(
@@ -415,6 +491,8 @@ def main(
         )
     stdout.write(json.dumps(report, separators=(",", ":")) + "\n")
     stdout.flush()
+    # Seal right away: anything still buffered in native code drains to stderr.
+    _seal_stdout()
     return 0 if report["ok"] else 1
 
 

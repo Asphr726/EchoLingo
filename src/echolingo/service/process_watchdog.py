@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import os
 import signal
 import subprocess
@@ -8,7 +9,7 @@ import threading
 import time
 from collections.abc import Callable, Sequence
 
-from .parent_watchdog import parent_process_alive
+from .parent_watchdog import watch_parent
 
 
 def _child_creationflags() -> int:
@@ -34,12 +35,18 @@ def run_child_until_parent_exit(
     *,
     parent_process_id: int | None = None,
     poll_seconds: float = 0.25,
-    alive: Callable[[int], bool] = parent_process_alive,
+    alive: Callable[[int], bool] | None = None,
 ) -> int:
     """Run a native model server and reap it when the Desktop owner disappears."""
     if not command:
         raise ValueError("watch-process requires a child command")
     parent_process_id = parent_process_id or int(os.environ["ECHOLINGO_PARENT_PID"])
+    # Set up before the child starts (on Windows: one handle to the owner).
+    parent_alive = (
+        watch_parent(parent_process_id)
+        if alive is None
+        else functools.partial(alive, parent_process_id)
+    )
     child = subprocess.Popen(
         list(command),
         stdin=subprocess.DEVNULL,
@@ -53,7 +60,7 @@ def run_child_until_parent_exit(
     previous = {number: signal.signal(number, request_stop) for number in _stop_signals()}
     try:
         while child.poll() is None:
-            if stopping.is_set() or not alive(parent_process_id):
+            if stopping.is_set() or not parent_alive():
                 child.terminate()
                 try:
                     child.wait(timeout=5.0)

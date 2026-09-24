@@ -20,6 +20,7 @@ CUDA_KEYS = {
     "device_name",
     "capability",
     "bf16",
+    "model_dtype",
     "arch_list",
     "matmul_ok",
     "error",
@@ -71,8 +72,11 @@ class _FakeCuda:
         return self.native_bf16
 
 
+CU130_FLAGS = "sm_75 sm_80 sm_86 sm_90 sm_100 sm_120 compute_120"
+
+
 def _fake_torch(*, available: bool, cuda_version: str | None = "13.0", native_bf16: bool = True):
-    return types.SimpleNamespace(
+    torch = types.SimpleNamespace(
         __version__="2.13.0+cu130" if cuda_version else "2.13.0+cpu",
         version=types.SimpleNamespace(cuda=cuda_version),
         cuda=_FakeCuda(available=available, native_bf16=native_bf16),
@@ -80,6 +84,10 @@ def _fake_torch(*, available: bool, cuda_version: str | None = "13.0", native_bf
         bfloat16="bfloat16",
         float16="float16",
     )
+    if cuda_version:
+        # CPU builds have no CUDA arch flags at all.
+        torch._C = types.SimpleNamespace(_cuda_getArchFlags=lambda: CU130_FLAGS)
+    return torch
 
 
 def test_self_test_prints_one_json_object_and_exits_zero_when_all_checks_pass(
@@ -104,6 +112,27 @@ def test_self_test_prints_one_json_object_and_exits_zero_when_all_checks_pass(
     assert report["cuda"] is None
     # Whatever a library prints goes to stderr, never into the JSON channel.
     assert "library chatter" in captured.err
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="libc printf via ctypes")
+def test_buffered_native_stdout_never_trails_the_json_line(monkeypatch, capfd) -> None:
+    import ctypes
+
+    libc = ctypes.CDLL(None)
+
+    def native_chatter() -> str:
+        # Buffered by C stdio (stdout is not a terminal here) until flushed.
+        libc.printf(b"native chatter")
+        return "native"
+
+    _stub_checks(monkeypatch, native=native_chatter)
+
+    assert self_test.main([]) == 0
+    libc.fflush(None)
+
+    captured = capfd.readouterr()
+    assert _only_json_line(captured.out)["checks"]["native"]["ok"] is True
+    assert "native chatter" in captured.err
 
 
 def test_one_failing_check_fails_the_run_but_every_check_still_runs(monkeypatch, capfd) -> None:
@@ -169,7 +198,29 @@ def test_cuda_report_without_a_gpu_is_not_a_failure(capfd, monkeypatch) -> None:
     assert cuda["torch_version"] == "2.13.0+cpu"
     assert cuda["device_name"] is None and cuda["capability"] is None
     assert cuda["bf16"] is None and cuda["matmul_ok"] is None and cuda["error"] is None
+    assert cuda["model_dtype"] is None and cuda["arch_list"] == []
     assert report["checks"]["cuda"]["ok"] is True
+
+
+def test_cuda_build_without_a_gpu_still_reports_its_compiled_archs() -> None:
+    report = self_test.run_self_test(
+        cuda=True, checks={}, torch_module=_fake_torch(available=False)
+    )
+
+    cuda = report["cuda"]
+    assert report["ok"] is True and cuda["available"] is False
+    assert cuda["arch_list"] == CU130_FLAGS.split()
+
+
+def test_arch_flags_are_normalised() -> None:
+    assert self_test.normalise_arch_flags(" sm_75 sm_80  SM_90a compute_120 sm_80") == [
+        "sm_75", "sm_80", "sm_90a", "compute_120"
+    ]
+    assert self_test.normalise_arch_flags("7.5;8.6;12.0+PTX") == [
+        "sm_75", "sm_86", "sm_120", "compute_120"
+    ]
+    assert self_test.normalise_arch_flags(None) == []
+    assert self_test.normalise_arch_flags("-O3 garbage") == []
 
 
 def test_cuda_report_describes_a_usable_gpu(monkeypatch) -> None:
@@ -182,7 +233,7 @@ def test_cuda_report_describes_a_usable_gpu(monkeypatch) -> None:
 
     monkeypatch.setattr(self_test, "_matmul_matches", matmul)
     report = self_test.run_self_test(
-        cuda=True, checks={}, torch_module=_fake_torch(available=True, native_bf16=False)
+        cuda=True, checks={}, torch_module=_fake_torch(available=True, native_bf16=True)
     )
 
     cuda = report["cuda"]
@@ -191,11 +242,21 @@ def test_cuda_report_describes_a_usable_gpu(monkeypatch) -> None:
     assert cuda["cuda_version"] == "13.0"
     assert cuda["device_name"] == "NVIDIA GeForce RTX 3060"
     assert cuda["capability"] == "8.6"
-    assert cuda["bf16"] is False
+    assert cuda["bf16"] is True
+    assert cuda["model_dtype"] == "bfloat16"
     assert cuda["arch_list"] == ["sm_75", "sm_80", "sm_120"]
     assert cuda["matmul_ok"] is True
-    # float32 plus the dtype the Qwen server picks (fp16 without native bf16).
-    assert dtypes == ["float32", "float16"]
+    # float32 plus the dtype the Qwen server loads the model in.
+    assert dtypes == ["float32", "bfloat16"]
+
+    # Without native bf16 the model runs in float32 (never float16).
+    dtypes.clear()
+    report = self_test.run_self_test(
+        cuda=True, checks={}, torch_module=_fake_torch(available=True, native_bf16=False)
+    )
+    assert report["cuda"]["bf16"] is False
+    assert report["cuda"]["model_dtype"] == "float32"
+    assert dtypes == ["float32"]
 
 
 def test_cuda_matmul_failure_fails_the_self_test(monkeypatch) -> None:
@@ -267,18 +328,56 @@ def test_entrypoint_dispatches_self_test_with_the_qwen_shims(monkeypatch) -> Non
 def test_frozen_entrypoint_uses_the_bundled_ca_file_unless_one_is_set(monkeypatch) -> None:
     certifi = pytest.importorskip("certifi")
     entry = _load_entrypoint()
-    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.setattr(sys, "platform", "darwin")
 
-    entry._configure_certificate_bundle()
-    assert "SSL_CERT_FILE" not in entry.os.environ  # source runs keep OpenSSL defaults
+    environ: dict[str, str] = {}
+    entry._configure_certificate_bundle(environ)
+    assert environ == {}  # source runs keep OpenSSL defaults
 
     monkeypatch.setattr(sys, "frozen", True, raising=False)
-    entry._configure_certificate_bundle()
-    assert entry.os.environ["SSL_CERT_FILE"] == certifi.where()
+    entry._configure_certificate_bundle(environ)
+    assert environ == {"SSL_CERT_FILE": certifi.where()}
 
-    monkeypatch.setenv("SSL_CERT_FILE", "/custom/ca.pem")
+    environ = {"SSL_CERT_FILE": "/custom/ca.pem"}
+    entry._configure_certificate_bundle(environ)
+    assert environ == {"SSL_CERT_FILE": "/custom/ca.pem"}
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    environ = {}
+    entry._configure_certificate_bundle(environ, linux_bundles=())
+    assert environ == {"SSL_CERT_FILE": certifi.where()}
+
+
+def test_frozen_linux_entrypoint_prefers_the_distribution_bundle(monkeypatch, tmp_path) -> None:
+    certifi = pytest.importorskip("certifi")
+    entry = _load_entrypoint()
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "platform", "linux")
+    system_bundle = tmp_path / "ca-certificates.crt"
+    system_bundle.write_text("", encoding="utf-8")
+    missing = str(tmp_path / "missing.pem")
+
+    environ: dict[str, str] = {}
+    entry._configure_certificate_bundle(environ, linux_bundles=(missing, str(system_bundle)))
+    assert environ == {"SSL_CERT_FILE": str(system_bundle)}
+
+    # No distribution bundle: an explicit SSL_CERT_DIR is used as is ...
+    environ = {"SSL_CERT_DIR": str(tmp_path)}
+    entry._configure_certificate_bundle(environ, linux_bundles=(missing,))
+    assert environ == {"SSL_CERT_DIR": str(tmp_path)}
+
+    # ... and otherwise certifi is the fallback.
+    environ = {}
+    entry._configure_certificate_bundle(environ, linux_bundles=(missing,))
+    assert environ == {"SSL_CERT_FILE": certifi.where()}
+
+
+def test_entrypoint_leaves_the_process_environment_alone_when_not_frozen(monkeypatch) -> None:
+    entry = _load_entrypoint()
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    before = dict(entry.os.environ)
     entry._configure_certificate_bundle()
-    assert entry.os.environ["SSL_CERT_FILE"] == "/custom/ca.pem"
+    assert dict(entry.os.environ) == before
 
 
 def test_entrypoint_switches_standard_streams_to_utf8(monkeypatch) -> None:

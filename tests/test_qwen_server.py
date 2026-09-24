@@ -352,7 +352,7 @@ def _fake_torch(*, native_bf16: bool, emulation_keyword: bool = True):
     )
 
 
-def test_cuda_model_dtype_is_bf16_only_where_the_gpu_computes_it_natively(monkeypatch) -> None:
+def test_cuda_model_dtype_is_bf16_where_native_and_float32_elsewhere(monkeypatch) -> None:
     class FakeAsr:
         def __init__(self, torch, device="auto", dtype="auto") -> None:
             self.device, self.dtype = self._resolve_device_dtype(torch, device, dtype)
@@ -375,11 +375,14 @@ def test_cuda_model_dtype_is_bf16_only_where_the_gpu_computes_it_natively(monkey
 
     turing = _fake_torch(native_bf16=False)
     ampere = _fake_torch(native_bf16=True)
-    assert wrapped(turing, device="cuda").dtype == "float16"
-    assert wrapped(turing).dtype == "float16"  # auto device resolved to CUDA
+    # float16 risks NaN/garbage from Qwen; GPUs without native bf16 use float32.
+    assert wrapped(turing, device="cuda").dtype == "float32"
+    assert wrapped(turing).dtype == "float32"  # auto device resolved to CUDA
     assert wrapped(ampere, device="cuda").dtype == "bfloat16"
+    assert wrapped(ampere).dtype == "bfloat16"
     # An explicit dtype and non-CUDA devices keep the upstream choice.
-    assert wrapped(turing, device="cuda", dtype="float32").dtype == "float32"
+    assert wrapped(turing, device="cuda", dtype="float16").dtype == "float16"
+    assert wrapped(ampere, device="cuda", dtype="float32").dtype == "float32"
     assert wrapped(turing, device="cpu").dtype == "float32"
     # Older torch without the including_emulation keyword.
     legacy = _fake_torch(native_bf16=False, emulation_keyword=False)
@@ -389,9 +392,12 @@ def test_cuda_model_dtype_is_bf16_only_where_the_gpu_computes_it_natively(monkey
 def test_cuda_dtype_hook_wraps_the_real_upstream_resolution() -> None:
     asr_module = pytest.importorskip("qwen3_asr_causal.asr")
     upstream = asr_module.Qwen3StreamingASR._resolve_device_dtype
-    for native, expected in ((False, "float16"), (True, "bfloat16")):
+    for native, expected in ((False, "float32"), (True, "bfloat16")):
         torch = _fake_torch(native_bf16=native)
         device, dtype = qwen_server.resolve_model_device_dtype(upstream, torch, "cuda", "auto")
         assert device.type == "cuda" and dtype == expected
         device, dtype = qwen_server.resolve_model_device_dtype(upstream, torch, "auto", "auto")
         assert device.type == "cuda" and dtype == expected
+        # An explicit --qwen3-streaming-dtype always wins.
+        _, dtype = qwen_server.resolve_model_device_dtype(upstream, torch, "cuda", "float16")
+        assert dtype == "float16"

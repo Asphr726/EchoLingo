@@ -246,7 +246,9 @@ class DesktopInferenceSession:
     ) -> "DesktopInferenceSession":
         config = desktop_config(payload)
 
-        capabilities = CapabilityDetector(Path.cwd()).detect()
+        # Detection blocks (nvidia-smi, DNS, loopback probes): keep it off the
+        # event loop that serves the live session.
+        capabilities = await asyncio.to_thread(CapabilityDetector(Path.cwd()).detect)
         align_local_profiles(config, capabilities)
         decision = RuntimeRouter(config, capabilities).select()
         input_rate_hz = int(payload.get("sample_rate_hz", 48_000))

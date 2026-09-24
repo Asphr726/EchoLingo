@@ -121,9 +121,8 @@ class SidecarConnection:
         elif command_type == "plan_session":
             if self.session is not None:
                 raise ProtocolError("cannot plan while a sidecar session is active")
-            await self.websocket.send(
-                _event("route_plan", DesktopInferenceSession.plan(payload))
-            )
+            plan = await asyncio.to_thread(DesktopInferenceSession.plan, payload)
+            await self.websocket.send(_event("route_plan", plan))
         elif command_type == "probe_cloud":
             if self.session is not None:
                 raise ProtocolError("cannot probe cloud while a session is active")

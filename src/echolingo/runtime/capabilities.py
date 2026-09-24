@@ -8,6 +8,8 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping
@@ -71,6 +73,13 @@ def _system_ram_bytes() -> int | None:
         return None
 
 
+# nvidia-smi takes a noticeable fraction of a second and the GPU does not
+# change between sessions: probe it at most once per TTL per process.
+_CUDA_PROBE_TTL_S = 600.0
+_cuda_probe_lock = threading.Lock()
+_cuda_probe: tuple[float, tuple[bool, int | None]] | None = None
+
+
 def _no_window_flags() -> int:
     # Keep a console tool from flashing a window from the windowless sidecar.
     if sys.platform == "win32":
@@ -99,6 +108,17 @@ class CapabilityDetector:
 
     @staticmethod
     def _cuda() -> tuple[bool, int | None]:
+        global _cuda_probe
+        with _cuda_probe_lock:
+            now = time.monotonic()
+            if _cuda_probe is not None and now - _cuda_probe[0] < _CUDA_PROBE_TTL_S:
+                return _cuda_probe[1]
+            result = CapabilityDetector._query_nvidia_smi()
+            _cuda_probe = (now, result)
+            return result
+
+    @staticmethod
+    def _query_nvidia_smi() -> tuple[bool, int | None]:
         binary = shutil.which("nvidia-smi")
         if binary is None:
             return False, None

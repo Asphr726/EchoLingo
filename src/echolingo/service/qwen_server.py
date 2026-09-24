@@ -318,16 +318,26 @@ def cuda_bf16_supported(torch: Any) -> bool:
         return bool(torch.cuda.is_bf16_supported())
 
 
+def cuda_model_dtype(torch: Any) -> Any:
+    """bfloat16 where the GPU computes it natively, float32 everywhere else.
+
+    float16 risks overflow (NaN or garbage text) in Qwen activations on
+    pre-Ampere cards; the 0.6B model needs about 2.4 GB in float32, which fits
+    the 6 GB and larger cards the GPU pack supports.
+    """
+    return torch.bfloat16 if cuda_bf16_supported(torch) else torch.float32
+
+
 def resolve_model_device_dtype(
     upstream: Any, torch: Any, device_setting: str, dtype_setting: str
 ) -> tuple[Any, Any]:
-    """Upstream device/dtype resolution, with fp16 on CUDA GPUs without bf16.
+    """Upstream device/dtype resolution with ``cuda_model_dtype`` on CUDA.
 
     Upstream "auto" always picks bfloat16 on CUDA; an explicit dtype is kept.
     """
     device, dtype = upstream(torch, device_setting, dtype_setting)
     if dtype_setting == "auto" and getattr(device, "type", str(device)) == "cuda":
-        dtype = torch.bfloat16 if cuda_bf16_supported(torch) else torch.float16
+        dtype = cuda_model_dtype(torch)
         logger.info("qwen3-streaming CUDA dtype: %s", dtype)
     return device, dtype
 

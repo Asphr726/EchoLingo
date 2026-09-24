@@ -37,3 +37,21 @@ def test_native_child_gets_no_console_window_on_windows(monkeypatch) -> None:
     )
     monkeypatch.setattr(process_watchdog.sys, "platform", "linux")
     assert process_watchdog._child_creationflags() == 0
+
+
+def test_default_liveness_is_set_up_once_before_the_child_starts(monkeypatch) -> None:
+    watched: list[int] = []
+
+    def watch_parent(process_id: int):
+        watched.append(process_id)
+        return lambda: False
+
+    monkeypatch.setattr(process_watchdog, "watch_parent", watch_parent)
+    result = run_child_until_parent_exit(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        parent_process_id=4321,
+        poll_seconds=0.01,
+    )
+
+    assert result != 0
+    assert watched == [4321]

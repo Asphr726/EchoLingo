@@ -1,6 +1,7 @@
 import json
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -136,7 +137,7 @@ def test_windows_capabilities_avoid_posix_calls_and_console_windows(monkeypatch)
 
     monkeypatch.setattr(module.shutil, "which", lambda _name: "nvidia-smi.exe")
     monkeypatch.setattr(module.subprocess, "run", run)
-    assert CapabilityDetector._cuda() == (True, 12288 * 1024 * 1024)
+    assert CapabilityDetector._query_nvidia_smi() == (True, 12288 * 1024 * 1024)
     assert calls[0]["creationflags"] == getattr(module.subprocess, "CREATE_NO_WINDOW", 0x0800_0000)
     assert calls[0]["encoding"] == "utf-8"
 
@@ -144,7 +145,30 @@ def test_windows_capabilities_avoid_posix_calls_and_console_windows(monkeypatch)
         raise FileNotFoundError(command[0])
 
     monkeypatch.setattr(module.subprocess, "run", missing_binary)
-    assert CapabilityDetector._cuda() == (False, None)
+    assert CapabilityDetector._query_nvidia_smi() == (False, None)
+
+
+def test_nvidia_smi_runs_once_per_ttl_not_per_session(monkeypatch) -> None:
+    from echolingo.runtime import capabilities as module
+
+    queries: list[int] = []
+
+    def query() -> tuple[bool, int | None]:
+        queries.append(1)
+        return True, 8 * 1024**3
+
+    clock = [1_000.0]
+    monkeypatch.setattr(module, "_cuda_probe", None)
+    monkeypatch.setattr(CapabilityDetector, "_query_nvidia_smi", staticmethod(query))
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    assert CapabilityDetector._cuda() == (True, 8 * 1024**3)
+    clock[0] += 60.0
+    assert CapabilityDetector._cuda() == (True, 8 * 1024**3)
+    assert len(queries) == 1
+    clock[0] += module._CUDA_PROBE_TTL_S
+    CapabilityDetector._cuda()
+    assert len(queries) == 2
 
 
 def test_local_backends_use_desktop_supervised_loopback_endpoints(monkeypatch) -> None:

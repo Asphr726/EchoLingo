@@ -2,6 +2,7 @@
 
 import os
 import sys
+from collections.abc import MutableMapping, Sequence
 from types import ModuleType
 
 
@@ -17,21 +18,44 @@ def _configure_standard_streams() -> None:
             pass
 
 
-def _configure_certificate_bundle() -> None:
+# Distribution CA bundles, which include locally added (e.g. corporate) roots.
+LINUX_CA_BUNDLES = (
+    "/etc/ssl/certs/ca-certificates.crt",  # Debian, Ubuntu, Arch, Gentoo
+    "/etc/pki/tls/certs/ca-bundle.crt",  # Fedora, RHEL
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",  # CentOS, RHEL 7+
+    "/etc/ssl/ca-bundle.pem",  # openSUSE
+    "/etc/ssl/cert.pem",  # Alpine
+)
+
+
+def _configure_certificate_bundle(
+    environ: MutableMapping[str, str] | None = None,
+    *,
+    linux_bundles: Sequence[str] = LINUX_CA_BUNDLES,
+) -> None:
     """Give the frozen interpreter's OpenSSL a CA bundle.
 
     A frozen build still looks for the build machine's OpenSSL certificate
     directory, so ``ssl.create_default_context()`` (used by websockets for
     cloud providers) trusts nothing. httpx already uses certifi. An explicit
-    SSL_CERT_FILE keeps precedence.
+    SSL_CERT_FILE keeps precedence. Linux prefers the distribution bundle and
+    keeps an explicit SSL_CERT_DIR; macOS and Windows use certifi.
     """
-    if not getattr(sys, "frozen", False) or os.environ.get("SSL_CERT_FILE"):
+    environ = os.environ if environ is None else environ
+    if not getattr(sys, "frozen", False) or environ.get("SSL_CERT_FILE"):
         return
+    if sys.platform.startswith("linux"):
+        for bundle in linux_bundles:
+            if os.path.isfile(bundle):
+                environ["SSL_CERT_FILE"] = bundle
+                return
+        if environ.get("SSL_CERT_DIR"):
+            return
     try:
         import certifi
     except ImportError:
         return
-    os.environ["SSL_CERT_FILE"] = certifi.where()
+    environ["SSL_CERT_FILE"] = certifi.where()
 
 
 def _install_qwen_import_shims() -> None:

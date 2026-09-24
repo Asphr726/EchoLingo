@@ -13,9 +13,8 @@ _lock = threading.Lock()
 # Windows access rights, error and wait codes used by the liveness probe.
 _SYNCHRONIZE = 0x0010_0000
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-_ERROR_ACCESS_DENIED = 5
 _ERROR_INVALID_PARAMETER = 87
-_WAIT_TIMEOUT = 0x0000_0102
+_WAIT_OBJECT_0 = 0x0000_0000
 
 
 class _Kernel32Processes:
@@ -51,13 +50,22 @@ class _Kernel32Processes:
 _kernel32: _Kernel32Processes | None = None
 
 
-def windows_process_alive(process_id: int, *, api: Any | None = None) -> bool:
-    """Probe a process through a SYNCHRONIZE handle (Windows only)."""
+def _kernel32_api() -> _Kernel32Processes:
     global _kernel32
-    if api is None:
-        if _kernel32 is None:
-            _kernel32 = _Kernel32Processes()
-        api = _kernel32
+    if _kernel32 is None:
+        _kernel32 = _Kernel32Processes()
+    return _kernel32
+
+
+def _signalled(api: Any, handle: Any) -> bool:
+    # Only WAIT_OBJECT_0 means the process has exited. WAIT_TIMEOUT is a
+    # running process; WAIT_FAILED is unknown and must not end a session.
+    return api.wait(handle) == _WAIT_OBJECT_0
+
+
+def windows_process_alive(process_id: int, *, api: Any | None = None) -> bool:
+    """One-shot probe through a SYNCHRONIZE handle (Windows only)."""
+    api = api if api is not None else _kernel32_api()
     handle, error = api.open_process(process_id)
     if handle is None:
         # ERROR_INVALID_PARAMETER: no process has this id any more. Access
@@ -65,9 +73,40 @@ def windows_process_alive(process_id: int, *, api: Any | None = None) -> bool:
         # the worker alive; the Desktop's job object still reaps it.
         return error != _ERROR_INVALID_PARAMETER
     try:
-        return api.wait(handle) == _WAIT_TIMEOUT
+        return not _signalled(api, handle)
     finally:
         api.close(handle)
+
+
+class WindowsProcessWatch:
+    """One handle to the owner, opened once and waited on for its lifetime.
+
+    The open handle pins the process object, so a recycled PID can never pass
+    for the owner, and polling needs no OpenProcess per check.
+    """
+
+    def __init__(self, process_id: int, *, api: Any | None = None) -> None:
+        self.process_id = process_id
+        self._api = api if api is not None else _kernel32_api()
+        self._handle, error = self._api.open_process(process_id)
+        self._exited = self._handle is None and error == _ERROR_INVALID_PARAMETER
+
+    def alive(self) -> bool:
+        if self._exited:
+            return False
+        if self._handle is None:
+            # No handle (access denied): fall back to probing by id.
+            return windows_process_alive(self.process_id, api=self._api)
+        if not _signalled(self._api, self._handle):
+            return True
+        self._exited = True
+        self.close()
+        return False
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._api.close(self._handle)
+            self._handle = None
 
 
 def parent_process_alive(
@@ -90,6 +129,13 @@ def parent_process_alive(
         return True
 
 
+def watch_parent(process_id: int, *, api: Any | None = None) -> Callable[[], bool]:
+    """Liveness check for the owner, set up once when a watchdog starts."""
+    if sys.platform == "win32" or api is not None:
+        return WindowsProcessWatch(process_id, api=api).alive
+    return lambda: parent_process_alive(process_id)
+
+
 def start_parent_watchdog_from_environment() -> None:
     """Exit a packaged worker when its owning Desktop process disappears."""
     raw = os.getenv("ECHOLINGO_PARENT_PID")
@@ -107,9 +153,10 @@ def start_parent_watchdog_from_environment() -> None:
         if _started:
             return
         _started = True
+    parent_alive = watch_parent(process_id)
 
     def monitor() -> None:
-        while parent_process_alive(process_id):
+        while parent_alive():
             time.sleep(1.0)
         os._exit(0)
 

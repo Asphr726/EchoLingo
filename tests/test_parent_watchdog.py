@@ -2,8 +2,15 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 from echolingo.service import parent_watchdog
-from echolingo.service.parent_watchdog import parent_process_alive, windows_process_alive
+from echolingo.service.parent_watchdog import (
+    WindowsProcessWatch,
+    parent_process_alive,
+    watch_parent,
+    windows_process_alive,
+)
 
 
 def test_parent_watchdog_distinguishes_live_missing_and_inaccessible_processes() -> None:
@@ -46,30 +53,71 @@ def test_windows_default_probe_never_signals_the_process(monkeypatch) -> None:
     assert probed == [1234]
 
 
+WAIT_OBJECT_0 = 0
+WAIT_TIMEOUT = 0x102
+WAIT_FAILED = 0xFFFF_FFFF
+
+
 class FakeKernel32:
-    def __init__(self, *, error: int = 0, wait_result: int = 0x102) -> None:
+    def __init__(self, *, error: int = 0, waits: list[int] | None = None) -> None:
         self.error = error
-        self.wait_result = wait_result
+        self.waits = list(waits or [WAIT_TIMEOUT])
+        self.opened = 0
         self.closed: list[object] = []
 
     def open_process(self, _process_id: int):
-        return (None, self.error) if self.error else ("handle", 0)
+        self.opened += 1
+        return (None, self.error) if self.error else (f"handle-{self.opened}", 0)
 
     def wait(self, _handle) -> int:
-        return self.wait_result
+        return self.waits.pop(0) if len(self.waits) > 1 else self.waits[0]
 
     def close(self, handle) -> None:
         self.closed.append(handle)
 
 
 def test_windows_probe_maps_open_and_wait_results() -> None:
-    running = FakeKernel32(wait_result=0x102)  # WAIT_TIMEOUT
+    running = FakeKernel32(waits=[WAIT_TIMEOUT])
     assert windows_process_alive(7, api=running)
-    assert running.closed == ["handle"]
+    assert running.closed == ["handle-1"]
 
-    exited = FakeKernel32(wait_result=0)  # WAIT_OBJECT_0
+    exited = FakeKernel32(waits=[WAIT_OBJECT_0])
     assert not windows_process_alive(7, api=exited)
-    assert exited.closed == ["handle"]
+    assert exited.closed == ["handle-1"]
 
+    # WAIT_FAILED says nothing about the process: keep running.
+    assert windows_process_alive(7, api=FakeKernel32(waits=[WAIT_FAILED]))
     assert not windows_process_alive(7, api=FakeKernel32(error=87))  # invalid parameter
     assert windows_process_alive(7, api=FakeKernel32(error=5))  # access denied
+
+
+def test_windows_watch_keeps_one_handle_to_the_owner() -> None:
+    api = FakeKernel32(waits=[WAIT_TIMEOUT, WAIT_FAILED, WAIT_TIMEOUT, WAIT_OBJECT_0])
+    alive = watch_parent(7, api=api)
+
+    assert [alive(), alive(), alive()] == [True, True, True]
+    assert api.opened == 1 and api.closed == []
+    assert alive() is False
+    assert api.closed == ["handle-1"]
+    # Once the owner has exited the watch stays down without new handles.
+    assert alive() is False
+    assert api.opened == 1
+
+
+def test_windows_watch_of_a_missing_or_protected_owner() -> None:
+    missing = FakeKernel32(error=87)
+    assert WindowsProcessWatch(7, api=missing).alive() is False
+
+    # Access denied: no handle to keep, so each check probes by id instead.
+    protected = FakeKernel32(error=5)
+    watch = WindowsProcessWatch(7, api=protected)
+    assert watch.alive() and watch.alive()
+    assert protected.opened == 3
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX probe")
+def test_posix_watch_probes_the_owner_by_id() -> None:
+    assert watch_parent(os.getpid())()
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(timeout=30)
+    assert watch_parent(child.pid)() is False
