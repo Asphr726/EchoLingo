@@ -122,6 +122,8 @@ async def test_no_context_sends_no_header_and_keeps_the_bearer_token(fake_connec
     backend = LocalQwenAsrBackend()
     await backend.start_session(AsrSessionConfig("s", "ja"))
     assert fake_connect["additional_headers"] is None
+    # The loopback server is never reached through a system proxy.
+    assert fake_connect["proxy"] is None
     await backend.close()
 
     monkeypatch.setenv("WLK_API_TOKEN", "local-dev-token")

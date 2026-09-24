@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextvars
 import dataclasses
+import functools
 import logging
 import os
 import sys
@@ -305,6 +306,32 @@ def _join_segments(*segments: str) -> str:
     return " ".join(kept).strip()
 
 
+def cuda_bf16_supported(torch: Any) -> bool:
+    """True when the current CUDA device computes bfloat16 natively (sm_80+).
+
+    ``is_bf16_supported()`` defaults to counting emulation, which reports
+    Turing cards (sm_75) as capable although bf16 runs far slower there.
+    """
+    try:
+        return bool(torch.cuda.is_bf16_supported(including_emulation=False))
+    except TypeError:  # torch without the including_emulation keyword
+        return bool(torch.cuda.is_bf16_supported())
+
+
+def resolve_model_device_dtype(
+    upstream: Any, torch: Any, device_setting: str, dtype_setting: str
+) -> tuple[Any, Any]:
+    """Upstream device/dtype resolution, with fp16 on CUDA GPUs without bf16.
+
+    Upstream "auto" always picks bfloat16 on CUDA; an explicit dtype is kept.
+    """
+    device, dtype = upstream(torch, device_setting, dtype_setting)
+    if dtype_setting == "auto" and getattr(device, "type", str(device)) == "cuda":
+        dtype = torch.bfloat16 if cuda_bf16_supported(torch) else torch.float16
+        logger.info("qwen3-streaming CUDA dtype: %s", dtype)
+    return device, dtype
+
+
 def install_streaming_policy(
     policy: Mapping[str, Any],
     *,
@@ -373,6 +400,11 @@ def install_streaming_policy(
             )
             return cls(**values)
 
+    upstream_resolve = getattr(base, "_resolve_device_dtype", None)
+    if upstream_resolve is not None:
+        EchoLingoQwen3StreamingASR._resolve_device_dtype = staticmethod(  # type: ignore[attr-defined]
+            functools.partial(resolve_model_device_dtype, upstream_resolve)
+        )
     EchoLingoQwen3StreamingASR.__name__ = base.__name__
     EchoLingoQwen3StreamingASR.__qualname__ = base.__qualname__
     streaming.Qwen3StreamingASR = EchoLingoQwen3StreamingASR

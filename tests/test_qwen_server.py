@@ -324,3 +324,74 @@ def test_eager_languages_come_from_the_policy_and_environment() -> None:
     assert policy["echolingo_eager_roll_languages"] == ""
     policy = qwen_server.decode_policy_from_environment({"ECHOLINGO_QWEN_EAGER_ROLL_LANGUAGES": "KO, JA"})
     assert policy["echolingo_eager_roll_languages"] == "ko, ja"
+
+
+class _FakeCuda:
+    def __init__(self, *, native_bf16: bool, emulation_keyword: bool = True) -> None:
+        self.native_bf16 = native_bf16
+        self.emulation_keyword = emulation_keyword
+
+    def is_available(self) -> bool:
+        return True
+
+    def is_bf16_supported(self, **kwargs) -> bool:
+        if kwargs and not self.emulation_keyword:
+            raise TypeError("unexpected keyword argument 'including_emulation'")
+        # Emulation reports every CUDA device (Turing included) as capable.
+        return self.native_bf16 or kwargs.get("including_emulation", True)
+
+
+def _fake_torch(*, native_bf16: bool, emulation_keyword: bool = True):
+    return types.SimpleNamespace(
+        bfloat16="bfloat16",
+        float16="float16",
+        float32="float32",
+        cuda=_FakeCuda(native_bf16=native_bf16, emulation_keyword=emulation_keyword),
+        backends=types.SimpleNamespace(mps=None),
+        device=lambda name: types.SimpleNamespace(type=name),
+    )
+
+
+def test_cuda_model_dtype_is_bf16_only_where_the_gpu_computes_it_natively(monkeypatch) -> None:
+    class FakeAsr:
+        def __init__(self, torch, device="auto", dtype="auto") -> None:
+            self.device, self.dtype = self._resolve_device_dtype(torch, device, dtype)
+
+        @staticmethod
+        def _resolve_device_dtype(torch, device_setting, dtype_setting):
+            # Upstream "auto": CUDA when present, always bfloat16 on CUDA.
+            device = "cuda" if device_setting == "auto" else device_setting
+            if dtype_setting != "auto":
+                return torch.device(device), getattr(torch, dtype_setting)
+            return torch.device(device), torch.bfloat16 if device == "cuda" else torch.float32
+
+    fake_module = types.ModuleType("whisperlivekit.qwen3_streaming")
+    fake_module.Qwen3StreamingASR = FakeAsr
+    fake_package = types.ModuleType("whisperlivekit")
+    fake_package.qwen3_streaming = fake_module
+    monkeypatch.setitem(sys.modules, "whisperlivekit", fake_package)
+    monkeypatch.setitem(sys.modules, "whisperlivekit.qwen3_streaming", fake_module)
+    wrapped = qwen_server.install_streaming_policy({}, warmup_seconds=0)
+
+    turing = _fake_torch(native_bf16=False)
+    ampere = _fake_torch(native_bf16=True)
+    assert wrapped(turing, device="cuda").dtype == "float16"
+    assert wrapped(turing).dtype == "float16"  # auto device resolved to CUDA
+    assert wrapped(ampere, device="cuda").dtype == "bfloat16"
+    # An explicit dtype and non-CUDA devices keep the upstream choice.
+    assert wrapped(turing, device="cuda", dtype="float32").dtype == "float32"
+    assert wrapped(turing, device="cpu").dtype == "float32"
+    # Older torch without the including_emulation keyword.
+    legacy = _fake_torch(native_bf16=False, emulation_keyword=False)
+    assert qwen_server.cuda_bf16_supported(legacy) is True
+
+
+def test_cuda_dtype_hook_wraps_the_real_upstream_resolution() -> None:
+    asr_module = pytest.importorskip("qwen3_asr_causal.asr")
+    upstream = asr_module.Qwen3StreamingASR._resolve_device_dtype
+    for native, expected in ((False, "float16"), (True, "bfloat16")):
+        torch = _fake_torch(native_bf16=native)
+        device, dtype = qwen_server.resolve_model_device_dtype(upstream, torch, "cuda", "auto")
+        assert device.type == "cuda" and dtype == expected
+        device, dtype = qwen_server.resolve_model_device_dtype(upstream, torch, "auto", "auto")
+        assert device.type == "cuda" and dtype == expected

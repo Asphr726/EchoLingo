@@ -53,7 +53,7 @@ async def test_mock_alignment_and_canonical_update_are_decoupled() -> None:
 
 
 async def test_qwen_adapter_maps_official_seconds_to_canonical_milliseconds(tmp_path) -> None:
-    (tmp_path / "config.json").write_text("{}")
+    (tmp_path / "config.json").write_text("{}", encoding="utf-8")
     (tmp_path / "model.safetensors").write_bytes(b"fixture")
 
     @dataclass

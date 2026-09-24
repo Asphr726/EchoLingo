@@ -102,6 +102,9 @@ class LocalQwenAsrBackend:
             _with_language(self.url, config.language),
             additional_headers=headers,
             max_size=8 * 1024 * 1024,
+            # websockets >= 15 follows the system proxy by default; the local
+            # ASR server is on loopback and must never be proxied.
+            proxy=None,
         )
         first = json.loads(await self._websocket.recv())
         if first.get("type") != "config":

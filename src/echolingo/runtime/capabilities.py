@@ -7,6 +7,7 @@ import platform
 import shutil
 import socket
 import subprocess
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping
@@ -35,11 +36,46 @@ class RuntimeCapabilities:
         return asdict(self)
 
 
+def _windows_ram_bytes() -> int | None:
+    import ctypes
+    from ctypes import wintypes
+
+    class MemoryStatusEx(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", wintypes.DWORD),
+            ("dwMemoryLoad", wintypes.DWORD),
+            ("ullTotalPhys", ctypes.c_uint64),
+            ("ullAvailPhys", ctypes.c_uint64),
+            ("ullTotalPageFile", ctypes.c_uint64),
+            ("ullAvailPageFile", ctypes.c_uint64),
+            ("ullTotalVirtual", ctypes.c_uint64),
+            ("ullAvailVirtual", ctypes.c_uint64),
+            ("ullAvailExtendedVirtual", ctypes.c_uint64),
+        ]
+
+    status = MemoryStatusEx()
+    status.dwLength = ctypes.sizeof(MemoryStatusEx)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    if not kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return None
+    return int(status.ullTotalPhys)
+
+
 def _system_ram_bytes() -> int | None:
     try:
+        if sys.platform == "win32":
+            # os.sysconf does not exist on Windows.
+            return _windows_ram_bytes()
         return int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_PHYS_PAGES"))
     except (AttributeError, OSError, ValueError):
         return None
+
+
+def _no_window_flags() -> int:
+    # Keep a console tool from flashing a window from the windowless sidecar.
+    if sys.platform == "win32":
+        return int(getattr(subprocess, "CREATE_NO_WINDOW", 0x0800_0000))
+    return 0
 
 
 class CapabilityDetector:
@@ -66,13 +102,19 @@ class CapabilityDetector:
         binary = shutil.which("nvidia-smi")
         if binary is None:
             return False, None
-        result = subprocess.run(
-            [binary, "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=3,
-        )
+        try:
+            result = subprocess.run(
+                [binary, "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=3,
+                creationflags=_no_window_flags(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False, None
         if result.returncode != 0:
             return False, None
         try:

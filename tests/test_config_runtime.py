@@ -120,6 +120,33 @@ def test_local_qwen_runtime_uses_whisperlivekit_import_name(monkeypatch) -> None
     assert requested == ["whisperlivekit"]
 
 
+def test_windows_capabilities_avoid_posix_calls_and_console_windows(monkeypatch) -> None:
+    from echolingo.runtime import capabilities as module
+
+    monkeypatch.setattr(module.sys, "platform", "win32")
+    monkeypatch.setattr(module, "_windows_ram_bytes", lambda: 16 * 1024**3)
+    monkeypatch.delattr(module.os, "sysconf", raising=False)
+    assert module._system_ram_bytes() == 16 * 1024**3
+
+    calls: list[dict] = []
+
+    def run(command, **kwargs):
+        calls.append(kwargs)
+        return type("Result", (), {"returncode": 0, "stdout": "12288\n"})()
+
+    monkeypatch.setattr(module.shutil, "which", lambda _name: "nvidia-smi.exe")
+    monkeypatch.setattr(module.subprocess, "run", run)
+    assert CapabilityDetector._cuda() == (True, 12288 * 1024 * 1024)
+    assert calls[0]["creationflags"] == getattr(module.subprocess, "CREATE_NO_WINDOW", 0x0800_0000)
+    assert calls[0]["encoding"] == "utf-8"
+
+    def missing_binary(command, **kwargs):
+        raise FileNotFoundError(command[0])
+
+    monkeypatch.setattr(module.subprocess, "run", missing_binary)
+    assert CapabilityDetector._cuda() == (False, None)
+
+
 def test_local_backends_use_desktop_supervised_loopback_endpoints(monkeypatch) -> None:
     monkeypatch.setenv("ECHOLINGO_LOCAL_QWEN_URL", "ws://127.0.0.1:43123/asr")
     monkeypatch.setenv("ECHOLINGO_LOCAL_HYMT_URL", "http://127.0.0.1:43124/v1")

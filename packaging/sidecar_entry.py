@@ -1,7 +1,37 @@
 """PyInstaller entry point for EchoLingo's isolated Python processes."""
 
+import os
 import sys
 from types import ModuleType
+
+
+def _configure_standard_streams() -> None:
+    """Write UTF-8 whatever the console code page is (ANSI on Windows)."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (OSError, ValueError):
+            pass
+
+
+def _configure_certificate_bundle() -> None:
+    """Give the frozen interpreter's OpenSSL a CA bundle.
+
+    A frozen build still looks for the build machine's OpenSSL certificate
+    directory, so ``ssl.create_default_context()`` (used by websockets for
+    cloud providers) trusts nothing. httpx already uses certifi. An explicit
+    SSL_CERT_FILE keeps precedence.
+    """
+    if not getattr(sys, "frozen", False) or os.environ.get("SSL_CERT_FILE"):
+        return
+    try:
+        import certifi
+    except ImportError:
+        return
+    os.environ["SSL_CERT_FILE"] = certifi.where()
 
 
 def _install_qwen_import_shims() -> None:
@@ -41,14 +71,21 @@ def _install_qwen_import_shims() -> None:
 
 
 def main() -> int:
+    _configure_standard_streams()
     if len(sys.argv) > 1 and sys.argv[1] == "watch-process":
         from echolingo.service.process_watchdog import run_child_until_parent_exit
 
         return run_child_until_parent_exit(sys.argv[2:])
 
+    # After watch-process: the native child's environment stays untouched.
+    _configure_certificate_bundle()
     from echolingo.service.parent_watchdog import start_parent_watchdog_from_environment
 
     start_parent_watchdog_from_environment()
+    if len(sys.argv) > 1 and sys.argv[1] == "self-test":
+        from echolingo.service.self_test import main as self_test_main
+
+        return self_test_main(sys.argv[2:], install_qwen_shims=_install_qwen_import_shims)
     if len(sys.argv) > 1 and sys.argv[1] == "qwen-asr-server":
         _install_qwen_import_shims()
         from echolingo.service.qwen_server import main as qwen_server_main

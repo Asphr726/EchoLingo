@@ -63,9 +63,18 @@ class RunRecorder:
 
     @staticmethod
     def _git_sha() -> str | None:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=False
-        )
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except OSError:
+            # git is optional (and usually absent on Windows machines).
+            return None
         return result.stdout.strip() if result.returncode == 0 else None
 
     @staticmethod

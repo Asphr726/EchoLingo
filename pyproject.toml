@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "echolingo"
-version = "0.1.0"
+version = "0.2.0"
 description = "Far-field multilingual streaming ASR spike"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
@@ -14,6 +14,9 @@ dependencies = [
   "rich>=14,<15",
   "websockets>=15,<17",
   "httpx>=0.28,<0.29",
+  # CA bundle for TLS in the frozen sidecar, which cannot see the build
+  # machine's OpenSSL certificate directory.
+  "certifi>=2024.7.4",
   "platformdirs>=4.3,<5",
   # AI notes: text extraction from PDF attachments (BSD-3-Clause, pure Python).
   "pypdf>=6,<7",
