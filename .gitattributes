@@ -1,0 +1,9 @@
+# Check out LF on every platform. Embedded files must be byte-identical
+# everywhere: SQL migration checksums are recorded in users' history
+# databases, and Windows checkouts default to CRLF.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.png binary
+*.ico binary
+*.onnx binary
