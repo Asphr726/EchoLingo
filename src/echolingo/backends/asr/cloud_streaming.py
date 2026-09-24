@@ -347,6 +347,9 @@ class CloudStreamingAsrBase:
                 continue
             try:
                 async with self._send_lock:
+                    # Nothing may follow the provider's finish message.
+                    if self._finishing:
+                        return
                     await self._send_raw(message)
             except Exception:
                 self._connected.clear()
@@ -643,8 +646,9 @@ class CloudStreamingAsrBase:
         self._finishing = True
         if self._connected.is_set():
             try:
-                for message in self.finish_messages():
-                    await self._send_raw(message)
+                async with self._send_lock:
+                    for message in self.finish_messages():
+                        await self._send_raw(message)
                 await asyncio.wait_for(self._session_finished.wait(), timeout=self.finish_timeout_s)
             except (TimeoutError, asyncio.TimeoutError):
                 await self._events.put(
