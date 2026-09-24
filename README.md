@@ -87,7 +87,7 @@ EchoLingo 是一款面向课堂的实时同声字幕工具：把老师的讲课�
 2. 如果提供的是 AppImage，先运行 `chmod +x EchoLingo_0.2.0_amd64.AppImage` 加上可执行权限，再直接打开。Ubuntu 22.04 及以上运行 AppImage 需要 libfuse2：`sudo apt install libfuse2`（Ubuntu 24.04 上的包名是 `libfuse2t64`）。
 3. 从应用菜单打开 EchoLingo，同样在 **Settings → Models** 下载本地模型。
 
-**NVIDIA GPU 加速包（可选）**。不安装时，识别和翻译都在 CPU 上运行。如果电脑有 NVIDIA GeForce RTX 20 系列、GTX 16 系列或更新的显卡，并且装了较新的驱动，可以打开 **Settings → Models → GPU acceleration**，点 **Download** 下载 GPU 加速包（约 2–3 GB）。加速包分段下载，每一段都会校验，安装后先做一次自检再启用；之后可以随时用 **Use GPU acceleration** 开关关闭。如果 GPU 运行时启动失败，EchoLingo 会自动退回 CPU，并在这张卡片上说明原因。AMD 和 Intel 显卡暂不支持。
+**NVIDIA GPU 加速包（可选）**。不安装时，识别和翻译都在 CPU 上运行。如果电脑有 NVIDIA GeForce RTX 20 系列、GTX 16 系列或更新的显卡，并且装了较新的驱动，可以打开 **Settings → Models → GPU acceleration**，点 **Download** 下载 GPU 加速包（约 2–3 GB）。加速包分段下载，每一段都会校验，安装后先做一次自检再启用；之后可以随时用 **Use GPU acceleration** 开关关闭。如果 GPU 运行时启动失败，EchoLingo 会自动退回 CPU，并在这张卡片上说明原因。AMD 和 Intel 显卡暂不支持。Linux 上用显卡翻译还需要 Vulkan 运行库（`sudo apt install libvulkan1`），没有它时翻译仍在 CPU 上运行。
 
 **与 Mac 版的差别**
 
@@ -307,7 +307,7 @@ EchoLingo 通过 Secret Service 保存密钥。请安装或解锁 GNOME 钥匙�
 
 - **macOS**：macOS 14 及以上的 Apple Silicon Mac，以及 Xcode Command Line Tools。
 - **Windows**：Windows 10 或 11（x64），Visual Studio 2022 生成工具（选“使用 C++ 的桌面开发”）和 WebView2 运行时。
-- **Linux**：Ubuntu 22.04 及以上（x64），并运行 `sudo apt install build-essential curl file libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libasound2-dev`。
+- **Linux**：Ubuntu 22.04 及以上（x64），并运行 `sudo apt install build-essential curl file libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libasound2-dev libdbus-1-dev pkg-config`。
 
 ```bash
 git clone https://github.com/Asphr726/EchoLingo.git

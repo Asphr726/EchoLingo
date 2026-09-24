@@ -87,7 +87,7 @@ The steps below are for macOS. For Windows and Linux, see [Windows / Linux](#win
 2. If an AppImage is provided instead, make it executable with `chmod +x EchoLingo_0.2.0_amd64.AppImage` and run it. On Ubuntu 22.04 and later, AppImages need libfuse2: `sudo apt install libfuse2` (the package is `libfuse2t64` on Ubuntu 24.04).
 3. Open EchoLingo from the applications menu and download the local models in **Settings → Models**.
 
-**NVIDIA GPU acceleration pack (optional).** Without it, recognition and translation run on the CPU. If the computer has an NVIDIA GeForce RTX 20-series or GTX 16-series card or newer with a recent driver, open **Settings → Models → GPU acceleration** and click **Download**. The pack (about 2–3 GB) is downloaded in parts, every part is checked, and a self-test runs before the pack is switched on; **Use GPU acceleration** turns it off again at any time. If the GPU runtime fails to start, EchoLingo falls back to the CPU and the card says why. AMD and Intel graphics cards are not supported yet.
+**NVIDIA GPU acceleration pack (optional).** Without it, recognition and translation run on the CPU. If the computer has an NVIDIA GeForce RTX 20-series or GTX 16-series card or newer with a recent driver, open **Settings → Models → GPU acceleration** and click **Download**. The pack (about 2–3 GB) is downloaded in parts, every part is checked, and a self-test runs before the pack is switched on; **Use GPU acceleration** turns it off again at any time. If the GPU runtime fails to start, EchoLingo falls back to the CPU and the card says why. AMD and Intel graphics cards are not supported yet. On Linux, GPU translation also needs the Vulkan loader (`sudo apt install libvulkan1`); without it translation stays on the CPU.
 
 **Differences from the Mac version**
 
@@ -307,7 +307,7 @@ You need Node.js 22 LTS, Rust 1.88 or later (stable) and Conda (Miniconda or Min
 
 - **macOS**: an Apple Silicon Mac with macOS 14 or later and the Xcode Command Line Tools.
 - **Windows**: Windows 10 or 11 (x64) with the Visual Studio 2022 Build Tools (**Desktop development with C++**) and the WebView2 runtime.
-- **Linux**: Ubuntu 22.04 or later (x64) with `sudo apt install build-essential curl file libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libasound2-dev`.
+- **Linux**: Ubuntu 22.04 or later (x64) with `sudo apt install build-essential curl file libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libasound2-dev libdbus-1-dev pkg-config`.
 
 ```bash
 git clone https://github.com/Asphr726/EchoLingo.git
