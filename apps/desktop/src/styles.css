@@ -252,7 +252,11 @@ input::placeholder { color: #9a9c93; }
   border: 1px solid var(--line);
   border-radius: 14px;
   background: rgba(255, 254, 250, .72);
+  /* The feed keeps the reader's place itself (lib/feedFollow.ts), the same
+     way on WebKit and Chromium. */
+  overflow-anchor: none;
 }
+.live-transcript-feed:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 60%, white); outline-offset: 2px; }
 
 /* Bilingual rows: time | original | translation, top-aligned so a sentence
    and its translation always sit side by side. */

@@ -12,6 +12,7 @@ import {
 } from "@phosphor-icons/react";
 import { memo, type ReactNode, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { api } from "../lib/bridge";
+import { anchorCorrection, type FeedAnchor, followChangeAfterScroll, pickAnchor, scrollsBack } from "../lib/feedFollow";
 import {
   effectiveProviderId,
   findProvider,
@@ -322,7 +323,7 @@ const SegmentRow = memo(function SegmentRow({
   const placeholder = segmentTranslationLabel(segment);
   const streaming = segment.translation_status === "streaming";
   return (
-    <article className="bilingual-row" data-status={segment.translation_status ?? "pending"}>
+    <article className="bilingual-row" data-status={segment.translation_status ?? "pending"} data-segment-id={segment.id}>
       <time>{formatTime(segment.start_ms)}</time>
       <p className="row-original" lang={sourceLanguage}>{segment.original}</p>
       {placeholder ? (
@@ -377,32 +378,86 @@ function SpeechIndicator() {
   );
 }
 
+const prefersReducedMotion = () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+
+/** The reader's place in the feed, from the rows' on-screen boxes. */
+function readAnchor(feed: HTMLElement): FeedAnchor | null {
+  function* rows() {
+    for (const row of feed.querySelectorAll<HTMLElement>("[data-segment-id]")) {
+      const box = row.getBoundingClientRect();
+      yield { id: row.dataset.segmentId ?? "", top: box.top, bottom: box.bottom };
+    }
+  }
+  return pickAnchor(rows(), feed.getBoundingClientRect().top);
+}
+
 function TranscriptStage() {
   const { draft, snapshot } = useApp();
   const feedRef = useRef<HTMLDivElement>(null);
-  const [following, setFollowing] = useState(true);
+  // The layout effect reads the ref, so a scroll back the reader starts in
+  // this frame wins over the next pin to the bottom; the state copy only
+  // drives the "Back to live" button.
+  const followingRef = useRef(true);
+  const [following, setFollowingState] = useState(true);
+  const anchorRef = useRef<FeedAnchor | null>(null);
+  // Where the feed's own last scroll left it, to tell the reader's scrolls
+  // from ours, and the position the previous scroll event saw.
+  const ownScrollTopRef = useRef<number | null>(null);
+  const lastScrollTopRef = useRef(0);
+  const touchYRef = useRef<number | null>(null);
   const openText = snapshot.live.open_text.trim();
   const unstableText = snapshot.live.original_unstable.trim();
   const provisionalTranslation = openText || unstableText ? snapshot.live.translation_editable.trim() : "";
   const segments = snapshot.previous_segments;
   const hasCopy = segments.length > 0 || openText || unstableText;
-  const lastSegment = segments.at(-1);
-  const contentToken = `${segments.length}:${lastSegment?.translation ?? ""}:${openText}:${unstableText}:${provisionalTranslation}`;
   // Before a session has a config, the heading shows the languages Start will use.
   const sourceLanguage = snapshot.config?.source_language ?? draft.source_language;
   const targetLanguage = snapshot.config?.target_language ?? draft.target_language;
 
+  const setFollowing = (value: boolean) => {
+    followingRef.current = value;
+    setFollowingState(value);
+    if (value) anchorRef.current = null;
+  };
+
+  // The anchor is taken from the scroll event that follows, once the
+  // browser has applied the reader's scroll.
+  const scrollBack = () => {
+    if (followingRef.current) setFollowing(false);
+  };
+
   const scrollToLive = () => {
     const feed = feedRef.current;
     if (!feed) return;
-    feed.scrollTo({ top: feed.scrollHeight, behavior: "smooth" });
     setFollowing(true);
+    feed.scrollTo({ top: feed.scrollHeight, behavior: prefersReducedMotion() ? "auto" : "smooth" });
   };
+
+  // Every new session starts at its newest line.
+  useEffect(() => {
+    setFollowing(true);
+  }, [snapshot.session_id]);
 
   useLayoutEffect(() => {
     const feed = feedRef.current;
-    if (feed && following) feed.scrollTop = feed.scrollHeight;
-  }, [contentToken, following]);
+    if (!feed) return;
+    if (followingRef.current) {
+      feed.scrollTop = feed.scrollHeight;
+    } else {
+      const anchor = anchorRef.current;
+      if (!anchor) return;
+      const row = feed.querySelector<HTMLElement>(`[data-segment-id="${CSS.escape(anchor.id)}"]`);
+      if (!row) {
+        // The row dropped off the window; the next one becomes the place.
+        anchorRef.current = readAnchor(feed);
+        return;
+      }
+      const correction = anchorCorrection(anchor, row.getBoundingClientRect().top, feed.getBoundingClientRect().top);
+      if (Math.abs(correction) < 0.5) return;
+      feed.scrollTop += correction;
+    }
+    ownScrollTopRef.current = feed.scrollTop;
+  }, [segments, openText, unstableText, provisionalTranslation]);
 
   return (
     <section className="transcript-stage" aria-label="Live transcript">
@@ -432,9 +487,31 @@ function TranscriptStage() {
           <div
             className="live-transcript-feed"
             ref={feedRef}
+            tabIndex={0}
+            onWheel={(event) => {
+              if (event.deltaY < 0 && !event.ctrlKey && event.currentTarget.scrollTop > 0) scrollBack();
+            }}
+            onKeyDown={(event) => {
+              if (scrollsBack(event.key) && event.currentTarget.scrollTop > 0) scrollBack();
+            }}
+            onTouchStart={(event) => {
+              touchYRef.current = event.touches[0]?.clientY ?? null;
+            }}
+            onTouchMove={(event) => {
+              const y = event.touches[0]?.clientY;
+              // A finger moving down drags older lines into view.
+              if (touchYRef.current !== null && y !== undefined && y > touchYRef.current + 2) scrollBack();
+            }}
             onScroll={(event) => {
               const feed = event.currentTarget;
-              setFollowing(feed.scrollHeight - feed.scrollTop - feed.clientHeight < 48);
+              const own = ownScrollTopRef.current !== null && Math.abs(feed.scrollTop - ownScrollTopRef.current) < 1;
+              ownScrollTopRef.current = null;
+              if (!own) {
+                const change = followChangeAfterScroll(followingRef.current, lastScrollTopRef.current, feed);
+                if (change) setFollowing(change === "follow");
+                if (!followingRef.current) anchorRef.current = readAnchor(feed);
+              }
+              lastScrollTopRef.current = feed.scrollTop;
             }}
           >
             <div className="bilingual-row bilingual-row--header" aria-hidden="true">

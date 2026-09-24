@@ -16,6 +16,7 @@ import type {
   NoteAttachment,
   ProviderCatalog,
   RuntimePreferences,
+  SegmentSummary,
   ModelStatus,
   SessionDetail,
   SessionNotes,
@@ -50,6 +51,24 @@ const previewIdle = () =>
 /** A query parameter of the browser preview; null outside it. */
 const previewParam = (key: string) =>
   previewMode() ? new URLSearchParams(window.location.search).get(key) : null;
+
+/** `&backlog=N` starts the live preview with N committed rows (at most the
+ *  200-row window), so scrolling back through a long lecture can be tried at once. */
+function previewBacklog(): SegmentSummary[] {
+  const count = Math.min(200, Math.max(0, Math.trunc(Number(previewParam("backlog") ?? 0)) || 0));
+  return Array.from({ length: count }, (_, index) => {
+    const [original, translation] = previewScript[index % previewScript.length];
+    return {
+      id: `preview-backlog-${index}`,
+      ordinal: index - count,
+      start_ms: index * 4200,
+      end_ms: index * 4200 + 3800,
+      original,
+      translation,
+      translation_status: "done",
+    };
+  });
+}
 
 /** `&route=cloud` starts the preview on a cloud route (Deepgram + DeepL)
  *  with both uploads still off, to review the consent gate on Start. */
@@ -146,6 +165,7 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
           ...emptySnapshot,
           phase: "LISTENING",
           session_id: "preview-session",
+          previous_segments: previewBacklog(),
           started_at: new Date().toISOString(),
           config: { ...defaultSessionDefaults },
           route: {
