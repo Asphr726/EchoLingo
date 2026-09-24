@@ -12,5 +12,5 @@ serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
-[target.'cfg(target_os = "macos")'.build-dependencies]
+[build-dependencies]
 cc = "1.2"

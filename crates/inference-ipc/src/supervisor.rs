@@ -1,14 +1,16 @@
 use crate::{Hello, SidecarCommand, SidecarEvent, PROTOCOL_VERSION};
 use futures_util::{SinkExt, StreamExt};
+use process_support::ProcessTree;
 use std::collections::HashMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -17,6 +19,11 @@ use uuid::Uuid;
 /// Upper bound for one sidecar stderr log file before it rotates to `<name>.1`.
 pub const SIDECAR_LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
 const DIAGNOSTICS_RING_BYTES: usize = 16 * 1024;
+/// How long a sidecar asked to shut down may take before its process tree is
+/// terminated.
+const SHUTDOWN_EXIT_GRACE: Duration = Duration::from_secs(2);
+/// SIGTERM-to-SIGKILL grace when the process tree is terminated.
+const TERMINATE_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct SidecarLaunchConfig {
@@ -44,13 +51,13 @@ impl SidecarLaunchConfig {
         }
     }
 
-    pub fn desktop(project_root: PathBuf) -> Self {
+    /// The packaged-app configuration: `ECHOLINGO_SIDECAR_EXECUTABLE` when
+    /// set, else the `bundled` sidecar the shell resolved from its resources,
+    /// else the development Conda environment.
+    pub fn desktop(project_root: PathBuf, bundled: Option<PathBuf>) -> Self {
         let mut config = Self::development(project_root);
         if config.executable.is_none() {
-            config.executable = std::env::current_exe()
-                .ok()
-                .and_then(|path| path.parent().map(|parent| parent.join("echolingo-sidecar")))
-                .filter(|path| path.is_file());
+            config.executable = bundled;
         }
         if config.executable.is_some() {
             config.startup_timeout = Duration::from_secs(120);
@@ -82,7 +89,11 @@ pub enum SupervisorError {
 pub struct InferenceSupervisor {
     config: SidecarLaunchConfig,
     commands: Mutex<Option<mpsc::Sender<Message>>>,
-    child: Mutex<Option<Child>>,
+    child: Mutex<Option<ProcessTree>>,
+    /// Incremented by every launch (under the `child` lock) so the
+    /// disconnect cleanup of an earlier connection can never stop the
+    /// sidecar that replaced it.
+    generation: AtomicU64,
     events: broadcast::Sender<SidecarEvent>,
     secret_environment: Mutex<HashMap<String, String>>,
     /// `providers_digest` from the last accepted hello, when the sidecar sent one.
@@ -96,6 +107,7 @@ impl InferenceSupervisor {
             config,
             commands: Mutex::new(None),
             child: Mutex::new(None),
+            generation: AtomicU64::new(0),
             events,
             secret_environment: Mutex::new(HashMap::new()),
             providers_digest: Mutex::new(None),
@@ -124,6 +136,10 @@ impl InferenceSupervisor {
         if self.commands.lock().await.is_some() {
             return Ok(());
         }
+        let generation = {
+            let _child = self.child.lock().await;
+            self.generation.fetch_add(1, Ordering::AcqRel) + 1
+        };
         let token = if self.config.configured_url.is_some() {
             std::env::var("ECHOLINGO_IPC_TOKEN").unwrap_or_else(|_| {
                 format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
@@ -165,17 +181,20 @@ impl InferenceSupervisor {
                 .current_dir(working_directory)
                 .env("ECHOLINGO_IPC_TOKEN", &token)
                 .env("ECHOLINGO_PARENT_PID", std::process::id().to_string())
+                .env("PYTHONUTF8", "1")
+                .env("PYTHONIOENCODING", "utf-8")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
+                .stderr(Stdio::piped());
             for (name, value) in self.secret_environment.lock().await.iter() {
                 command.env(name, value);
             }
-            let mut child = command.spawn().map_err(SupervisorError::Launch)?;
+            // The sidecar's own children (the Conda wrapper's Python, model
+            // workers) belong to its process group / job and stop with it.
+            let mut child = ProcessTree::spawn(&mut command).map_err(SupervisorError::Launch)?;
             let diagnostics = Arc::new(Mutex::new(Vec::new()));
             let log_path = self.config.log_path.clone();
-            let stderr_task = child.stderr.take().map(|mut stderr| {
+            let stderr_task = child.child_mut().stderr.take().map(|mut stderr| {
                 let diagnostics = diagnostics.clone();
                 tokio::spawn(async move {
                     let mut chunk = [0_u8; 2048];
@@ -288,10 +307,17 @@ impl InferenceSupervisor {
                 }
             }
             if let Some(supervisor) = weak_supervisor.upgrade() {
-                supervisor.commands.lock().await.take();
-                if let Some(mut child) = supervisor.child.lock().await.take() {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
+                let child = {
+                    let mut child = supervisor.child.lock().await;
+                    if supervisor.generation.load(Ordering::Acquire) != generation {
+                        // A newer launch owns the sidecar now.
+                        return;
+                    }
+                    supervisor.commands.lock().await.take();
+                    child.take()
+                };
+                if let Some(mut child) = child {
+                    let _ = child.terminate(TERMINATE_GRACE).await;
                 }
                 let _ = event_bus.send(SidecarEvent::Error {
                     code: "sidecar_disconnected".into(),
@@ -363,6 +389,9 @@ impl InferenceSupervisor {
                 });
             }
             if tokio::time::Instant::now() >= deadline {
+                if let Some(mut child) = self.child.lock().await.take() {
+                    let _ = child.terminate(TERMINATE_GRACE).await;
+                }
                 return Err(SupervisorError::StartupTimeout);
             }
             sleep(Duration::from_millis(100)).await;
@@ -396,12 +425,15 @@ impl InferenceSupervisor {
             .map_err(|_| SupervisorError::ChannelClosed)
     }
 
+    /// Ask the sidecar to exit, give it [`SHUTDOWN_EXIT_GRACE`] to do so and
+    /// then terminate whatever remains of its process tree.
     pub async fn shutdown(&self) {
         let _ = self.send_command(SidecarCommand::Shutdown).await;
         self.commands.lock().await.take();
-        if let Some(mut child) = self.child.lock().await.take() {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+        let child = self.child.lock().await.take();
+        if let Some(mut child) = child {
+            let _ = child.wait_timeout(SHUTDOWN_EXIT_GRACE).await;
+            let _ = child.terminate(TERMINATE_GRACE).await;
         }
     }
 }

@@ -1922,6 +1922,8 @@ mod tests {
                 .iter()
                 .map(|(key, value)| (key.to_string(), value.to_string()))
                 .collect(),
+            store_available: true,
+            store_error: None,
         }
     }
 
@@ -2261,7 +2263,7 @@ mod tests {
         assert!(state
             .local_runtimes
             .set(runtime_manager::LocalRuntimeManager::new(crate::local_runtime_layout(
-                model_root, directory, directory, 1, 2,
+                model_root, directory, directory, None, 1, 2,
             )))
             .is_ok());
         state

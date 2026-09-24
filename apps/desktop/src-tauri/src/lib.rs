@@ -18,14 +18,15 @@ use inference_ipc::{
 };
 #[cfg(target_os = "macos")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use runtime_manager::gpu_pack::{GpuAccelerationStatus, GpuPackManager, GpuPackState};
 use runtime_manager::{
-    LocalRuntimeLayout, LocalRuntimeManager, ModelManager, ModelProgress, ModelStatus,
-    QwenStreamingProfile, RuntimeCommand,
+    GpuRuntimeLayout, LocalRuntimeLayout, LocalRuntimeManager, ModelManager, ModelProgress,
+    ModelStatus, QwenStreamingProfile, RuntimeCommand,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -68,6 +69,21 @@ struct CredentialGroupStatus {
     /// Effective non-secret settings: the stored preference, else the process
     /// environment, else the catalog default (empty defaults are omitted).
     settings: HashMap<String, String>,
+    /// `false` when the OS secure store (Keychain, Windows Credential
+    /// Manager, Secret Service) could not be read; `fields` then only
+    /// reflect environment variables.
+    store_available: bool,
+    store_error: Option<String>,
+}
+
+impl CredentialGroupStatus {
+    fn with_store_failure(mut self, failure: Option<&str>) -> Self {
+        if let Some(error) = failure {
+            self.store_available = false;
+            self.store_error = Some(error.to_string());
+        }
+        self
+    }
 }
 
 impl CredentialStore {
@@ -120,9 +136,11 @@ impl CredentialStore {
         }
     }
 
-    fn status(&self, providers: &ProviderSettings) -> Result<Vec<CredentialGroupStatus>, String> {
+    /// Every group's status. A secure store that cannot be read does not
+    /// fail the call: the statuses say so and report environment values.
+    fn status(&self, providers: &ProviderSettings) -> Vec<CredentialGroupStatus> {
         let failure = std::cell::RefCell::new(None);
-        let statuses = catalog()
+        let statuses: Vec<CredentialGroupStatus> = catalog()
             .credential_groups
             .iter()
             .map(|group| {
@@ -134,12 +152,14 @@ impl CredentialStore {
                 )
             })
             .collect();
-        if let Some(error) = failure.into_inner() {
-            return Err(error);
-        }
-        Ok(statuses)
+        let failure = failure.into_inner();
+        statuses
+            .into_iter()
+            .map(|status| status.with_store_failure(failure.as_deref()))
+            .collect()
     }
 
+    /// One group's status; fails only for an unknown group.
     fn group_status(
         &self,
         group_id: &str,
@@ -153,16 +173,15 @@ impl CredentialStore {
             process_env,
             providers,
         );
-        if let Some(error) = failure.into_inner() {
-            return Err(error);
-        }
-        Ok(status)
+        Ok(status.with_store_failure(failure.into_inner().as_deref()))
     }
 
+    /// The provider environment and, when the secure store could not be
+    /// read, why (the values then come from the process environment only).
     fn sidecar_environment(
         &self,
         providers: &ProviderSettings,
-    ) -> Result<HashMap<String, String>, String> {
+    ) -> (HashMap<String, String>, Option<String>) {
         let failure = std::cell::RefCell::new(None);
         let values = compose_sidecar_environment(
             catalog(),
@@ -170,10 +189,7 @@ impl CredentialStore {
             process_env,
             providers,
         );
-        if let Some(error) = failure.into_inner() {
-            return Err(error);
-        }
-        Ok(values)
+        (values, failure.into_inner())
     }
 }
 
@@ -249,6 +265,8 @@ fn group_status(
         group_id: group.id.clone(),
         fields,
         settings,
+        store_available: true,
+        store_error: None,
     }
 }
 
@@ -530,6 +548,10 @@ struct RuntimeState {
     catalog_mismatch_reported: std::sync::atomic::AtomicBool,
     models: std::sync::OnceLock<ModelManager>,
     local_runtimes: std::sync::OnceLock<LocalRuntimeManager>,
+    /// The optional NVIDIA acceleration pack (Windows/Linux x64).
+    gpu_pack: std::sync::OnceLock<GpuPackManager>,
+    /// The secure-store failure has been logged once this run.
+    credential_store_failure_reported: std::sync::atomic::AtomicBool,
     onboarding_complete: std::sync::atomic::AtomicBool,
     persistence_throttle: Mutex<PersistenceThrottle>,
     runtime_preferences: Mutex<RuntimePreferences>,
@@ -544,6 +566,50 @@ struct RuntimeState {
 
 fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
+}
+
+/// `echolingo-sidecar` with this platform's executable suffix.
+fn sidecar_file_name() -> String {
+    format!("echolingo-sidecar{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// Where a packaged sidecar lives, in lookup order: the onedir build shipped
+/// as the `sidecar/` resource (Windows, Linux), then next to the app
+/// executable (the macOS onefile `externalBin`).
+fn bundled_sidecar_candidates(
+    resource_directory: Option<&Path>,
+    executable_directory: Option<&Path>,
+) -> Vec<PathBuf> {
+    let name = sidecar_file_name();
+    resource_directory
+        .map(|directory| directory.join("sidecar").join(&name))
+        .into_iter()
+        .chain(executable_directory.map(|directory| directory.join(&name)))
+        .collect()
+}
+
+fn find_bundled_sidecar(
+    resource_directory: Option<&Path>,
+    executable_directory: Option<&Path>,
+) -> Option<PathBuf> {
+    bundled_sidecar_candidates(resource_directory, executable_directory)
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+}
+
+fn executable_directory() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+}
+
+/// The sidecar executable for the supervisor and the local runtimes:
+/// `ECHOLINGO_SIDECAR_EXECUTABLE`, else the bundled one; `None` selects the
+/// development Conda environment.
+fn resolve_sidecar_executable(resource_directory: Option<&Path>) -> Option<PathBuf> {
+    std::env::var_os("ECHOLINGO_SIDECAR_EXECUTABLE")
+        .map(PathBuf::from)
+        .or_else(|| find_bundled_sidecar(resource_directory, executable_directory().as_deref()))
 }
 
 impl Default for RuntimeState {
@@ -565,6 +631,8 @@ impl Default for RuntimeState {
             catalog_mismatch_reported: std::sync::atomic::AtomicBool::new(false),
             models: std::sync::OnceLock::new(),
             local_runtimes: std::sync::OnceLock::new(),
+            gpu_pack: std::sync::OnceLock::new(),
+            credential_store_failure_reported: std::sync::atomic::AtomicBool::new(false),
             onboarding_complete: std::sync::atomic::AtomicBool::new(false),
             persistence_throttle: Mutex::new(PersistenceThrottle::default()),
             runtime_preferences: Mutex::new(RuntimePreferences::default()),
@@ -616,8 +684,12 @@ impl PersistenceThrottle {
 
 impl RuntimeState {
     fn supervisor(&self) -> &Arc<InferenceSupervisor> {
-        self.supervisor
-            .get_or_init(|| InferenceSupervisor::new(SidecarLaunchConfig::desktop(project_root())))
+        self.supervisor.get_or_init(|| {
+            InferenceSupervisor::new(SidecarLaunchConfig::desktop(
+                project_root(),
+                find_bundled_sidecar(None, executable_directory().as_deref()),
+            ))
+        })
     }
 
     fn provider_settings(&self) -> Result<ProviderSettings, String> {
@@ -629,9 +701,23 @@ impl RuntimeState {
             .clone())
     }
 
+    /// Provider credentials and settings for the sidecar. An unreadable
+    /// secure store is logged once and the environment-variable keys are
+    /// used, so the sidecar and local providers still start.
     fn sidecar_environment(&self) -> Result<HashMap<String, String>, String> {
-        self.credentials
-            .sidecar_environment(&self.provider_settings()?)
+        let (values, failure) = self
+            .credentials
+            .sidecar_environment(&self.provider_settings()?);
+        if let Some(error) = failure {
+            if !self
+                .credential_store_failure_reported
+                .swap(true, Ordering::AcqRel)
+            {
+                eprintln!("secure credential store unavailable: {error}");
+                self.log_desktop_event(&format!("credential_store_unavailable error={error}"));
+            }
+        }
+        Ok(values)
     }
 
     /// The complete sidecar launch environment: provider credentials and
@@ -896,6 +982,54 @@ impl RuntimeState {
             .get()
             .ok_or_else(|| "local runtime manager is not initialized".to_string())
     }
+
+    fn gpu_pack(&self) -> Result<&GpuPackManager, String> {
+        self.gpu_pack
+            .get()
+            .ok_or_else(|| "GPU acceleration pack manager is not initialized".to_string())
+    }
+
+    fn gpu_acceleration_enabled(&self) -> bool {
+        self.runtime_preferences
+            .lock()
+            .is_ok_and(|preferences| preferences.gpu_acceleration)
+    }
+
+    /// The pack runtime when the user wants it and the installed pack has a
+    /// usable CUDA device; `None` selects the bundled CPU runtime.
+    fn desired_gpu_runtime(&self) -> Option<GpuRuntimeLayout> {
+        if !self.gpu_acceleration_enabled() {
+            return None;
+        }
+        self.gpu_pack.get()?.runtime_layout()
+    }
+
+    /// Point the local model services at the desired runtime, restarting
+    /// them on a change. Callers make sure no session uses them.
+    async fn apply_gpu_runtime(&self) -> Result<(), String> {
+        let desired = self.desired_gpu_runtime();
+        let accelerated = desired.is_some();
+        if self
+            .local_runtimes()?
+            .select_gpu_runtime(desired)
+            .await
+        {
+            self.log_desktop_event(&format!("local_runtime_selected gpu={accelerated}"));
+        }
+        Ok(())
+    }
+
+    async fn gpu_status(&self) -> Result<GpuAccelerationStatus, String> {
+        let runtimes = self.local_runtimes()?;
+        Ok(self
+            .gpu_pack()?
+            .status(
+                self.gpu_acceleration_enabled(),
+                runtimes.gpu_active(),
+                runtimes.gpu_fallback_reason(),
+            )
+            .await)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -932,6 +1066,9 @@ struct RuntimePreferences {
     providers: ProviderSettings,
     /// AI assistant for session notes and titles.
     assistant: AssistantPreferences,
+    /// Run the local models on the NVIDIA acceleration pack when it is
+    /// installed and usable. Changed only through `set_gpu_acceleration`.
+    gpu_acceleration: bool,
 }
 
 impl Default for RuntimePreferences {
@@ -940,6 +1077,7 @@ impl Default for RuntimePreferences {
             preload_local_models: true,
             providers: ProviderSettings::new(),
             assistant: AssistantPreferences::default(),
+            gpu_acceleration: true,
         }
     }
 }
@@ -1003,25 +1141,27 @@ fn validate_caption_preferences(preferences: &CaptionPreferences) -> Result<(), 
     Ok(())
 }
 
+/// `name` (plus the platform's executable suffix) on `PATH`.
 fn executable_on_path(name: &str) -> Option<PathBuf> {
+    let name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
-            .map(|directory| directory.join(name))
+            .map(|directory| directory.join(&name))
             .find(|candidate| candidate.is_file())
     })
 }
 
+/// The local runtime layout. `bundled_sidecar` is the resolved sidecar
+/// executable (see [`resolve_sidecar_executable`]); it serves
+/// `qwen-asr-server` and wraps llama.cpp in its owner watchdog.
 fn local_runtime_layout(
     model_root: PathBuf,
-    app_data_directory: &std::path::Path,
-    resource_directory: &std::path::Path,
+    app_data_directory: &Path,
+    resource_directory: &Path,
+    bundled_sidecar: Option<PathBuf>,
     qwen_port: u16,
     hymt_port: u16,
 ) -> LocalRuntimeLayout {
-    let bundled_sidecar = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join("echolingo-sidecar")))
-        .filter(|path| path.is_file());
     let worker_wrapper = bundled_sidecar.clone();
     let qwen_command = if let Some(executable) =
         std::env::var_os("ECHOLINGO_QWEN_ASR_COMMAND").map(PathBuf::from)
@@ -1052,7 +1192,10 @@ fn local_runtime_layout(
             environment: HashMap::new(),
         }
     };
-    let bundled_llama = resource_directory.join("runtimes/llama.cpp/llama-server");
+    let bundled_llama = resource_directory
+        .join("runtimes")
+        .join("llama.cpp")
+        .join(format!("llama-server{}", std::env::consts::EXE_SUFFIX));
     let llama_server = std::env::var_os("ECHOLINGO_LLAMA_SERVER")
         .map(PathBuf::from)
         .filter(|path| path.is_file())
@@ -1258,9 +1401,15 @@ fn list_providers() -> Result<Value, String> {
     Ok(catalog_value())
 }
 
+/// Keychain reads can block (or prompt), so they run off the async runtime.
 #[tauri::command]
-fn credential_status(state: State<'_, RuntimeState>) -> Result<Vec<CredentialGroupStatus>, String> {
-    state.credentials.status(&state.provider_settings()?)
+async fn credential_status(
+    state: State<'_, RuntimeState>,
+) -> Result<Vec<CredentialGroupStatus>, String> {
+    let providers = state.provider_settings()?;
+    tauri::async_runtime::spawn_blocking(move || CredentialStore.status(&providers))
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1485,12 +1634,51 @@ fn list_models(state: State<'_, RuntimeState>) -> Result<Vec<ModelStatus>, Strin
     Ok(state.models()?.list())
 }
 
+/// The local model services that keep files of `model_id` open; the
+/// forced aligner runs inside the sidecar itself.
+fn services_using_model(model_id: &str) -> &'static [&'static str] {
+    match model_id {
+        "qwen3-asr-0.6b" => &["qwen_asr"],
+        "hymt2-1.8b" => &["hymt"],
+        _ => &[],
+    }
+}
+
+const MODEL_SESSION_BUSY: &str = "Stop the current session before changing local models";
+
+/// Stop every process that has files of `model_id` open, so the files can
+/// be replaced or deleted (Windows refuses to while they are open). Refused
+/// during a session and while assistant jobs use the sidecar.
+async fn release_model_files(state: &RuntimeState, model_id: &str) -> Result<(), String> {
+    let _lifecycle = state.sidecar_lifecycle.lock().await;
+    if !state.is_idle() {
+        return Err(MODEL_SESSION_BUSY.into());
+    }
+    let in_sidecar = state
+        .models()?
+        .status(model_id)
+        .map_err(|error| error.to_string())?
+        .role
+        == runtime_manager::ModelRole::Alignment;
+    if in_sidecar {
+        if state.assistant.any_running() {
+            return Err(assistant::ASSISTANT_BUSY.into());
+        }
+        state.supervisor().shutdown().await;
+    }
+    for service in services_using_model(model_id) {
+        state.local_runtimes()?.stop_service(service).await;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn install_model(
     app: AppHandle,
     state: State<'_, RuntimeState>,
     model_id: String,
 ) -> Result<ModelStatus, String> {
+    release_model_files(&state, &model_id).await?;
     let progress_app = app.clone();
     let callback = Arc::new(move |progress: ModelProgress| {
         let _ = progress_app.emit(MODEL_PROGRESS_CHANNEL, progress);
@@ -1515,11 +1703,117 @@ async fn verify_model(
 }
 
 #[tauri::command]
-fn delete_model(state: State<'_, RuntimeState>, model_id: String) -> Result<ModelStatus, String> {
+async fn delete_model(
+    app: AppHandle,
+    state: State<'_, RuntimeState>,
+    model_id: String,
+) -> Result<ModelStatus, String> {
+    release_model_files(&state, &model_id).await?;
+    // Deleting gigabytes can take a while; keep it off the async runtime.
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<RuntimeState>()
+            .models()?
+            .delete(&model_id)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+const GPU_SESSION_BUSY: &str = "Stop the current session before changing GPU acceleration";
+
+#[tauri::command]
+async fn gpu_acceleration_status(
+    state: State<'_, RuntimeState>,
+) -> Result<GpuAccelerationStatus, String> {
+    state.gpu_status().await
+}
+
+/// Download, verify, self-test and activate the NVIDIA acceleration pack.
+/// Long-running; progress goes to the model-progress channel with
+/// `model_id: "gpu-pack"`.
+#[tauri::command]
+async fn install_gpu_pack(
+    app: AppHandle,
+    state: State<'_, RuntimeState>,
+) -> Result<GpuAccelerationStatus, String> {
+    if !state.is_idle() {
+        return Err(GPU_SESSION_BUSY.into());
+    }
+    let status = state.gpu_status().await?;
+    if !status.supported_platform || !status.eligible {
+        return Err(status
+            .ineligible_reason
+            .unwrap_or_else(|| "GPU acceleration is not available on this computer".into()));
+    }
+    if status.pack_state != GpuPackState::NotInstalled {
+        // Replacing a pack: move the services off its files first.
+        state.local_runtimes()?.select_gpu_runtime(None).await;
+    }
+    let progress_app = app.clone();
+    let callback = Arc::new(move |progress: ModelProgress| {
+        let _ = progress_app.emit(MODEL_PROGRESS_CHANNEL, progress);
+    });
+    let installed = state.gpu_pack()?.install(callback).await;
+    match &installed {
+        Ok(record) => {
+            state.local_runtimes()?.clear_gpu_fallback();
+            state.log_desktop_event(&format!(
+                "gpu_pack_installed version={} cuda_available={:?}",
+                record.manifest.app_version,
+                record.cuda_available()
+            ));
+        }
+        Err(error) => state.log_desktop_event(&format!("gpu_pack_install_failed error={error}")),
+    }
+    // A session started during the download picks the pack up at its end.
+    if state.is_idle() {
+        state.apply_gpu_runtime().await?;
+    }
+    installed.map_err(|error| error.to_string())?;
+    state.gpu_status().await
+}
+
+#[tauri::command]
+async fn remove_gpu_pack(
+    app: AppHandle,
+    state: State<'_, RuntimeState>,
+) -> Result<GpuAccelerationStatus, String> {
+    if !state.is_idle() {
+        return Err(GPU_SESSION_BUSY.into());
+    }
+    state.local_runtimes()?.select_gpu_runtime(None).await;
+    let removal_app = app.clone();
+    let removed = tauri::async_runtime::spawn_blocking(move || {
+        removal_app
+            .state::<RuntimeState>()
+            .gpu_pack()?
+            .remove()
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    state.apply_gpu_runtime().await?;
+    removed?;
+    state.gpu_status().await
+}
+
+#[tauri::command]
+async fn set_gpu_acceleration(
+    state: State<'_, RuntimeState>,
+    enabled: bool,
+) -> Result<GpuAccelerationStatus, String> {
+    if !state.is_idle() {
+        return Err(GPU_SESSION_BUSY.into());
+    }
     state
-        .models()?
-        .delete(&model_id)
-        .map_err(|error| error.to_string())
+        .runtime_preferences
+        .lock()
+        .map_err(|_| "runtime preferences lock poisoned".to_string())?
+        .gpu_acceleration = enabled;
+    state.persist_preferences()?;
+    state.apply_gpu_runtime().await?;
+    state.gpu_status().await
 }
 
 fn route_status(value: &Value) -> RouteStatus {
@@ -2252,6 +2546,8 @@ async fn update_runtime_preferences(
             .runtime_preferences
             .lock()
             .map_err(|_| "runtime preferences lock poisoned".to_string())?;
+        // Only `set_gpu_acceleration` changes it (it also switches runtimes).
+        preferences.gpu_acceleration = guard.gpu_acceleration;
         std::mem::replace(&mut *guard, preferences.clone())
     };
     state.persist_preferences()?;
@@ -2370,6 +2666,9 @@ async fn prepare_inference_runtimes(
     })
     .await
     .map_err(|_| "inference route planning timed out".to_string())??;
+    // No session uses the services yet: apply a GPU runtime change that
+    // arrived while one did.
+    state.apply_gpu_runtime().await?;
     for service in &services_to_start {
         state.emit_event(
             app,
@@ -2377,11 +2676,27 @@ async fn prepare_inference_runtimes(
             UiEventKind::BackendHealth,
             json!({"service": service, "state": "starting"}),
         )?;
-        state
-            .local_runtimes()?
-            .ensure_service(service)
-            .await
-            .map_err(|error| error.to_string())?;
+        let runtimes = state.local_runtimes()?;
+        let accelerated = runtimes.gpu_active();
+        let started = runtimes.ensure_service(service).await;
+        if accelerated {
+            if let Some(reason) = runtimes.gpu_fallback_reason() {
+                state.log_desktop_event(&format!("gpu_fallback {reason}"));
+                let _ = state.emit_event(
+                    app,
+                    Some(session_id),
+                    UiEventKind::Error,
+                    json!({
+                        "code": "gpu_fallback",
+                        "message": format!(
+                            "GPU acceleration could not start, so the CPU is used for now. {reason}"
+                        ),
+                        "recoverable": true
+                    }),
+                );
+            }
+        }
+        started.map_err(|error| error.to_string())?;
         state.emit_event(
             app,
             Some(session_id),
@@ -2827,6 +3142,12 @@ async fn history_export_to_path(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // WebKitGTK's DMA-BUF renderer shows blank windows with several GPU
+    // drivers (notably NVIDIA); the plain renderer works everywhere.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(RuntimeState::default())
@@ -2848,6 +3169,10 @@ pub fn run() {
             install_model,
             verify_model,
             delete_model,
+            gpu_acceleration_status,
+            install_gpu_pack,
+            remove_gpu_pack,
+            set_gpu_acceleration,
             list_audio_devices,
             get_caption_preferences,
             get_session_defaults,
@@ -2878,9 +3203,18 @@ pub fn run() {
         ])
         .setup(|app| {
             let state = app.state::<RuntimeState>();
-            let app_data_directory = app.path().app_data_dir()?;
+            // Local (not roaming) data: models and runtimes are gigabytes.
+            // Identical to the app data directory on macOS and Linux.
+            let app_data_directory = app.path().app_local_data_dir()?;
+            let resource_directory = app.path().resource_dir()?;
             let logs_directory = app_data_directory.join("logs");
-            let mut launch = SidecarLaunchConfig::desktop(project_root());
+            let mut launch = SidecarLaunchConfig::desktop(
+                project_root(),
+                find_bundled_sidecar(
+                    Some(&resource_directory),
+                    executable_directory().as_deref(),
+                ),
+            );
             launch.log_path = Some(logs_directory.join(SIDECAR_LOG_FILE));
             state
                 .supervisor
@@ -2905,7 +3239,6 @@ pub fn run() {
                 .models
                 .set(ModelManager::new(model_root.clone()))
                 .map_err(|_| std::io::Error::other("model manager already initialized"))?;
-            let resource_directory = app.path().resource_dir()?;
             let (qwen_reservation, hymt_reservation) = reserve_local_runtime_ports()?;
             let qwen_port = qwen_reservation.local_addr()?.port();
             let hymt_port = hymt_reservation.local_addr()?.port();
@@ -2916,6 +3249,7 @@ pub fn run() {
                         model_root,
                         &app_data_directory,
                         &resource_directory,
+                        resolve_sidecar_executable(Some(&resource_directory)),
                         qwen_port,
                         hymt_port,
                     ),
@@ -2923,6 +3257,13 @@ pub fn run() {
                     hymt_reservation,
                 ))
                 .map_err(|_| std::io::Error::other("local runtime manager already initialized"))?;
+            state
+                .gpu_pack
+                .set(GpuPackManager::new(
+                    app_data_directory.join("runtimes"),
+                    env!("CARGO_PKG_VERSION"),
+                ))
+                .map_err(|_| std::io::Error::other("GPU pack manager already initialized"))?;
             let preferences = load_preferences(&preferences_path);
             state
                 .onboarding_complete
@@ -2949,6 +3290,18 @@ pub fn run() {
             if let Ok(mut runtime) = state.runtime_preferences.lock() {
                 *runtime = preferences.runtime;
             }
+            // Before any warm-up starts a service. (No desktop.log line here:
+            // its redaction reads the secure store, which may block setup.)
+            let gpu_runtime = state.desired_gpu_runtime();
+            if gpu_runtime.is_some() {
+                eprintln!("local model services use the GPU acceleration pack");
+            }
+            tauri::async_runtime::block_on(
+                state
+                    .local_runtimes()
+                    .map_err(std::io::Error::other)?
+                    .select_gpu_runtime(gpu_runtime),
+            );
             if std::env::var("ECHOLINGO_PRELOAD_LOCAL_MODELS").as_deref() != Ok("0") {
                 warm_local_runtimes(app.handle().clone());
             }
@@ -2966,8 +3319,13 @@ pub fn run() {
                 api.prevent_close();
                 let window = window.clone();
                 tauri::async_runtime::spawn(async move {
-                    shutdown_application(window.app_handle()).await;
+                    let app = window.app_handle().clone();
+                    shutdown_application(&app).await;
                     let _ = window.destroy();
+                    // Only macOS apps outlive their last window; elsewhere the
+                    // hidden caption window would keep the process running.
+                    #[cfg(not(target_os = "macos"))]
+                    app.exit(0);
                 });
             }
         })
@@ -3033,6 +3391,12 @@ mod tests {
         persist_sidecar_event(state, event_session_id, event).await
     }
 
+    #[cfg(not(unix))]
+    fn resident_set_bytes() -> Option<u64> {
+        None
+    }
+
+    #[cfg(unix)]
     fn resident_set_bytes() -> Option<u64> {
         let output = std::process::Command::new("/bin/ps")
             .args(["-o", "rss=", "-p", &std::process::id().to_string()])
@@ -3300,6 +3664,11 @@ mod tests {
         );
         let serialized = serde_json::to_string(&status).unwrap();
         assert!(!serialized.contains("sekrit") && !serialized.contains("ws-123"));
+        assert!(status.store_available && status.store_error.is_none());
+        let unavailable = status.with_store_failure(Some("Secret Service is not running"));
+        let serialized = serde_json::to_value(&unavailable).unwrap();
+        assert_eq!(serialized["store_available"], false);
+        assert_eq!(serialized["store_error"], "Secret Service is not running");
 
         let none = |_: &str| None;
         let status = group_status(group, none, none, &ProviderSettings::new());
@@ -3477,6 +3846,88 @@ mod tests {
     }
 
     #[test]
+    fn packaged_sidecar_lookup_prefers_the_onedir_resource() {
+        let directory = tempfile::tempdir().unwrap();
+        let resources = directory.path().join("resources");
+        let executables = directory.path().join("bin");
+        let name = format!("echolingo-sidecar{}", std::env::consts::EXE_SUFFIX);
+        let onedir = resources.join("sidecar").join(&name);
+        let adjacent = executables.join(&name);
+        assert_eq!(
+            bundled_sidecar_candidates(Some(&resources), Some(&executables)),
+            vec![onedir.clone(), adjacent.clone()]
+        );
+        assert_eq!(find_bundled_sidecar(Some(&resources), Some(&executables)), None);
+        std::fs::create_dir_all(&executables).unwrap();
+        std::fs::write(&adjacent, b"onefile").unwrap();
+        assert_eq!(
+            find_bundled_sidecar(Some(&resources), Some(&executables)),
+            Some(adjacent.clone())
+        );
+        std::fs::create_dir_all(onedir.parent().unwrap()).unwrap();
+        std::fs::write(&onedir, b"onedir").unwrap();
+        assert_eq!(
+            find_bundled_sidecar(Some(&resources), Some(&executables)),
+            Some(onedir)
+        );
+        assert_eq!(find_bundled_sidecar(None, Some(&executables)), Some(adjacent));
+    }
+
+    #[test]
+    fn local_runtime_layout_uses_the_resolved_sidecar_and_bundled_llama() {
+        let directory = tempfile::tempdir().unwrap();
+        let llama = directory
+            .path()
+            .join("runtimes")
+            .join("llama.cpp")
+            .join(format!("llama-server{}", std::env::consts::EXE_SUFFIX));
+        std::fs::create_dir_all(llama.parent().unwrap()).unwrap();
+        std::fs::write(&llama, b"llama").unwrap();
+        let sidecar = directory.path().join("sidecar").join("echolingo-sidecar");
+        let layout = local_runtime_layout(
+            directory.path().join("models"),
+            directory.path(),
+            directory.path(),
+            Some(sidecar.clone()),
+            1,
+            2,
+        );
+        if std::env::var_os("ECHOLINGO_QWEN_ASR_COMMAND").is_none() {
+            assert_eq!(layout.qwen_command.executable, sidecar);
+            assert_eq!(layout.qwen_command.args, ["qwen-asr-server"]);
+        }
+        assert_eq!(layout.worker_wrapper.as_ref(), Some(&sidecar));
+        if std::env::var_os("ECHOLINGO_LLAMA_SERVER").is_none() {
+            assert_eq!(layout.llama_server, Some(llama));
+        }
+        assert_eq!(layout.log_root, directory.path().join("logs"));
+    }
+
+    #[test]
+    fn gpu_acceleration_defaults_on_and_survives_older_files() {
+        let legacy: RuntimePreferences =
+            serde_json::from_str(r#"{"preload_local_models": false}"#).unwrap();
+        assert!(legacy.gpu_acceleration);
+        let off: RuntimePreferences =
+            serde_json::from_str(r#"{"gpu_acceleration": false}"#).unwrap();
+        assert!(!off.gpu_acceleration && off.preload_local_models);
+        let serialized = serde_json::to_value(RuntimePreferences::default()).unwrap();
+        assert_eq!(serialized["gpu_acceleration"], true);
+    }
+
+    #[test]
+    fn model_changes_stop_the_services_that_hold_their_files() {
+        assert_eq!(services_using_model("qwen3-asr-0.6b"), ["qwen_asr"]);
+        assert_eq!(services_using_model("hymt2-1.8b"), ["hymt"]);
+        assert!(services_using_model("qwen3-forced-aligner-0.6b").is_empty());
+        for spec in runtime_manager::catalog() {
+            let covered = !services_using_model(&spec.id).is_empty()
+                || spec.role == runtime_manager::ModelRole::Alignment;
+            assert!(covered, "{} has no owner to stop", spec.id);
+        }
+    }
+
+    #[test]
     fn redaction_scrubs_known_secrets_only() {
         let secrets = ["sk-live-abcdef", "abc"];
         assert_eq!(
@@ -3507,13 +3958,14 @@ mod tests {
             "ECHOLINGO_LOCAL_QWEN_URL".to_string(),
             "http://127.0.0.1:4100".to_string(),
         )]);
-        let root = PathBuf::from("/data/EchoLingo/models");
+        let data = PathBuf::from("/data").join("EchoLingo");
+        let root = data.join("models");
         let values = compose_full_sidecar_environment(secrets, &root, capabilities).unwrap();
         assert_eq!(values["DASHSCOPE_API_KEY"], "sk-test-1");
-        assert_eq!(values["ECHOLINGO_MODEL_ROOT"], "/data/EchoLingo/models");
+        assert_eq!(Path::new(&values["ECHOLINGO_MODEL_ROOT"]), root);
         assert_eq!(
-            values["ECHOLINGO_ALIGNMENT_SPOOL_ROOT"],
-            "/data/EchoLingo/alignment-spool"
+            Path::new(&values["ECHOLINGO_ALIGNMENT_SPOOL_ROOT"]),
+            data.join("alignment-spool")
         );
         assert_eq!(values["ECHOLINGO_LOCAL_QWEN_URL"], "http://127.0.0.1:4100");
         assert!(compose_full_sidecar_environment(

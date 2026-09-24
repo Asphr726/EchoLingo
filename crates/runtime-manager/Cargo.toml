@@ -6,13 +6,20 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+chrono.workspace = true
 fs2 = "0.4"
 hf-hub = "1.0"
+process-support = { path = "../process-support" }
+# The rustls-based client hf-hub already brings in (no OpenSSL).
+reqwest = "0.13"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tar = "0.4"
 thiserror.workspace = true
 tokio.workspace = true
+url = "2"
+zstd = "0.14"
 
 [dev-dependencies]
 tempfile = "3"

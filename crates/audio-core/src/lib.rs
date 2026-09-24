@@ -14,6 +14,10 @@ use tokio::sync::mpsc;
 
 pub const INTERNAL_SAMPLE_RATE_HZ: u32 = 48_000;
 pub const CAPTURE_QUEUE_FRAMES: usize = 64;
+/// System-audio device ids (see [`AudioDevice::system_audio`]).
+pub const MACOS_SYSTEM_AUDIO_DEVICE_ID: &str = "macos-screen-capture-kit";
+pub const WINDOWS_LOOPBACK_DEVICE_ID: &str = "windows-wasapi-loopback";
+pub const UNAVAILABLE_SYSTEM_AUDIO_DEVICE_ID: &str = "system-audio-unavailable";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -65,11 +69,25 @@ pub fn audio_permission_status() -> AudioPermissionStatus {
     }
 }
 
+/// Windows records the default output through WASAPI loopback without a
+/// separate consent; other platforms without a native implementation have
+/// no system audio at all.
+#[cfg(not(target_os = "macos"))]
+fn system_audio_permission() -> PermissionState {
+    if cfg!(target_os = "windows") {
+        PermissionState::Granted
+    } else {
+        PermissionState::Unavailable
+    }
+}
+
+/// Off macOS the OS grants desktop apps microphone access without an
+/// in-app prompt.
 #[cfg(not(target_os = "macos"))]
 pub fn audio_permission_status() -> AudioPermissionStatus {
     AudioPermissionStatus {
-        microphone: PermissionState::NotDetermined,
-        system_audio: PermissionState::Unavailable,
+        microphone: PermissionState::Granted,
+        system_audio: system_audio_permission(),
     }
 }
 
@@ -88,8 +106,8 @@ pub fn request_audio_permission(kind: PermissionKind) -> PermissionState {
 #[cfg(not(target_os = "macos"))]
 pub fn request_audio_permission(kind: PermissionKind) -> PermissionState {
     match kind {
-        PermissionKind::Microphone => PermissionState::NotDetermined,
-        PermissionKind::SystemAudio => PermissionState::Unavailable,
+        PermissionKind::Microphone => PermissionState::Granted,
+        PermissionKind::SystemAudio => system_audio_permission(),
     }
 }
 
@@ -104,14 +122,42 @@ pub struct AudioDevice {
 }
 
 impl AudioDevice {
+    /// The system-audio entry of the device list: the ScreenCaptureKit picker
+    /// on macOS, loopback of the default output on Windows, and an
+    /// unavailable placeholder elsewhere.
+    #[cfg(target_os = "macos")]
     pub fn system_audio() -> Self {
         Self {
-            id: "macos-screen-capture-kit".into(),
+            id: MACOS_SYSTEM_AUDIO_DEVICE_ID.into(),
             name: "System Audio…".into(),
             kind: AudioSourceKind::SystemAudio,
             is_default: false,
-            available: cfg!(target_os = "macos"),
+            available: true,
             requires_picker: true,
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn system_audio() -> Self {
+        Self {
+            id: WINDOWS_LOOPBACK_DEVICE_ID.into(),
+            name: "System audio (default output)".into(),
+            kind: AudioSourceKind::SystemAudio,
+            is_default: false,
+            available: cpal::default_host().default_output_device().is_some(),
+            requires_picker: false,
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    pub fn system_audio() -> Self {
+        Self {
+            id: UNAVAILABLE_SYSTEM_AUDIO_DEVICE_ID.into(),
+            name: "System audio".into(),
+            kind: AudioSourceKind::SystemAudio,
+            is_default: false,
+            available: false,
+            requires_picker: false,
         }
     }
 }
@@ -196,6 +242,12 @@ pub fn list_audio_devices() -> Result<Vec<AudioDevice>, AudioError> {
     for device in devices {
         let Ok(id) = device.id() else { continue };
         let id = id.to_string();
+        if cfg!(target_os = "linux")
+            && default_id.as_deref() != Some(id.as_str())
+            && !is_listed_alsa_input(&id)
+        {
+            continue;
+        }
         let name = device
             .description()
             .map(|description| description.name().to_string())
@@ -212,6 +264,15 @@ pub fn list_audio_devices() -> Result<Vec<AudioDevice>, AudioError> {
     result.sort_by_key(|device| (!device.is_default, device.name.clone()));
     result.push(AudioDevice::system_audio());
     Ok(result)
+}
+
+/// ALSA lists every plugin and hardware alias of every card; offer the ones
+/// a user would pick (the sound server and each card's default).
+fn is_listed_alsa_input(device_id: &str) -> bool {
+    let pcm = device_id
+        .split_once(':')
+        .map_or(device_id, |(_, pcm)| pcm);
+    matches!(pcm, "default" | "pipewire" | "pulse") || pcm.starts_with("sysdefault:CARD=")
 }
 
 pub struct AudioCaptureSession {
@@ -249,8 +310,10 @@ impl Drop for AudioCaptureSession {
 }
 
 enum CaptureControl {
-    Microphone {
+    Cpal {
         stream: cpal::Stream,
+        /// A silent output stream that keeps a loopback endpoint running.
+        keep_alive: Option<cpal::Stream>,
         events: mpsc::Sender<AudioSourceEvent>,
         stopped: AtomicBool,
     },
@@ -261,7 +324,7 @@ enum CaptureControl {
 impl CaptureControl {
     fn pause(&self) -> Result<(), AudioError> {
         match self {
-            Self::Microphone { stream, events, .. } => {
+            Self::Cpal { stream, events, .. } => {
                 stream
                     .pause()
                     .map_err(|error| AudioError::Control(error.to_string()))?;
@@ -275,7 +338,7 @@ impl CaptureControl {
 
     fn resume(&self) -> Result<(), AudioError> {
         match self {
-            Self::Microphone { stream, events, .. } => {
+            Self::Cpal { stream, events, .. } => {
                 stream
                     .play()
                     .map_err(|error| AudioError::Control(error.to_string()))?;
@@ -289,12 +352,16 @@ impl CaptureControl {
 
     fn stop(&mut self) -> Result<(), AudioError> {
         match self {
-            Self::Microphone {
+            Self::Cpal {
                 stream,
+                keep_alive,
                 events,
                 stopped,
             } => {
                 if !stopped.swap(true, Ordering::SeqCst) {
+                    if let Some(keep_alive) = keep_alive {
+                        let _ = keep_alive.pause();
+                    }
                     stream
                         .pause()
                         .map_err(|error| AudioError::Control(error.to_string()))?;
@@ -310,42 +377,39 @@ impl CaptureControl {
 
 pub fn start_microphone(device_id: Option<&str>) -> Result<AudioCaptureSession, AudioError> {
     let (device, supported) = select_microphone_config(device_id)?;
+    start_cpal_capture(&device, supported, None)
+}
+
+/// Capture `device` in its `supported` format. `keep_alive` is a stream that
+/// has to live (and stop) with the capture.
+fn start_cpal_capture(
+    device: &cpal::Device,
+    supported: cpal::SupportedStreamConfig,
+    keep_alive: Option<cpal::Stream>,
+) -> Result<AudioCaptureSession, AudioError> {
     let sample_format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
     let (frame_tx, frame_rx) = mpsc::channel(CAPTURE_QUEUE_FRAMES);
     let (event_tx, event_rx) = mpsc::channel(32);
     let dropped = Arc::new(AtomicBool::new(false));
+    let events = event_tx.clone();
     let stream = match sample_format {
-        SampleFormat::F32 => {
-            build_stream::<f32>(&device, &config, frame_tx, event_tx.clone(), dropped)?
+        SampleFormat::F32 => build_stream::<f32>(device, &config, frame_tx, events, dropped)?,
+        SampleFormat::F64 => build_stream::<f64>(device, &config, frame_tx, events, dropped)?,
+        SampleFormat::I8 => build_stream::<i8>(device, &config, frame_tx, events, dropped)?,
+        SampleFormat::I16 => build_stream::<i16>(device, &config, frame_tx, events, dropped)?,
+        SampleFormat::I24 => {
+            build_stream::<cpal::I24>(device, &config, frame_tx, events, dropped)?
         }
-        SampleFormat::F64 => {
-            build_stream::<f64>(&device, &config, frame_tx, event_tx.clone(), dropped)?
+        SampleFormat::I32 => build_stream::<i32>(device, &config, frame_tx, events, dropped)?,
+        SampleFormat::I64 => build_stream::<i64>(device, &config, frame_tx, events, dropped)?,
+        SampleFormat::U8 => build_stream::<u8>(device, &config, frame_tx, events, dropped)?,
+        SampleFormat::U16 => build_stream::<u16>(device, &config, frame_tx, events, dropped)?,
+        SampleFormat::U24 => {
+            build_stream::<cpal::U24>(device, &config, frame_tx, events, dropped)?
         }
-        SampleFormat::I8 => {
-            build_stream::<i8>(&device, &config, frame_tx, event_tx.clone(), dropped)?
-        }
-        SampleFormat::I16 => {
-            build_stream::<i16>(&device, &config, frame_tx, event_tx.clone(), dropped)?
-        }
-        SampleFormat::I32 => {
-            build_stream::<i32>(&device, &config, frame_tx, event_tx.clone(), dropped)?
-        }
-        SampleFormat::I64 => {
-            build_stream::<i64>(&device, &config, frame_tx, event_tx.clone(), dropped)?
-        }
-        SampleFormat::U8 => {
-            build_stream::<u8>(&device, &config, frame_tx, event_tx.clone(), dropped)?
-        }
-        SampleFormat::U16 => {
-            build_stream::<u16>(&device, &config, frame_tx, event_tx.clone(), dropped)?
-        }
-        SampleFormat::U32 => {
-            build_stream::<u32>(&device, &config, frame_tx, event_tx.clone(), dropped)?
-        }
-        SampleFormat::U64 => {
-            build_stream::<u64>(&device, &config, frame_tx, event_tx.clone(), dropped)?
-        }
+        SampleFormat::U32 => build_stream::<u32>(device, &config, frame_tx, events, dropped)?,
+        SampleFormat::U64 => build_stream::<u64>(device, &config, frame_tx, events, dropped)?,
         _ => return Err(AudioError::UnsupportedFormat),
     };
     stream
@@ -355,8 +419,9 @@ pub fn start_microphone(device_id: Option<&str>) -> Result<AudioCaptureSession, 
     Ok(AudioCaptureSession {
         frames: Some(frame_rx),
         events: Some(event_rx),
-        control: CaptureControl::Microphone {
+        control: CaptureControl::Cpal {
             stream,
+            keep_alive,
             events: event_tx,
             stopped: AtomicBool::new(false),
         },
@@ -375,11 +440,31 @@ pub fn preferred_capture_format(
                 channels: config.channels(),
             })
         }
-        AudioSourceKind::SystemAudio => Ok(CaptureFormat {
-            sample_rate_hz: INTERNAL_SAMPLE_RATE_HZ,
-            channels: 2,
-        }),
+        AudioSourceKind::SystemAudio => system_audio_format(),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn system_audio_format() -> Result<CaptureFormat, AudioError> {
+    Ok(CaptureFormat {
+        sample_rate_hz: INTERNAL_SAMPLE_RATE_HZ,
+        channels: 2,
+    })
+}
+
+/// Loopback delivers the default output's mix format.
+#[cfg(target_os = "windows")]
+fn system_audio_format() -> Result<CaptureFormat, AudioError> {
+    let (_, config) = windows_loopback::select_config()?;
+    Ok(CaptureFormat {
+        sample_rate_hz: config.sample_rate(),
+        channels: config.channels(),
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn system_audio_format() -> Result<CaptureFormat, AudioError> {
+    Err(AudioError::SystemAudioUnsupported)
 }
 
 fn select_microphone_config(
@@ -487,9 +572,77 @@ pub fn start_system_audio() -> Result<AudioCaptureSession, AudioError> {
     macos::start()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+pub fn start_system_audio() -> Result<AudioCaptureSession, AudioError> {
+    windows_loopback::start()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn start_system_audio() -> Result<AudioCaptureSession, AudioError> {
     Err(AudioError::SystemAudioUnsupported)
+}
+
+/// WASAPI loopback of the default output device: cpal opens an input stream
+/// on a render endpoint in loopback mode (`AUDCLNT_STREAMFLAGS_LOOPBACK`).
+#[cfg(target_os = "windows")]
+mod windows_loopback {
+    use super::*;
+
+    pub(super) fn select_config(
+    ) -> Result<(cpal::Device, cpal::SupportedStreamConfig), AudioError> {
+        let device = cpal::default_host()
+            .default_output_device()
+            .ok_or_else(|| AudioError::DeviceNotFound("default output".into()))?;
+        // Shared-mode loopback has to use the endpoint's mix format.
+        let config = device
+            .default_output_config()
+            .map_err(|error| AudioError::Build(error.to_string()))?;
+        Ok((device, config))
+    }
+
+    pub(super) fn start() -> Result<AudioCaptureSession, AudioError> {
+        let (device, config) = select_config()?;
+        // A loopback stream only receives packets while the endpoint renders;
+        // silence keeps it running when nothing else plays, so the pipeline
+        // sees continuous (silent) audio instead of a stalled source.
+        let keep_alive = silent_output(&device, &config).ok();
+        start_cpal_capture(&device, config, keep_alive)
+    }
+
+    fn silent_output(
+        device: &cpal::Device,
+        supported: &cpal::SupportedStreamConfig,
+    ) -> Result<cpal::Stream, AudioError> {
+        let config = supported.config();
+        let stream = match supported.sample_format() {
+            SampleFormat::F32 => silent::<f32>(device, &config)?,
+            SampleFormat::F64 => silent::<f64>(device, &config)?,
+            SampleFormat::I16 => silent::<i16>(device, &config)?,
+            SampleFormat::I24 => silent::<cpal::I24>(device, &config)?,
+            SampleFormat::I32 => silent::<i32>(device, &config)?,
+            SampleFormat::U8 => silent::<u8>(device, &config)?,
+            SampleFormat::U16 => silent::<u16>(device, &config)?,
+            _ => return Err(AudioError::UnsupportedFormat),
+        };
+        stream
+            .play()
+            .map_err(|error| AudioError::Control(error.to_string()))?;
+        Ok(stream)
+    }
+
+    fn silent<T: SizedSample + Send + 'static>(
+        device: &cpal::Device,
+        config: &cpal::StreamConfig,
+    ) -> Result<cpal::Stream, AudioError> {
+        device
+            .build_output_stream::<T, _, _>(
+                config,
+                |output: &mut [T], _| output.fill(T::EQUILIBRIUM),
+                |_| {},
+                None,
+            )
+            .map_err(|error| AudioError::Build(error.to_string()))
+    }
 }
 
 /// Apply public AppKit `NSWindow.alphaValue` without enabling Tauri's private
@@ -673,9 +826,58 @@ mod tests {
     }
 
     #[test]
-    fn system_audio_descriptor_is_explicit_about_picker() {
+    fn system_audio_descriptor_matches_the_platform() {
         let device = AudioDevice::system_audio();
         assert_eq!(device.kind, AudioSourceKind::SystemAudio);
-        assert!(device.requires_picker);
+        assert!(!device.is_default);
+        if cfg!(target_os = "macos") {
+            assert_eq!(device.id, MACOS_SYSTEM_AUDIO_DEVICE_ID);
+            assert!(device.requires_picker && device.available);
+        } else if cfg!(target_os = "windows") {
+            assert_eq!(device.id, WINDOWS_LOOPBACK_DEVICE_ID);
+            assert_eq!(device.name, "System audio (default output)");
+            assert!(!device.requires_picker);
+        } else {
+            assert_eq!(device.id, UNAVAILABLE_SYSTEM_AUDIO_DEVICE_ID);
+            assert!(!device.available && !device.requires_picker);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn permissions_off_macos_need_no_prompt() {
+        let status = audio_permission_status();
+        assert_eq!(status.microphone, PermissionState::Granted);
+        let system = if cfg!(target_os = "windows") {
+            PermissionState::Granted
+        } else {
+            PermissionState::Unavailable
+        };
+        assert_eq!(status.system_audio, system);
+        assert_eq!(
+            request_audio_permission(PermissionKind::SystemAudio),
+            system
+        );
+    }
+
+    #[test]
+    fn linux_device_list_keeps_servers_and_card_defaults() {
+        for id in [
+            "alsa:default",
+            "alsa:pipewire",
+            "alsa:pulse",
+            "alsa:sysdefault:CARD=PCH",
+        ] {
+            assert!(is_listed_alsa_input(id), "{id}");
+        }
+        for id in [
+            "alsa:hw:CARD=PCH,DEV=0",
+            "alsa:plughw:CARD=PCH,DEV=0",
+            "alsa:dsnoop:CARD=PCH,DEV=0",
+            "alsa:surround51:CARD=PCH,DEV=0",
+            "alsa:null",
+        ] {
+            assert!(!is_listed_alsa_input(id), "{id}");
+        }
     }
 }

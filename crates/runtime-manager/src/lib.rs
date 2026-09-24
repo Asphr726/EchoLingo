@@ -2,6 +2,7 @@
 
 use hf_hub::progress::{DownloadEvent, ProgressEvent, ProgressHandler};
 use hf_hub::HFClient;
+use process_support::ProcessTree;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -14,10 +15,14 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
 
+pub mod gpu_pack;
+
 pub const MODEL_CATALOG_VERSION: u16 = 1;
+/// SIGTERM-to-SIGKILL grace when a local model service is stopped.
+const SERVICE_STOP_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -190,6 +195,16 @@ where
         .unwrap_or(default)
 }
 
+/// The NVIDIA acceleration pack's runtime (see [`gpu_pack`]): used in place
+/// of the bundled CPU runtime while it is selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuRuntimeLayout {
+    /// The pack's CUDA build of the sidecar, run as `qwen-asr-server`.
+    pub sidecar: PathBuf,
+    /// The pack's Vulkan `llama-server`.
+    pub llama_server: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalRuntimeLayout {
     pub qwen_command: RuntimeCommand,
@@ -232,13 +247,44 @@ pub enum LocalRuntimeError {
     Io(#[from] io::Error),
 }
 
-struct ManagedService {
-    child: Child,
+impl LocalRuntimeError {
+    /// The service process itself failed (as opposed to a missing model or
+    /// runtime), so another runtime may still succeed.
+    fn is_process_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Launch { .. } | Self::StartupExit { .. } | Self::StartupTimeout { .. }
+        )
+    }
+
+    /// One line for the UI: the log tail stays in the log file.
+    fn summary(&self) -> String {
+        match self {
+            Self::StartupExit {
+                service,
+                status,
+                log_path,
+                ..
+            } => format!(
+                "{service} exited during startup ({status}); see {}",
+                log_path.display()
+            ),
+            other => other.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct GpuSelection {
+    runtime: Option<GpuRuntimeLayout>,
+    /// Why the GPU runtime was abandoned for the rest of this app run.
+    fallback_reason: Option<String>,
 }
 
 pub struct LocalRuntimeManager {
     layout: LocalRuntimeLayout,
-    services: AsyncMutex<HashMap<String, ManagedService>>,
+    gpu: Mutex<GpuSelection>,
+    services: AsyncMutex<HashMap<String, ProcessTree>>,
     port_reservations: Mutex<HashMap<String, std::net::TcpListener>>,
 }
 
@@ -246,6 +292,7 @@ impl LocalRuntimeManager {
     pub fn new(layout: LocalRuntimeLayout) -> Self {
         Self {
             layout,
+            gpu: Mutex::new(GpuSelection::default()),
             services: AsyncMutex::new(HashMap::new()),
             port_reservations: Mutex::new(HashMap::new()),
         }
@@ -258,6 +305,7 @@ impl LocalRuntimeManager {
     ) -> Self {
         Self {
             layout,
+            gpu: Mutex::new(GpuSelection::default()),
             services: AsyncMutex::new(HashMap::new()),
             port_reservations: Mutex::new(HashMap::from([
                 ("qwen_asr".into(), qwen),
@@ -305,14 +353,94 @@ impl LocalRuntimeManager {
         values
     }
 
+    /// Use `runtime` (the GPU pack) for the model services from now on, or
+    /// the bundled CPU runtime for `None`. A change stops every running
+    /// service so the next start uses the new runtime, and gives a runtime
+    /// that failed earlier another chance; returns whether anything changed.
+    /// Callers only switch while no session uses the services.
+    pub async fn select_gpu_runtime(&self, runtime: Option<GpuRuntimeLayout>) -> bool {
+        let mut services = self.services.lock().await;
+        {
+            let Ok(mut selection) = self.gpu.lock() else {
+                return false;
+            };
+            if selection.runtime == runtime {
+                return false;
+            }
+            selection.runtime = runtime;
+            selection.fallback_reason = None;
+        }
+        for (_, mut process) in services.drain() {
+            let _ = process.terminate(SERVICE_STOP_GRACE).await;
+        }
+        true
+    }
+
+    /// Forget an earlier GPU failure so the next start tries the GPU runtime
+    /// again (after the user reinstalled or re-enabled the pack).
+    pub fn clear_gpu_fallback(&self) {
+        if let Ok(mut selection) = self.gpu.lock() {
+            selection.fallback_reason = None;
+        }
+    }
+
+    /// Whether services start on the GPU runtime now.
+    pub fn gpu_active(&self) -> bool {
+        self.active_gpu_runtime().is_some()
+    }
+
+    /// Why the GPU runtime was abandoned for this app run, if it was.
+    pub fn gpu_fallback_reason(&self) -> Option<String> {
+        self.gpu
+            .lock()
+            .ok()
+            .and_then(|selection| selection.fallback_reason.clone())
+    }
+
+    fn active_gpu_runtime(&self) -> Option<GpuRuntimeLayout> {
+        let selection = self.gpu.lock().ok()?;
+        if selection.fallback_reason.is_some() {
+            return None;
+        }
+        selection.runtime.clone()
+    }
+
+    fn record_gpu_fallback(&self, reason: String) {
+        if let Ok(mut selection) = self.gpu.lock() {
+            selection.fallback_reason.get_or_insert(reason);
+        }
+    }
+
+    /// The command that starts `service` on the runtime selected now.
     pub fn command_for(&self, service: &str) -> Result<RuntimeCommand, LocalRuntimeError> {
+        self.command_on(service, self.active_gpu_runtime().as_ref())
+    }
+
+    fn command_on(
+        &self,
+        service: &str,
+        gpu: Option<&GpuRuntimeLayout>,
+    ) -> Result<RuntimeCommand, LocalRuntimeError> {
         match service {
             "qwen_asr" => {
                 let model = self.layout.model_root.join("qwen3-asr-0.6b");
                 if !model.join("model.safetensors").is_file() {
                     return Err(LocalRuntimeError::ModelUnavailable("qwen3-asr-0.6b".into()));
                 }
-                let mut command = self.layout.qwen_command.clone();
+                let (mut command, device) = match gpu {
+                    Some(gpu) => (
+                        RuntimeCommand {
+                            executable: gpu.sidecar.clone(),
+                            args: vec!["qwen-asr-server".into()],
+                            environment: HashMap::new(),
+                        },
+                        "cuda".to_string(),
+                    ),
+                    None => (
+                        self.layout.qwen_command.clone(),
+                        self.layout.qwen_device.clone(),
+                    ),
+                };
                 command
                     .environment
                     .insert("WLK_API_TOKEN".into(), self.layout.local_api_key.clone());
@@ -333,7 +461,7 @@ impl LocalRuntimeManager {
                     "--warmup-file".into(),
                     "".into(),
                     "--qwen3-streaming-device".into(),
-                    self.layout.qwen_device.clone(),
+                    device,
                     "--qwen3-streaming-chunk-sec".into(),
                     self.layout.qwen_streaming.chunk_seconds.to_string(),
                     "--qwen3-streaming-stable-iterations".into(),
@@ -352,14 +480,15 @@ impl LocalRuntimeManager {
                 Ok(command)
             }
             "hymt" => {
-                let executable =
-                    self.layout.llama_server.clone().ok_or_else(|| {
-                        LocalRuntimeError::RuntimeUnavailable("llama-server".into())
-                    })?;
+                let executable = gpu
+                    .map(|gpu| gpu.llama_server.clone())
+                    .or_else(|| self.layout.llama_server.clone())
+                    .ok_or_else(|| LocalRuntimeError::RuntimeUnavailable("llama-server".into()))?;
                 let model = self
                     .layout
                     .model_root
-                    .join("hymt2-1.8b/Hy-MT2-1.8B-Q4_K_M.gguf");
+                    .join("hymt2-1.8b")
+                    .join("Hy-MT2-1.8B-Q4_K_M.gguf");
                 if !model.is_file() {
                     return Err(LocalRuntimeError::ModelUnavailable("hymt2-1.8b".into()));
                 }
@@ -427,12 +556,44 @@ impl LocalRuntimeManager {
             return Ok(());
         }
         if let Some(mut previous) = services.remove(service) {
-            let _ = previous.child.start_kill();
-            let _ = previous.child.wait().await;
+            let _ = previous.terminate(SERVICE_STOP_GRACE).await;
         }
-        let spec = self.command_for(service)?;
+        let gpu = self.active_gpu_runtime();
+        let process = match self.launch(service, port, health_path, gpu.as_ref()).await {
+            Ok(process) => process,
+            Err(error) if gpu.is_some() && error.is_process_failure() => {
+                // The GPU runtime is optional: keep the session working on
+                // the CPU runtime and stay there for the rest of this run.
+                self.record_gpu_fallback(format!(
+                    "{service} could not start with GPU acceleration: {}",
+                    error.summary()
+                ));
+                self.launch(service, port, health_path, None).await?
+            }
+            Err(error) => return Err(error),
+        };
+        services.insert(service.into(), process);
+        Ok(())
+    }
+
+    /// Start `service` on the CPU runtime or `gpu` and wait until it is
+    /// healthy. GPU starts log to `<service>.gpu.log` so a CPU fallback does
+    /// not overwrite the diagnostics of the failure.
+    async fn launch(
+        &self,
+        service: &str,
+        port: u16,
+        health_path: &str,
+        gpu: Option<&GpuRuntimeLayout>,
+    ) -> Result<ProcessTree, LocalRuntimeError> {
+        let spec = self.command_on(service, gpu)?;
         std::fs::create_dir_all(&self.layout.log_root)?;
-        let log_path = self.layout.log_root.join(format!("{service}.log"));
+        let log_name = if gpu.is_some() {
+            format!("{service}.gpu.log")
+        } else {
+            format!("{service}.log")
+        };
+        let log_path = self.layout.log_root.join(log_name);
         let log = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -444,23 +605,22 @@ impl LocalRuntimeManager {
             .args(&spec.args)
             .envs(&spec.environment)
             .env("ECHOLINGO_PARENT_PID", std::process::id().to_string())
+            .env("PYTHONUTF8", "1")
+            .env("PYTHONIOENCODING", "utf-8")
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
-            .stderr(Stdio::from(stderr))
-            .kill_on_drop(true);
-        let mut child = command
-            .spawn()
-            .map_err(|source| LocalRuntimeError::Launch {
+            .stderr(Stdio::from(stderr));
+        let mut process =
+            ProcessTree::spawn(&mut command).map_err(|source| LocalRuntimeError::Launch {
                 service: service.into(),
                 source,
             })?;
         let deadline = tokio::time::Instant::now() + self.layout.startup_timeout;
         loop {
             if service_healthy(port, health_path).await {
-                services.insert(service.into(), ManagedService { child });
-                return Ok(());
+                return Ok(process);
             }
-            if let Some(status) = child.try_wait().map_err(LocalRuntimeError::Io)? {
+            if let Some(status) = process.try_wait().map_err(LocalRuntimeError::Io)? {
                 return Err(LocalRuntimeError::StartupExit {
                     service: service.into(),
                     status: status.to_string(),
@@ -469,8 +629,7 @@ impl LocalRuntimeManager {
                 });
             }
             if tokio::time::Instant::now() >= deadline {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                let _ = process.terminate(SERVICE_STOP_GRACE).await;
                 return Err(LocalRuntimeError::StartupTimeout {
                     service: service.into(),
                     seconds: self.layout.startup_timeout.as_secs(),
@@ -481,11 +640,19 @@ impl LocalRuntimeManager {
         }
     }
 
+    /// Stop one service (and everything it launched) if it is running, for
+    /// example before its model files are replaced or deleted.
+    pub async fn stop_service(&self, service: &str) {
+        let process = self.services.lock().await.remove(service);
+        if let Some(mut process) = process {
+            let _ = process.terminate(SERVICE_STOP_GRACE).await;
+        }
+    }
+
     pub async fn shutdown(&self) {
         let mut services = self.services.lock().await;
-        for (_, mut service) in services.drain() {
-            let _ = service.child.start_kill();
-            let _ = service.child.wait().await;
+        for (_, mut process) in services.drain() {
+            let _ = process.terminate(SERVICE_STOP_GRACE).await;
         }
     }
 
@@ -1001,7 +1168,7 @@ mod tests {
     #[test]
     fn qwen_runtime_command_uses_managed_model_and_local_frontend_contract() {
         let directory = tempfile::tempdir().unwrap();
-        let model = directory.path().join("models/qwen3-asr-0.6b");
+        let model = directory.path().join("models").join("qwen3-asr-0.6b");
         std::fs::create_dir_all(&model).unwrap();
         std::fs::write(model.join("model.safetensors"), b"model").unwrap();
         let manager = LocalRuntimeManager::new(runtime_layout(
@@ -1014,7 +1181,7 @@ mod tests {
         assert!(command
             .args
             .windows(2)
-            .any(|pair| { pair[0] == "--model_dir" && pair[1] == model.to_string_lossy() }));
+            .any(|pair| { pair[0] == "--model_dir" && Path::new(&pair[1]) == model }));
         assert!(command.args.contains(&"--pcm-input".into()));
         assert!(command.args.contains(&"--no-vad".into()));
         assert!(command
@@ -1066,7 +1233,7 @@ mod tests {
 
         assert_eq!(command.executable, wrapper);
         assert_eq!(command.args[0], "watch-process");
-        assert_eq!(command.args[1], llama.to_string_lossy());
+        assert_eq!(Path::new(&command.args[1]), llama);
         assert!(!command.args.iter().any(|argument| argument == "--api-key"));
         assert!(command.args.iter().any(|argument| argument == "--jinja"));
         assert!(command
@@ -1113,6 +1280,101 @@ mod tests {
                 .map(String::as_str),
             Some("38124")
         );
+    }
+
+    #[tokio::test]
+    async fn selected_gpu_runtime_runs_the_pack_and_can_be_switched_off() {
+        let directory = tempfile::tempdir().unwrap();
+        let model = directory.path().join("models").join("qwen3-asr-0.6b");
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(model.join("model.safetensors"), b"model").unwrap();
+        let gguf = directory.path().join("models").join("hymt2-1.8b");
+        std::fs::create_dir_all(&gguf).unwrap();
+        std::fs::write(gguf.join("Hy-MT2-1.8B-Q4_K_M.gguf"), b"model").unwrap();
+        let cpu_sidecar = directory.path().join("echolingo-sidecar");
+        let mut layout = runtime_layout(directory.path(), cpu_sidecar.clone());
+        layout.worker_wrapper = Some(cpu_sidecar.clone());
+        layout.llama_server = Some(directory.path().join("cpu-llama-server"));
+        let manager = LocalRuntimeManager::new(layout);
+        let pack = GpuRuntimeLayout {
+            sidecar: directory.path().join("gpu").join("echolingo-sidecar"),
+            llama_server: directory.path().join("gpu").join("llama-server"),
+        };
+
+        assert!(!manager.gpu_active());
+        assert!(manager.select_gpu_runtime(Some(pack.clone())).await);
+        assert!(!manager.select_gpu_runtime(Some(pack.clone())).await);
+        assert!(manager.gpu_active());
+        let qwen = manager.command_for("qwen_asr").unwrap();
+        assert_eq!(qwen.executable, pack.sidecar);
+        assert_eq!(qwen.args[0], "qwen-asr-server");
+        assert!(qwen
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "--qwen3-streaming-device" && pair[1] == "cuda"));
+        let hymt = manager.command_for("hymt").unwrap();
+        // The pack's llama-server still runs under the owner watchdog.
+        assert_eq!(hymt.executable, cpu_sidecar);
+        assert_eq!(Path::new(&hymt.args[1]), pack.llama_server);
+
+        assert!(manager.select_gpu_runtime(None).await);
+        let qwen = manager.command_for("qwen_asr").unwrap();
+        assert_eq!(qwen.executable, cpu_sidecar);
+        assert!(qwen
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "--qwen3-streaming-device" && pair[1] == "mps"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_gpu_start_falls_back_to_the_cpu_runtime_for_the_run() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let model = directory.path().join("models").join("qwen3-asr-0.6b");
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(model.join("model.safetensors"), b"model").unwrap();
+        let script = |name: &str, body: &str| {
+            let path = directory.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).unwrap();
+            path
+        };
+        let gpu_sidecar = script("gpu-sidecar", "echo 'CUDA driver version is insufficient' >&2\nexit 3");
+        let cpu_sidecar = script("cpu-sidecar", "echo 'cpu runtime ran' >&2\nexit 5");
+        let manager = LocalRuntimeManager::new(runtime_layout(directory.path(), cpu_sidecar));
+        manager
+            .select_gpu_runtime(Some(GpuRuntimeLayout {
+                sidecar: gpu_sidecar,
+                llama_server: directory.path().join("llama-server"),
+            }))
+            .await;
+
+        let error = manager.ensure_service("qwen_asr").await.unwrap_err();
+        // The CPU runtime was tried after the GPU failure.
+        assert!(matches!(
+            error,
+            LocalRuntimeError::StartupExit { status, diagnostics, .. }
+                if status.contains('5') && diagnostics.contains("cpu runtime ran")
+        ));
+        let reason = manager.gpu_fallback_reason().unwrap();
+        assert!(reason.contains("qwen_asr"), "{reason}");
+        assert!(!manager.gpu_active());
+        assert!(
+            std::fs::read_to_string(directory.path().join("logs").join("qwen_asr.gpu.log"))
+                .unwrap()
+                .contains("CUDA driver version is insufficient")
+        );
+        // The fallback holds until the user retries explicitly.
+        assert_eq!(
+            manager.command_for("qwen_asr").unwrap().executable,
+            directory.path().join("cpu-sidecar")
+        );
+        manager.clear_gpu_fallback();
+        assert!(manager.gpu_active());
     }
 
     #[cfg(unix)]
