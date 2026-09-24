@@ -46,6 +46,21 @@ def test_retry_policy_is_bounded() -> None:
     assert sum(delays) <= 2
 
 
+def test_retry_budget_counts_wall_time_between_delays() -> None:
+    # Each nominal 1 ms sleep really takes 15 ms (Windows' timer), so a 20 ms
+    # budget allows two attempts, not twenty.
+    now = [0.0]
+
+    def clock() -> float:
+        return now[0]
+
+    delays = []
+    for delay in RetryPolicy(initial_s=0.001, maximum_s=0.001, budget_s=0.02).delays(lambda: 1.0, clock):
+        delays.append(delay)
+        now[0] += 0.015
+    assert len(delays) == 2
+
+
 async def test_calibrator_measures_and_persists_mock_asr(tmp_path) -> None:
     store = CalibrationStore(tmp_path / "calibration.json")
     record = await InferenceCalibrator(store).calibrate_asr(
