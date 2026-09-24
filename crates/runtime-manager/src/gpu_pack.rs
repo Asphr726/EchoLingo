@@ -1320,16 +1320,11 @@ fn create_symlink(link: &Path, _resolved: &Path, target: &Path) -> io::Result<()
     std::os::unix::fs::symlink(link, target)
 }
 
-/// Symbolic links need a privilege on Windows; a copy of the file works the
-/// same for a shared-library alias.
+/// Windows gets a copy of the file: symbolic links need a privilege there,
+/// and one created from a `/`-separated relative target does not resolve. A
+/// copy works the same for a shared-library alias.
 #[cfg(not(unix))]
-fn create_symlink(link: &Path, resolved: &Path, target: &Path) -> io::Result<()> {
-    #[cfg(windows)]
-    if std::os::windows::fs::symlink_file(link, target).is_ok() {
-        return Ok(());
-    }
-    #[cfg(not(windows))]
-    let _ = link;
+fn create_symlink(_link: &Path, resolved: &Path, target: &Path) -> io::Result<()> {
     std::fs::copy(resolved, target).map(|_| ())
 }
 
