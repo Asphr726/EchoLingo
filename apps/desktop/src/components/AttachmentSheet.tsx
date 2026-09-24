@@ -97,7 +97,7 @@ export function AttachmentSheet({
           </button>
         </header>
         <p id="attachment-sheet-body" className="attachment-sheet-body">
-          Slides or handouts help fix names, terms and formulas. Text is extracted on this Mac; only the text is sent.
+          Slides or handouts help fix names, terms and formulas. Text is extracted on this computer; only the text is sent.
         </p>
         {count > 0 && (
           <ul className="attachment-list" aria-label="Files to attach">

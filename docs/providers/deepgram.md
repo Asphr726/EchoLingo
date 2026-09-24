@@ -16,7 +16,8 @@ accuracy have been measured.
 2. Create a project API key (**API Keys → Create a New API Key**). The key
    needs the default *Member* scope; nothing else is required for streaming.
 3. In EchoLingo open **Settings → Cloud providers → Deepgram**, paste the
-   key and choose **Save** (it is stored in the macOS Keychain). The desktop shell injects it
+   key and choose **Save**. It is stored in the system secure store (macOS
+   Keychain, Windows Credential Manager, or Secret Service on Linux). The desktop shell injects it
    into the sidecar as `DEEPGRAM_API_KEY`; the adapter never logs, persists
    or places it in a URL. Setting `DEEPGRAM_API_KEY` in the process
    environment is a development fallback only.

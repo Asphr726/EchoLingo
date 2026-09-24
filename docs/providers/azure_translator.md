@@ -25,7 +25,8 @@ different resource and is not used.
 5. In EchoLingo open **Settings → Cloud providers → Azure AI Translator**, paste the
    key, type the **Resource region** exactly as the portal shows it (lower
    case, no spaces: `eastasia`) and choose **Save**. The key is stored in the
-   macOS Keychain and reaches the sidecar only as the `AZURE_TRANSLATOR_KEY`
+   system secure store (macOS Keychain, Windows Credential Manager, or Secret
+   Service on Linux) and reaches the sidecar only as the `AZURE_TRANSLATOR_KEY`
    environment variable for the lifetime of a session; the region is
    forwarded as `ECHOLINGO_AZURE_TRANSLATOR_REGION`. On the command line both
    variables are the development fallback:

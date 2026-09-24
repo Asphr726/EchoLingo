@@ -11,6 +11,7 @@ import {
   Waveform,
 } from "@phosphor-icons/react";
 import { memo, type ReactNode, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { systemAudioAvailable } from "../lib/audio";
 import { api } from "../lib/bridge";
 import { anchorCorrection, type FeedAnchor, followChangeAfterScroll, pickAnchor, scrollsBack } from "../lib/feedFollow";
 import {
@@ -52,6 +53,7 @@ export function LiveView() {
   const consentNoteId = useId();
   const locked = !["IDLE", "COMPLETED"].includes(snapshot.phase);
   const microphones = devices.filter((device) => device.kind === "microphone");
+  const systemAudioOffered = systemAudioAvailable(devices);
   const needsAudioUpload = catalogNeedsAudioUpload(catalog, draft);
   const needsTranscriptUpload = catalogNeedsTranscriptUpload(catalog, draft);
   const selectedAsr = findProvider(catalog, "asr", effectiveProviderId(draft, "asr") ?? "auto");
@@ -124,7 +126,10 @@ export function LiveView() {
               }}
             >
               <option value="microphone">Microphone</option>
-              <option value="system_audio">System audio</option>
+              {/* Not offered where the shell cannot capture it (Linux for now). */}
+              {(systemAudioOffered || draft.audio_source === "system_audio") && (
+                <option value="system_audio" disabled={!systemAudioOffered}>System audio</option>
+              )}
             </select>
           </Field>
           <Field label="Audio profile">

@@ -12,7 +12,8 @@ Cloud ASR adapter for the OpenAI Realtime API in transcription mode
    project must have access to the Realtime API and to the transcription model
    you select.
 2. In EchoLingo open **Settings → Cloud providers → OpenAI**, paste the key
-   and choose **Save** (it is stored in the macOS Keychain). The desktop shell injects it into
+   and choose **Save**. It is stored in the system secure store (macOS Keychain,
+   Windows Credential Manager, or Secret Service on Linux). The desktop shell injects it into
    the sidecar as `OPENAI_API_KEY`; the adapter never persists or logs it.
 3. Choose **Test** (see below).
 4. Enable **Settings → Privacy → Audio upload** and select *OpenAI realtime
@@ -20,7 +21,7 @@ Cloud ASR adapter for the OpenAI Realtime API in transcription mode
    independently and may stay local (Hybrid).
 
 For development only, `OPENAI_API_KEY` in the environment is used when the
-keychain has no key.
+secure store has no key.
 
 ## Pricing and free tier
 

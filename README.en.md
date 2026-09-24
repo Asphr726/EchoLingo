@@ -2,22 +2,22 @@
 
 [简体中文](README.md) | English
 
-EchoLingo is a real-time lecture interpreter for the Mac. It turns what the lecturer says into side-by-side captions in the original language and your language, sentence by sentence, and after class an AI model of your choice can turn the transcript into study notes. By default, all recognition and translation run on your own Mac.
+EchoLingo is a real-time lecture interpreter. It turns what the lecturer says into side-by-side captions in the original language and your language, sentence by sentence, and after class an AI model of your choice can turn the transcript into study notes. By default, all recognition and translation run on your own computer. The published download is for the Mac; Windows and Linux versions are in testing.
 
 [![Platform](https://img.shields.io/badge/platform-macOS%2014%2B%20%C2%B7%20Apple%20Silicon-lightgrey)](#requirements)
-[![Version](https://img.shields.io/badge/version-0.1.0%20Beta-orange)](https://github.com/Asphr726/EchoLingo/releases)
+[![Version](https://img.shields.io/badge/version-0.2.0%20Beta-orange)](https://github.com/Asphr726/EchoLingo/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 ![EchoLingo live bilingual captions](docs/screenshots/live.png)
 
-> **v0.1.0 Beta**: Apple Silicon Macs running macOS 14 or later only. A Windows version is planned. The app's interface is in English.
+> **v0.2.0 Beta**: the published download is for Apple Silicon Macs running macOS 14 or later. Windows and Linux builds are in testing and not published yet; see [Windows / Linux](#windows--linux-in-testing-not-yet-published). The app's interface is in English.
 
-[Highlights](#highlights) · [Requirements](#requirements) · [Install](#install) · [Quick start](#quick-start) · [Guide](#guide) · [Privacy](#privacy) · [FAQ](#faq) · [Roadmap](#roadmap) · [Build from source](#build-from-source) · [License and acknowledgements](#license-and-acknowledgements)
+[Highlights](#highlights) · [Requirements](#requirements) · [Install](#install) · [Windows / Linux](#windows--linux-in-testing-not-yet-published) · [Quick start](#quick-start) · [Guide](#guide) · [Privacy](#privacy) · [FAQ](#faq) · [Roadmap](#roadmap) · [Build from source](#build-from-source) · [License and acknowledgements](#license-and-acknowledgements)
 
 ## Highlights
 
-- **Local-first and private.** Speech recognition (Qwen3-ASR) and translation (Hy-MT2) run on your Mac by default. No account is needed, and once the models are downloaded everything works offline. Audio or text leaves the Mac only if you turn on a cloud provider, and every kind of upload needs your explicit consent first. API keys are stored in the macOS Keychain.
-- **Designed for far-field lecture audio.** The default Lecture / far-field audio profile runs noise suppression and automatic gain control (AGC) on your Mac. Speech detection only labels the audio and never throws any of it away. A sentence is finalized only after a pause confirms that it has ended, which keeps sentences from being cut in half.
+- **Local-first and private.** Speech recognition (Qwen3-ASR) and translation (Hy-MT2) run on your computer by default. No account is needed, and once the models are downloaded everything works offline. Audio or text leaves the computer only if you turn on a cloud provider, and every kind of upload needs your explicit consent first. API keys are stored in the system secure store (macOS Keychain, Windows Credential Manager, or Secret Service on Linux).
+- **Designed for far-field lecture audio.** The default Lecture / far-field audio profile runs noise suppression and automatic gain control (AGC) on your computer. Speech detection only labels the audio and never throws any of it away. A sentence is finalized only after a pause confirms that it has ended, which keeps sentences from being cut in half.
 - **Side-by-side bilingual transcript and a floating caption window.** The main window shows the original on the left and the translation on the right, sentence by sentence. The floating caption window stays on top of your slides, PDF or note-taking app, with adjustable font size, opacity and content.
 - **Lecture context.** Before class, add the topic, names and terms (write `term = translation` for a fixed translation), or import them from the slides. Recognition and translation both use this context, so names and terms come out right more often. Terms you use every week go into a standing glossary.
 - **AI notes.** The AI notes feature turns a messy spoken transcript into structured study notes, written in your translation language, with formulas rendered from LaTeX. You can attach course materials (PDF, PPTX, DOCX, Markdown, LaTeX, plain text). The notes are saved with the session, and each section carries a time range that jumps back to that part of the transcript. Notes are written by a chat model you choose: a cloud provider with your own key, or a local server such as Ollama.
@@ -31,18 +31,22 @@ EchoLingo is a real-time lecture interpreter for the Mac. It turns what the lect
 
 ## Requirements
 
-| Item | Requirement |
-| --- | --- |
-| System | macOS 14 Sonoma or later |
-| Chip | Apple Silicon (M1 or later); Intel Macs are not supported |
-| Memory | 16 GB or more recommended |
-| Disk | The local models take about 4.5 GB; keep at least 6 GB free |
-| Permissions | Microphone; to capture sound playing on the Mac (online classes, videos), also Screen & System Audio Recording |
-| Network | Only for downloading models, cloud providers and AI notes |
+| Item | macOS (published) | Windows / Linux (in testing) |
+| --- | --- | --- |
+| System | macOS 14 Sonoma or later | Windows 10 21H2 or later, or Windows 11 (x64); Ubuntu 22.04 or later, or Debian 12 or later (x64) |
+| Chip | Apple Silicon (M1 or later); Intel Macs are not supported | An x64 processor with AVX2; optionally an NVIDIA graphics card for the GPU acceleration pack |
+| Memory | 16 GB or more recommended | 16 GB or more recommended |
+| Disk | The local models take about 4.5 GB; keep at least 6 GB free | The same; the optional GPU acceleration pack is another 2–3 GB download and takes more space once unpacked |
+| Permissions | Microphone; to capture sound playing on the Mac (online classes, videos), also Screen & System Audio Recording | Windows: desktop apps must be allowed to use the microphone; Linux: none |
+| Network | Only for downloading models, cloud providers and AI notes | The same |
+
+On Windows and Linux, recognition and translation run on the CPU unless the GPU acceleration pack is installed. On slower processors the captions may fall behind the lecture; the [GPU acceleration pack](#windows--linux-in-testing-not-yet-published) or a cloud recognizer solves that.
 
 ## Install
 
-1. Download `EchoLingo_0.1.0_aarch64.dmg` from [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases).
+The steps below are for macOS. For Windows and Linux, see [Windows / Linux](#windows--linux-in-testing-not-yet-published).
+
+1. Download `EchoLingo_0.2.0_aarch64.dmg` from [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases).
 2. Open the dmg and drag **EchoLingo** into the Applications folder.
 3. Open it for the first time. The Beta is not notarized by Apple yet, so macOS blocks it at first:
    - **macOS 14**: in Applications, Control-click (or right-click) EchoLingo, choose **Open**, then choose **Open** again in the dialog.
@@ -67,6 +71,31 @@ EchoLingo is a real-time lecture interpreter for the Mac. It turns what the lect
    > `launchctl setenv HF_ENDPOINT https://hf-mirror.com` in Terminal, quit EchoLingo completely with ⌘Q, reopen it and click **Download** again.
    > The setting lasts until you log out or restart the Mac. To go back to the official source, run `launchctl unsetenv HF_ENDPOINT` and reopen the app.
 
+## Windows / Linux (in testing, not yet published)
+
+> **Not published yet.** Windows and Linux builds exist, but they have not been tested on real Windows or Linux computers yet, so they are not on the Releases page. The steps below are for testers who received a build; the app and its settings work as described in the rest of this guide unless noted here.
+
+**Windows 10 / 11 (x64)**
+
+1. Run `EchoLingo_0.2.0_x64-setup.exe`. It installs for your user account only and needs no administrator rights; if the Microsoft Edge WebView2 runtime is missing, the installer adds it.
+2. The installer is not code-signed yet, so Windows SmartScreen may say "Windows protected your PC". Click **More info**, then **Run anyway**.
+3. Open EchoLingo from the Start menu and download the local models in **Settings → Models**, as in step 4 of [Install](#install).
+
+**Linux (Ubuntu 22.04+ / Debian 12+, x64)**
+
+1. In the folder you downloaded it to, install the package with `sudo apt install ./EchoLingo_0.2.0_amd64.deb`.
+2. If an AppImage is provided instead, make it executable with `chmod +x EchoLingo_0.2.0_amd64.AppImage` and run it. On Ubuntu 22.04 and later, AppImages need libfuse2: `sudo apt install libfuse2` (the package is `libfuse2t64` on Ubuntu 24.04).
+3. Open EchoLingo from the applications menu and download the local models in **Settings → Models**.
+
+**NVIDIA GPU acceleration pack (optional).** Without it, recognition and translation run on the CPU. If the computer has an NVIDIA GeForce RTX 20-series or GTX 16-series card or newer with a recent driver, open **Settings → Models → GPU acceleration** and click **Download**. The pack (about 2–3 GB) is downloaded in parts, every part is checked, and a self-test runs before the pack is switched on; **Use GPU acceleration** turns it off again at any time. If the GPU runtime fails to start, EchoLingo falls back to the CPU and the card says why. AMD and Intel graphics cards are not supported yet.
+
+**Differences from the Mac version**
+
+- **System audio**: on Windows, **System audio** captures whatever the default output device (speakers or headphones) plays; there is no picker. On Linux, system audio capture is not available yet, so use a microphone.
+- **Keys** are stored in the Windows Credential Manager, or on Linux in a Secret Service provider such as GNOME Keyring or KWallet. If none can be reached, **Settings → Cloud providers** says so, and keys can still come from environment variables such as `DEEPL_API_KEY`.
+- **Hugging Face mirror**: on Windows, run `setx HF_ENDPOINT https://hf-mirror.com` in Command Prompt or PowerShell, then quit and reopen EchoLingo (`reg delete HKCU\Environment /v HF_ENDPOINT /f` goes back to the official source). On Linux, add `export HF_ENDPOINT=https://hf-mirror.com` to `~/.profile` and log in again, or start EchoLingo from a terminal where the variable is set.
+- **Floating caption**: the opacity setting is available on macOS only.
+
 ## Quick start
 
 1. **First-run setup.** On first launch, a short wizard walks you through seven steps: Welcome, Languages, Audio (source and profile), Inference mode, Permissions, Audio test and Ready. You can change every choice later in Settings.
@@ -84,27 +113,27 @@ EchoLingo is a real-time lecture interpreter for the Mac. It turns what the lect
 ![Lecture context panel](docs/screenshots/lecture-context.png)
 
 - **Source language / Target language**: any two of English, Chinese, Japanese and Korean.
-- **Audio source**: **Microphone** for a lecture in the room, or **System audio** for sound playing on the Mac (online classes, recorded videos, meetings). With System audio, macOS asks you to choose the display or app to capture each time a session starts.
+- **Audio source**: **Microphone** for a lecture in the room, or **System audio** for sound playing on the computer (online classes, recorded videos, meetings). With System audio, macOS asks you to choose the display or app to capture each time a session starts; Windows captures the default output device; Linux does not offer System audio yet.
 - **Audio profile**: keep **Lecture / far-field** (the default) for classrooms. Choose **Conversation** for close-up, face-to-face speech. **Raw diagnostics** turns off all audio processing and is meant for troubleshooting only.
 - **Input device**: the microphone to use.
 - **Inference mode**:
-  - **Local** uses only the models on your Mac.
+  - **Local** uses only the models on your computer.
   - **Cloud** uses cloud providers.
-  - **Auto** uses the local models by default. When you press Start, it uses the preferred cloud provider set in **Settings → Cloud providers** instead only if the local models cannot keep up in real time on this Mac and you have allowed the matching upload. Auto never turns on an upload permission for you.
-- The **Inference** panel on the right lets you pick the recognition provider (ASR provider) and the translation provider separately. **Audio / VAD** shows the input level and whether speech is detected. **Latency** shows how long each step takes. The card at the bottom says whether this session's audio and text leave the Mac; in Auto mode or on a cloud route it also has the **Allow audio upload** and **Allow transcript upload** switches.
+  - **Auto** uses the local models by default. When you press Start, it uses the preferred cloud provider set in **Settings → Cloud providers** instead only if the local models cannot keep up in real time on this computer and you have allowed the matching upload. Auto never turns on an upload permission for you.
+- The **Inference** panel on the right lets you pick the recognition provider (ASR provider) and the translation provider separately. **Audio / VAD** shows the input level and whether speech is detected. **Latency** shows how long each step takes. The card at the bottom says whether this session's audio and text leave the computer; in Auto mode or on a cloud route it also has the **Allow audio upload** and **Allow transcript upload** switches.
 - **Start / Pause / Resume / Stop** control the session.
-- In the transcript, the original is on the left and the translation on the right. The bottom row marked **LIVE** is the sentence still being recognized; its lighter words may still change. When a sentence is final it stays fixed, and its translation follows. Scrolling up pauses auto-scroll; **Back to live** returns to the newest line.
+- In the transcript, the original is on the left and the translation on the right. The bottom row marked **LIVE** is the sentence still being recognized; its lighter words may still change. When a sentence is final it stays fixed, and its translation follows. Scrolling up pauses auto-scroll and keeps your place while new lines arrive; **Back to live** returns to the newest line.
 
-**Floating caption**: **Floating caption** on the Live screen (or **Open caption** in **Settings → General**) opens a small always-on-top window that you can move and resize. It shows the last 1–3 sentences and the one being spoken. In **Settings → Appearance** you can show the original and the translation, the original only or the translation only, and set the font size (18–72 px), the opacity and the number of sentences.
+**Floating caption**: **Floating caption** on the Live screen (or **Open caption** in **Settings → General**) opens a small always-on-top window that you can move and resize. It shows the last 1–3 sentences and the one being spoken. In **Settings → Appearance** you can show the original and the translation, the original only or the translation only, and set the font size (18–72 px), the opacity (macOS only) and the number of sentences.
 
 ![Floating caption window](docs/screenshots/caption.png)
 
 **Lecture context**: before class, open this panel and write one entry per line: the topic, names and terms. A line like `pre-attentive vision = 前注意视觉` becomes a glossary pair for this lecture. The limit is 2,000 characters.
 
-- **Import from slides…** pulls terms out of course materials (PDF, PPTX, DOCX and more). Without an AI assistant, the text is only extracted on your Mac. If the assistant is set up but not yet allowed to receive text, EchoLingo first asks whether it may read the slide text to pick out terms and translations; choose **Extract on this Mac** to keep it local. Once the assistant is allowed, slide text goes to it directly, and the hint next to the button says so.
+- **Import from slides…** pulls terms out of course materials (PDF, PPTX, DOCX and more). Without an AI assistant, the text is only extracted on your computer. If the assistant is set up but not yet allowed to receive text, EchoLingo first asks whether it may read the slide text to pick out terms and translations; choose **Extract on this computer** to keep it local. Once the assistant is allowed, slide text goes to it directly, and the hint next to the button says so.
 - While a session runs, the context is read-only.
 - Put terms you need in every lecture into **Settings → Translation → Glossary**: one entry per line, lines starting with `#` are ignored, and the limit is 4,000 characters. Changes apply from the next session.
-- With local models, the context never leaves your Mac. With cloud providers, it is sent along with the audio or text only when the matching upload is allowed.
+- With local models, the context never leaves your computer. With cloud providers, it is sent along with the audio or text only when the matching upload is allowed.
 
 ### History and AI notes
 
@@ -114,7 +143,7 @@ EchoLingo is a real-time lecture interpreter for the Mac. It turns what the lect
 - **Transcript tab**: the bilingual transcript with timestamps. **Export** saves MD, TXT, JSON, SRT or VTT; if the session has AI notes, the Markdown export puts them at the top. After class, the local alignment model refines the timestamps to word level in the background, and **Timing** then shows `word-aligned`.
 - **AI notes tab**:
   1. Set up the assistant in **Settings → AI assistant** first (see below).
-  2. Click **Create notes**. EchoLingo asks whether to add course materials (**Add files…**), or you can go ahead with **Create without files**. You can attach up to 5 files of up to 25 MB each, in PDF, PowerPoint (.pptx), Word (.docx), Markdown, LaTeX, CSV or plain text. The text is extracted on your Mac and only the extracted text is sent. Scanned PDFs without a text layer are reported and skipped.
+  2. Click **Create notes**. EchoLingo asks whether to add course materials (**Add files…**), or you can go ahead with **Create without files**. You can attach up to 5 files of up to 25 MB each, in PDF, PowerPoint (.pptx), Word (.docx), Markdown, LaTeX, CSV or plain text. The text is extracted on your computer and only the extracted text is sent. Scanned PDFs without a text layer are reported and skipped.
   3. The notes stream in as they are written, in the session's translation language: a title, an overview, sections, formulas and key terms. Sessions longer than about 20 minutes are written in 12–15 minute parts that continue one document.
   4. Each section heading has a time range such as `08:40–21:15`. Click it to jump to that part of the transcript, then **Back to notes** to return. The **Contents** list on the left jumps between sections.
   5. The toolbar has **Copy** (copies the Markdown), **Export .md** and **Regenerate** (the current notes are replaced only once the new ones are saved). Notes are saved with the session, so reopening it shows them without calling the model again.
@@ -127,7 +156,7 @@ EchoLingo is a real-time lecture interpreter for the Mac. It turns what the lect
 | Audio | Default audio profile |
 | Languages | Default source and target languages |
 | Inference | Default inference mode (Auto / Local / Cloud); preload local models at launch |
-| Models | Default recognition and translation providers; download, verify and delete local models |
+| Models | Default recognition and translation providers; download, verify and delete local models; the GPU acceleration pack (Windows and Linux) |
 | Cloud providers | Preferred cloud recognizer and translator for Auto; one key card per provider |
 | AI assistant | The model that writes notes and titles, its consent switch, automatic titles |
 | Privacy | The two upload switches: Audio upload and Transcript upload |
@@ -135,7 +164,7 @@ EchoLingo is a real-time lecture interpreter for the Mac. It turns what the lect
 | Appearance | How the floating caption looks |
 | Advanced | Diagnostics and the logs folder |
 
-**Cloud providers**: each provider has a card. Paste the key and click **Save** to store it in the macOS Keychain, **Clear** to remove it, and **Test** to check the setup.
+**Cloud providers**: each provider has a card. Paste the key and click **Save** to store it in the system secure store (macOS Keychain, Windows Credential Manager, or Secret Service on Linux), **Clear** to remove it, and **Test** to check the setup.
 
 - Recognition tests only complete the authenticated handshake; they never upload audio.
 - Translation tests send one fixed English sentence ("Welcome to the lecture.") and need Transcript upload. If it is not allowed yet, a translation-only provider asks for your consent before testing; a provider with both recognition and translation (such as Qwen Cloud or OpenAI) tests recognition only, and **Include translation in the test…** below the result adds translation.
@@ -146,7 +175,7 @@ EchoLingo is a real-time lecture interpreter for the Mac. It turns what the lect
 
 **AI assistant**: notes and automatic titles are written by a chat model you choose and billed to your own API key. Recognition and translation are not affected.
 
-- **Provider**: Qwen (Alibaba Model Studio), OpenAI, DeepSeek, Google Gemini, Groq, OpenRouter, SiliconFlow, or a custom OpenAI-compatible endpoint (for example Ollama on your Mac). Save that provider's key under **Cloud providers** first; a custom endpoint needs its **Base URL** there instead, and its key is optional.
+- **Provider**: Qwen (Alibaba Model Studio), OpenAI, DeepSeek, Google Gemini, Groq, OpenRouter, SiliconFlow, or a custom OpenAI-compatible endpoint (for example Ollama on your computer). Save that provider's key under **Cloud providers** first; a custom endpoint needs its **Base URL** there instead, and its key is optional.
 - **Model**: leave it empty to use the default (for example `qwen-plus` or `gpt-4o-mini`). For long lectures, choose a model with a large context window.
 - **Test**: sends one short fixed prompt and no transcript.
 - **Consent**: "Send transcripts and attached files to this model for notes and titles" must be on before any transcript or attachment text can be sent. Consent covers the selected provider only; switching providers turns it off.
@@ -154,13 +183,13 @@ EchoLingo is a real-time lecture interpreter for the Mac. It turns what the lect
 
 ![AI assistant settings](docs/screenshots/settings-assistant.png)
 
-**Consent dialogs**: a small lock on a button (for example **Start** on a cloud route, **Create notes**, **Generate title**, or **Test** for a translation provider) means that step needs your consent. Clicking it opens a dialog that explains what will be sent, to whom, and what stays on your Mac. The dialog opens with the focus on the button that uploads nothing (**Not now**, or **Extract on this Mac** when importing slides); nothing changes until you click a button that starts with **Allow**. Your answer is saved as the default and can be turned off at any time in **Settings → Privacy** or **Settings → AI assistant**. If something is still missing (for example a key), the dialog has a button that opens the right settings page.
+**Consent dialogs**: a small lock on a button (for example **Start** on a cloud route, **Create notes**, **Generate title**, or **Test** for a translation provider) means that step needs your consent. Clicking it opens a dialog that explains what will be sent, to whom, and what stays on your computer. The dialog opens with the focus on the button that uploads nothing (**Not now**, or **Extract on this computer** when importing slides); nothing changes until you click a button that starts with **Allow**. Your answer is saved as the default and can be turned off at any time in **Settings → Privacy** or **Settings → AI assistant**. If something is still missing (for example a key), the dialog has a button that opens the right settings page.
 
 ![Consent dialog before any upload](docs/screenshots/consent.png)
 
 ## Privacy
 
-**What always stays on your Mac**
+**What always stays on your computer**
 
 - Audio capture, noise suppression, gain control, speech detection and resampling.
 - All recognition and translation when you use the local models.
@@ -179,25 +208,29 @@ EchoLingo is a real-time lecture interpreter for the Mac. It turns what the lect
 
 Audio is never sent for AI notes or titles.
 
-**How to revoke**: turn off Audio upload or Transcript upload in **Settings → Privacy**; turn off Consent or set the provider to **Off** in **Settings → AI assistant**; click **Clear** on a card in **Settings → Cloud providers** to delete a key from the Keychain. Data already sent to a third-party provider is governed by that provider's own privacy policy.
+**How to revoke**: turn off Audio upload or Transcript upload in **Settings → Privacy**; turn off Consent or set the provider to **Off** in **Settings → AI assistant**; click **Clear** on a card in **Settings → Cloud providers** to delete a key from the secure store. Data already sent to a third-party provider is governed by that provider's own privacy policy.
 
-**Where your data lives**: `~/Library/Application Support/app.echolingo.desktop/`
+**Where your data lives**:
+- macOS: `~/Library/Application Support/app.echolingo.desktop/`
+- Windows: `%LOCALAPPDATA%\app.echolingo.desktop\`
+- Linux: `~/.local/share/app.echolingo.desktop/`
 
 | Path | Contents |
 | --- | --- |
 | `history.sqlite` | Sessions, transcripts, translations, AI notes |
 | `preferences.json` | Settings (no keys) |
 | `models/` | Local models |
+| `runtimes/gpu-pack/` | The GPU acceleration pack (Windows and Linux, once installed) |
 | `alignment-spool/` | Temporary audio for timestamp alignment |
 | `logs/` | Logs for troubleshooting |
 
-Keys are stored in the macOS Keychain under the service name `app.echolingo.desktop` and are never written to the settings file or the logs. To uninstall completely, first **Clear** each key under **Cloud providers**, then delete the app and the folder above.
+Keys are stored in the system secure store (macOS Keychain, Windows Credential Manager, or Secret Service on Linux) under the service name `app.echolingo.desktop` and are never written to the settings file or the logs. To uninstall completely, first **Clear** each key under **Cloud providers**, then uninstall the app (on Windows in **Settings → Apps → Installed apps**) and delete the folder above.
 
 ## FAQ
 
 ### The model download is slow or fails
 
-In mainland China, try the Hugging Face mirror: run `launchctl setenv HF_ENDPOINT https://hf-mirror.com`, quit EchoLingo with ⌘Q, reopen it and click **Download** again. Downloads use the macOS system proxy settings; if your proxy app does not set a system proxy, set one the same way, for example `launchctl setenv HTTPS_PROXY http://127.0.0.1:7890` (use your own proxy address). After a failed or interrupted download, click **Download** again.
+In mainland China, try the Hugging Face mirror. On macOS, run `launchctl setenv HF_ENDPOINT https://hf-mirror.com`, quit EchoLingo with ⌘Q, reopen it and click **Download** again; for Windows and Linux, see [Windows / Linux](#windows--linux-in-testing-not-yet-published). If downloads do not go through your proxy, set `HTTPS_PROXY` the same way, for example `launchctl setenv HTTPS_PROXY http://127.0.0.1:7890` on macOS or `setx HTTPS_PROXY http://127.0.0.1:7890` on Windows (use your own proxy address). After a failed or interrupted download, click **Download** again.
 
 ### Start says a required local model is not ready
 
@@ -209,10 +242,24 @@ Loading the models the first time takes 1–2 minutes. With "Preload local model
 
 ### No captions, or no sound gets through
 
-- Open **System Settings → Privacy & Security → Microphone** and make sure EchoLingo is on.
+- On macOS, open **System Settings → Privacy & Security → Microphone** and make sure EchoLingo is on.
 - To capture sound playing on the Mac, also turn EchoLingo on under **System Settings → Privacy & Security → Screen & System Audio Recording** (called **Screen Recording** on macOS 14), then reopen the app.
 - After updating the Beta, macOS may ask for permission again. If the switch is on but there is still no sound, remove EchoLingo from the list and grant access again.
+- On Windows, open **Settings → Privacy & security → Microphone** and make sure microphone access and **Let desktop apps access your microphone** are on.
+- On Linux, check the input device and its level in the system sound settings.
 - Check that the level bar in the **Audio / VAD** panel on the Live screen moves.
+
+### Captions fall further and further behind (Windows / Linux)
+
+Without the GPU acceleration pack, recognition runs on the CPU, and slower processors may not keep up in real time. Install the [GPU acceleration pack](#windows--linux-in-testing-not-yet-published) if the computer has a supported NVIDIA card, or set a cloud recognizer under **Settings → Cloud providers**: with the route on Auto, it is used when the local model misses its latency target, once you allow audio upload.
+
+### The floating caption does not stay on top (Linux)
+
+On Wayland desktops, an app cannot always keep its own window above the others. Start EchoLingo with the X11 backend, for example `GDK_BACKEND=x11 echolingo-desktop` (or `GDK_BACKEND=x11 ./EchoLingo_0.2.0_amd64.AppImage`), or log in to an X11 session.
+
+### Keys cannot be saved (Linux)
+
+EchoLingo saves keys through the Secret Service. Install or unlock GNOME Keyring or KWallet and reopen EchoLingo. Until then, set the provider's environment variable (for example `DEEPL_API_KEY`) before starting the app; each card in **Settings → Cloud providers** names its variable.
 
 ### The Qwen Cloud test fails
 
@@ -243,18 +290,24 @@ Existing notes are kept when a new attempt fails. The error message usually has 
 
 ### Can I use it completely offline?
 
-Yes. Once the models are downloaded, local recognition and translation need no network. AI notes need a connection unless the assistant points to a custom endpoint running on your Mac (such as Ollama).
+Yes. Once the models are downloaded, local recognition and translation need no network. AI notes need a connection unless the assistant points to a custom endpoint running on your computer (such as Ollama).
 
 ## Roadmap
 
-- **Windows version (planned)**: native WASAPI audio capture (including system-audio loopback), local inference on CPU, CUDA and DirectML, a Windows build of llama.cpp, the packaged local inference service, and code signing.
-- Linux version.
-- Apple notarization, so the first launch needs no manual steps.
+- **Windows and Linux**: published once they have been tested on real computers.
+- GPU acceleration on AMD and Intel graphics cards.
+- System audio capture on Linux.
+- Code signing on Windows and Apple notarization, so the first launch needs no manual steps.
+- ARM64 builds for Windows and Linux.
 - More languages.
 
 ## Build from source
 
-You need an Apple Silicon Mac with macOS 14 or later, the Xcode Command Line Tools, Node.js 22 LTS, Rust 1.88 or later (stable) and Conda (Miniconda or Miniforge).
+You need Node.js 22 LTS, Rust 1.88 or later (stable) and Conda (Miniconda or Miniforge), plus:
+
+- **macOS**: an Apple Silicon Mac with macOS 14 or later and the Xcode Command Line Tools.
+- **Windows**: Windows 10 or 11 (x64) with the Visual Studio 2022 Build Tools (**Desktop development with C++**) and the WebView2 runtime.
+- **Linux**: Ubuntu 22.04 or later (x64) with `sudo apt install build-essential curl file libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libasound2-dev`.
 
 ```bash
 git clone https://github.com/Asphr726/EchoLingo.git
@@ -263,21 +316,21 @@ cd EchoLingo
 # Python environment and the speech recognition runtime
 conda env create -f environment.yml
 conda activate echolingo-spike1
-python -m pip install -e '.[qwen]'
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu   # Windows and Linux only: CPU build of PyTorch
+python -m pip install -e ".[qwen]"
 
-# Speech detection model and the translation runtime (llama.cpp)
-mkdir -p models
-curl -L -o models/silero_vad.onnx https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx
+# Translation runtime (the llama.cpp build for this platform)
 python scripts/fetch_llama_runtime.py
 
 # Desktop app
 npm install
-python scripts/build_sidecar.py --clean          # packages the local inference service
+python scripts/build_sidecar.py --clean          # packages the local inference service (and downloads the pinned Silero VAD model)
 npm run desktop:dev                              # run in development mode
-APPLE_SIGNING_IDENTITY=- npm run desktop:build   # local ad-hoc signed build
+npm run desktop:build                            # Windows and Linux: installer and packages
+APPLE_SIGNING_IDENTITY=- npm run desktop:build   # macOS: local ad-hoc signed build
 ```
 
-The build ends up in `target/release/bundle/dmg/EchoLingo_0.1.0_aarch64.dmg`. `APPLE_SIGNING_IDENTITY=-` produces an ad-hoc signature that is only suitable for your own Mac; public distribution needs a Developer ID certificate and Apple notarization.
+The build ends up in `target/release/bundle/`: `dmg/EchoLingo_0.2.0_aarch64.dmg` on macOS, `nsis/EchoLingo_0.2.0_x64-setup.exe` on Windows, and `deb/EchoLingo_0.2.0_amd64.deb` (plus `appimage/`) on Linux. `APPLE_SIGNING_IDENTITY=-` produces an ad-hoc signature that is only suitable for your own Mac; public distribution needs a Developer ID certificate and Apple notarization.
 
 Run the tests:
 

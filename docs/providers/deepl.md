@@ -14,7 +14,8 @@ endpoint). Translation only; DeepL has no streaming ASR.
    <https://www.deepl.com/your-account/keys>.
 3. In EchoLingo open **Settings → Cloud providers → DeepL**, paste the key, pick the
    **Plan** (API Free / API Pro) and choose **Save**. The key is stored in the
-   macOS Keychain and reaches the sidecar only as the `DEEPL_API_KEY`
+   system secure store (macOS Keychain, Windows Credential Manager, or Secret
+   Service on Linux) and reaches the sidecar only as the `DEEPL_API_KEY`
    environment variable for the lifetime of a session. On the command line
    `DEEPL_API_KEY` is the development fallback.
 

@@ -12,6 +12,7 @@ import type {
   ConsentRequest,
   ContextImportResult,
   CredentialGroupStatus,
+  GpuAccelerationStatus,
   ModelProgress,
   NoteAttachment,
   ProviderCatalog,
@@ -27,6 +28,7 @@ import type {
   UiEventEnvelope,
 } from "../types";
 import { defaultAssistantPreferences, defaultCaptionPreferences, defaultSessionDefaults, emptySnapshot } from "../types";
+import { platform } from "./platform";
 import { PreviewAssistant, previewAttachments, previewContextImport, previewNotesMode } from "./previewNotes";
 // The committed catalog doubles as the browser-preview fixture. In the
 // desktop runtime the shell serves the same document via `list_providers`.
@@ -81,6 +83,142 @@ const previewAssistantConsentValue = (fallback: boolean) => {
   if (previewAssistantConsent === null && previewParam("assistant") === "consent") previewAssistantConsent = false;
   return previewAssistantConsent ?? fallback;
 };
+
+/** `&store=unavailable`: the OS secure store cannot be reached, as when no
+ *  Secret Service provider runs on Linux. */
+const previewStoreUnavailable = () => previewParam("store") === "unavailable";
+
+/** Devices, permissions and folders of the platform the preview shows
+ *  (`&platform=windows|linux`, otherwise the browser's own). */
+function previewPlatformFixtures() {
+  const microphone: AudioDevice = {
+    id: "preview-microphone",
+    name: "Default microphone",
+    kind: "microphone",
+    is_default: true,
+    available: true,
+    requires_picker: false,
+  };
+  switch (platform()) {
+    case "windows":
+      return {
+        devices: [
+          microphone,
+          { id: "windows-wasapi-loopback", name: "System audio (default output)", kind: "system_audio", is_default: false, available: true, requires_picker: false },
+        ] satisfies AudioDevice[],
+        permissions: { microphone: "granted", system_audio: "granted" } satisfies AudioPermissionStatus,
+        dataDirectory: "C:\\Users\\you\\AppData\\Local\\app.echolingo.desktop",
+        separator: "\\",
+      };
+    case "linux":
+      return {
+        devices: [
+          microphone,
+          { id: "system-audio-unavailable", name: "System audio", kind: "system_audio", is_default: false, available: false, requires_picker: false },
+        ] satisfies AudioDevice[],
+        permissions: { microphone: "granted", system_audio: "unavailable" } satisfies AudioPermissionStatus,
+        dataDirectory: "~/.local/share/app.echolingo.desktop",
+        separator: "/",
+      };
+    default:
+      return {
+        devices: [
+          microphone,
+          { id: "macos-screen-capture-kit", name: "System Audio…", kind: "system_audio", is_default: false, available: true, requires_picker: true },
+        ] satisfies AudioDevice[],
+        permissions: { microphone: "not_determined", system_audio: "not_determined" } satisfies AudioPermissionStatus,
+        dataDirectory: "~/Library/Application Support/app.echolingo.desktop",
+        separator: "/",
+      };
+  }
+}
+
+// GPU acceleration pack of the preview. `&gpu=eligible|ineligible|none|
+// installed|update|fallback` shows the Windows and Linux card; without it the
+// platform has none, as on macOS.
+const previewRtx = { name: "NVIDIA GeForce RTX 3060 Laptop GPU", compute_capability: "8.6", driver_version: "581.15" };
+const previewGpuUnsupported: GpuAccelerationStatus = {
+  supported_platform: false,
+  gpu: null,
+  eligible: false,
+  ineligible_reason: null,
+  pack_state: "not_installed",
+  pack_version: null,
+  download_bytes: null,
+  installed_bytes: null,
+  cuda_available: null,
+  device_name: null,
+  enabled: true,
+  active: false,
+  fallback_reason: null,
+};
+const previewGpuEligible: GpuAccelerationStatus = {
+  ...previewGpuUnsupported,
+  supported_platform: true,
+  gpu: previewRtx,
+  eligible: true,
+  download_bytes: 2_791_728_742,
+};
+const previewGpuInstalled: GpuAccelerationStatus = {
+  ...previewGpuEligible,
+  pack_state: "ready",
+  pack_version: "0.2.0",
+  installed_bytes: 5_798_205_849,
+  cuda_available: true,
+  device_name: previewRtx.name,
+  active: true,
+};
+let previewGpuState: GpuAccelerationStatus | null = null;
+
+function previewGpu(): GpuAccelerationStatus {
+  if (previewGpuState) return previewGpuState;
+  switch (previewParam("gpu")) {
+    case "eligible":
+      return (previewGpuState = previewGpuEligible);
+    case "ineligible":
+      return (previewGpuState = {
+        ...previewGpuUnsupported,
+        supported_platform: true,
+        gpu: { name: "NVIDIA GeForce GTX 1060 6GB", compute_capability: "6.1", driver_version: "581.15" },
+        ineligible_reason: "GeForce GTX 1060 6GB has compute capability 6.1; the pack needs 7.5 (GeForce RTX 20 or GTX 16 series) or newer.",
+      });
+    case "none":
+      return (previewGpuState = { ...previewGpuUnsupported, supported_platform: true, ineligible_reason: "No NVIDIA GPU detected." });
+    case "installed":
+      return (previewGpuState = previewGpuInstalled);
+    case "update":
+      return (previewGpuState = { ...previewGpuEligible, pack_state: "update_required", pack_version: "0.1.9", installed_bytes: 5_798_205_849 });
+    case "fallback":
+      return (previewGpuState = {
+        ...previewGpuInstalled,
+        active: false,
+        fallback_reason: "Qwen3-ASR did not start on the GPU (CUDA error: out of memory).",
+      });
+    default:
+      return previewGpuUnsupported;
+  }
+}
+
+/** Walks the pack download through its phases on the model progress channel. */
+async function previewInstallGpuPack(): Promise<GpuAccelerationStatus> {
+  const total = previewGpu().download_bytes ?? 2_791_728_742;
+  const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+  const emit = (phase: string, bytes: number) =>
+    emitPreviewProgress({ model_id: "gpu-pack", bytes_completed: bytes, total_bytes: total, bytes_per_second: 48_000_000, phase });
+  previewGpuState = { ...previewGpu(), pack_state: "installing" };
+  emit("starting", 0);
+  for (let step = 1; step <= 20; step += 1) {
+    await sleep(160);
+    emit("downloading", Math.round((total * step) / 20));
+  }
+  for (const phase of ["verifying", "extracting", "testing"]) {
+    await sleep(700);
+    emit(phase, total);
+  }
+  previewGpuState = { ...previewGpuInstalled, enabled: previewGpu().enabled, active: false };
+  emit("ready", total);
+  return previewGpuState;
+}
 
 /** `?consent=session|assistant|setup` opens the consent dialog on load. */
 export function previewConsentRequest(): ConsentRequest | null {
@@ -159,6 +297,7 @@ export async function command<T>(name: string, args?: Record<string, unknown>): 
 }
 
 function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
+  const fixtures = previewPlatformFixtures();
   const values: Record<string, unknown> = {
     get_app_snapshot: previewMode() && !previewIdle()
       ? {
@@ -185,24 +324,7 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
         }
       : emptySnapshot,
     onboarding_status: previewMode(),
-    list_audio_devices: [
-      {
-        id: "preview-microphone",
-        name: "Default microphone",
-        kind: "microphone",
-        is_default: true,
-        available: true,
-        requires_picker: false,
-      },
-      {
-        id: "macos-screen-capture-kit",
-        name: "System Audio…",
-        kind: "system_audio",
-        is_default: false,
-        available: true,
-        requires_picker: true,
-      },
-    ] satisfies AudioDevice[],
+    list_audio_devices: fixtures.devices,
     get_caption_preferences: defaultCaptionPreferences,
     get_runtime_preferences: {
       preload_local_models: true,
@@ -223,7 +345,7 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
     credential_status: previewCatalog.credential_groups.map((group) =>
       previewGroupStatus(group.id, previewMode() && group.id === "dashscope" ? "keychain" : "none"),
     ) satisfies CredentialGroupStatus[],
-    logs_directory: "~/Library/Logs/EchoLingo",
+    logs_directory: [fixtures.dataDirectory, "logs"].join(fixtures.separator),
     list_models: [
       {
         id: "qwen3-asr-0.6b",
@@ -231,14 +353,12 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
         role: "asr",
         size_bytes: 1876091704,
         state: "not_downloaded",
-        path: "/Applications/EchoLingo/models/qwen3-asr-0.6b",
+        path: [fixtures.dataDirectory, "models", "qwen3-asr-0.6b"].join(fixtures.separator),
         revision: "5eb144179a02acc5e5ba31e748d22b0cf3e303b0",
       },
     ] satisfies ModelStatus[],
-    audio_permission_status: {
-      microphone: "not_determined",
-      system_audio: "not_determined",
-    } satisfies AudioPermissionStatus,
+    audio_permission_status: fixtures.permissions,
+    gpu_acceleration_status: previewGpu(),
   };
   if (name === "update_session_defaults") {
     return args?.defaults as T;
@@ -299,6 +419,17 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
         return assistant.title(String(args?.sessionId)) as T;
       case "import_context_files":
         return previewContextImport as T;
+      case "install_gpu_pack":
+        return previewInstallGpuPack() as T;
+      case "remove_gpu_pack":
+        previewGpuState = { ...previewGpuEligible, enabled: previewGpu().enabled };
+        return previewGpuState as T;
+      case "set_gpu_acceleration": {
+        const enabled = Boolean(args?.enabled);
+        const current = previewGpu();
+        previewGpuState = { ...current, enabled, active: enabled && current.pack_state === "ready" && !current.fallback_reason };
+        return previewGpuState as T;
+      }
     }
   }
   if (name === "history_search") return [] as T;
@@ -321,13 +452,17 @@ function previewGroupStatus(
   only?: string[],
 ): CredentialGroupStatus {
   const group = previewCatalog.credential_groups.find((entry) => entry.id === groupId);
+  const storeUnavailable = previewStoreUnavailable();
+  const effectiveSource = storeUnavailable && source === "keychain" ? "none" : source;
   return {
     group_id: groupId,
     fields: (group?.fields ?? []).map((field) => {
-      const available = source !== "none" && (only === undefined || only.includes(field.key));
-      return { key: field.key, available, source: available ? source : "none" };
+      const available = effectiveSource !== "none" && (only === undefined || only.includes(field.key));
+      return { key: field.key, available, source: available ? effectiveSource : "none" };
     }),
     settings: Object.fromEntries((group?.settings ?? []).map((setting) => [setting.key, setting.default])),
+    store_available: !storeUnavailable,
+    store_error: storeUnavailable ? "The name org.freedesktop.secrets was not provided by any .service files" : null,
   };
 }
 
@@ -523,10 +658,20 @@ function startPreviewFeed(): void {
   })();
 }
 
+const previewProgressHandlers = new Set<(event: ModelProgress) => void>();
+
+function emitPreviewProgress(progress: ModelProgress) {
+  for (const handler of [...previewProgressHandlers]) handler(progress);
+}
+
 export async function subscribeModelProgress(
   handler: (event: ModelProgress) => void,
 ): Promise<UnlistenFn> {
-  if (!isTauri()) return () => undefined;
+  if (!isTauri()) {
+    if (!previewMode()) return () => undefined;
+    previewProgressHandlers.add(handler);
+    return () => void previewProgressHandlers.delete(handler);
+  }
   return listen<ModelProgress>("echolingo://model-progress", ({ payload }) => handler(payload));
 }
 
@@ -582,6 +727,16 @@ export const api = {
     command<ModelStatus>("verify_model", { modelId }),
   deleteModel: (modelId: string) =>
     command<ModelStatus>("delete_model", { modelId }),
+
+  // NVIDIA GPU acceleration pack (Windows and Linux). Everything but the
+  // status is refused while a session runs.
+  gpuAccelerationStatus: () => command<GpuAccelerationStatus>("gpu_acceleration_status"),
+  /** Downloads, verifies, unpacks and self-tests the pack; progress arrives
+   *  on the model progress channel as `model_id: "gpu-pack"`. */
+  installGpuPack: () => command<GpuAccelerationStatus>("install_gpu_pack"),
+  removeGpuPack: () => command<GpuAccelerationStatus>("remove_gpu_pack"),
+  setGpuAcceleration: (enabled: boolean) =>
+    command<GpuAccelerationStatus>("set_gpu_acceleration", { enabled }),
   showCaption: () => command<void>("show_caption_window"),
   hideCaption: () => command<void>("hide_caption_window"),
   historySearch: (query = "") =>

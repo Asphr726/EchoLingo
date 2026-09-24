@@ -471,7 +471,7 @@ function SetupCover({ onCreate, status }: { status: AssistantStatus; onCreate: (
         <h3>Allow transcripts to go to {name}</h3>
         <p>
           Creating notes sends this session’s transcript, and the text of any files you attach, to {name}. Audio never
-          leaves this Mac.
+          leaves this computer.
         </p>
         <div className="notes-cover-actions">
           {/* Asks in the consent dialog, then continues to the attachment sheet. */}

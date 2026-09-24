@@ -6,11 +6,19 @@ upload**, cloud translation needs **Transcript upload**. Nothing is uploaded
 without those switches, and the connection tests below never upload
 microphone audio.
 
-Credentials are stored in the macOS Keychain (service
-`app.echolingo.desktop`) and reach the local inference service only as
-environment variables for the lifetime of a session. On the command line the same
-variables are development fallbacks. Secret values never appear in settings
-files, history, events or logs.
+Credentials are stored in the system secure store (service
+`app.echolingo.desktop`): the macOS Keychain, the Windows Credential Manager,
+or a Secret Service provider such as GNOME Keyring or KWallet on Linux. They
+reach the local inference service only as environment variables for the
+lifetime of a session. On the command line the same variables are development
+fallbacks. Secret values never appear in settings files, history, events or
+logs.
+
+If the secure store cannot be reached (on Linux, typically because no Secret
+Service provider is running or it is locked), **Settings → Cloud providers**
+says so and saving keys is turned off. Each card then names the environment
+variable to set instead; set it before EchoLingo starts (see
+[Setting environment variables for the app](#setting-environment-variables-for-the-app)).
 
 | Group | Providers | Free tier | Page |
 | --- | --- | --- | --- |
@@ -49,13 +57,26 @@ yet publish EN/ZH/JA/KO latency or accuracy figures for the cloud providers.
 | --- | --- | --- |
 | `authentication_failed` (HTTP 401/403) | key rejected, wrong region, model not enabled | The message names the host that was tried. For Qwen Cloud check the Region setting matches the console where the key was created; clear the workspace ID to use the key's default workspace. |
 | `rate_limited` (HTTP 429/456) | quota or rate limit | Wait, or switch the preferred cloud provider. |
-| `network_error` / `provider_timeout` | host unreachable | Check connectivity and proxy settings; `HTTPS_PROXY`/`NO_PROXY` are honoured by the inference service (for the app, set them with `launchctl setenv` and reopen it). Mainland China networks usually need a proxy for OpenAI, Deepgram, AssemblyAI, Gladia, DeepL, Google and Azure; DashScope Beijing, DeepSeek and SiliconFlow are reachable directly. |
+| `network_error` / `provider_timeout` | host unreachable | Check connectivity and proxy settings; `HTTPS_PROXY`/`NO_PROXY` are honoured by the inference service (for the app, set them as described [below](#setting-environment-variables-for-the-app) and reopen it). Mainland China networks usually need a proxy for OpenAI, Deepgram, AssemblyAI, Gladia, DeepL, Google and Azure; DashScope Beijing, DeepSeek and SiliconFlow are reachable directly. |
 | `privacy_policy_denied` | consent switch off | Enable Audio upload / Transcript upload in Settings → Privacy. |
 | `unknown_provider` | stale preference | Re-select the provider on the Live screen or in **Settings → Models**. |
 
 Diagnostics from the inference service are appended to `logs/sidecar.log`
 inside the app data directory (shown under **Settings → Advanced**); values
 of credentials are never written there.
+
+### Setting environment variables for the app
+
+Proxy settings (`HTTPS_PROXY`, `NO_PROXY`), the Hugging Face mirror
+(`HF_ENDPOINT`) and, when the secure store is unavailable, provider keys reach
+the app through its environment. Quit EchoLingo completely before changing
+them and reopen it afterwards.
+
+| System | Set | Remove |
+| --- | --- | --- |
+| macOS | `launchctl setenv HTTPS_PROXY http://127.0.0.1:7890` (lasts until you log out) | `launchctl unsetenv HTTPS_PROXY` |
+| Windows | `setx HTTPS_PROXY http://127.0.0.1:7890` in Command Prompt or PowerShell (applies to apps started afterwards) | `reg delete HKCU\Environment /v HTTPS_PROXY /f` |
+| Linux | `export HTTPS_PROXY=http://127.0.0.1:7890` in `~/.profile`, then log out and back in; or start the app from a terminal with the variable set | remove the line from `~/.profile` |
 
 ## AI assistant: session notes and titles
 
@@ -74,7 +95,7 @@ each session automatically.
    titles**, or allow it in the dialog the first time you create notes.
    Nothing is sent before this consent is given; it covers the selected
    provider only, and switching providers turns it off. Audio never leaves
-   the Mac for notes or titles. **Test** sends one fixed prompt and no
+   the computer for notes or titles. **Test** sends one fixed prompt and no
    transcript.
 4. With **Name sessions automatically when they end** on, a session with at
    least 30 words gets an AI title in its target language right after Stop.
@@ -83,7 +104,7 @@ each session automatically.
 **Creating notes.** Open a session in History → **AI notes** → **Create
 notes**. EchoLingo asks whether to add course materials: PDF, PowerPoint
 (.pptx), Word (.docx), Markdown, LaTeX, CSV or plain text, up to 5 files of
-25 MB each. Text is extracted on this Mac (scanned PDFs without a text layer
+25 MB each. Text is extracted on this computer (scanned PDFs without a text layer
 are reported and skipped); only the extracted text is sent, so every provider
 accepts it. Notes are written in the session's translation language, stream
 in as they are generated, render Markdown and LaTeX, and are saved with the

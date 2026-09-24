@@ -10,6 +10,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { restoreAudioSelection } from "../lib/audio";
 import { api, subscribeUiEvents } from "../lib/bridge";
 import { requestNavigation } from "../lib/navigation";
 import { announceAssistantChanged, setupNeed } from "../lib/notes";
@@ -365,12 +366,7 @@ export function AppProvider({ children }: PropsWithChildren) {
           expected_state_revision: nextSnapshot.state_revision,
           asr_provider: smokeBackend ? "mock" : nextDefaults.asr_provider,
           translation_provider: smokeBackend ? "mock" : nextDefaults.translation_provider,
-          audio_device_id:
-            nextDevices.find(
-              (device) => device.id === nextDefaults.audio_device_id && device.available,
-            )?.id ??
-            nextDevices.find((device) => device.kind === "microphone" && device.is_default)?.id ??
-            null,
+          ...restoreAudioSelection(nextDefaults, nextDevices),
         });
         setDevices(nextDevices);
         setCaption(nextCaption);

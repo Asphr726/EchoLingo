@@ -56,19 +56,19 @@ describe("ConsentDialog", () => {
     const html = render({ kind: "assistant", vendor: "Qwen (Alibaba Model Studio)", model: "qwen-plus", purpose: "notes" });
     expect(html).toContain("Send this session to Qwen (Alibaba Model Studio) · qwen-plus?");
     expect(html).toContain("the transcript and the text of files you attach go to Qwen (Alibaba Model Studio)");
-    expect(html).toContain("audio never leaves this Mac");
-    expect(html).toContain("Stays on this Mac");
+    expect(html).toContain("audio never leaves this computer");
+    expect(html).toContain("Stays on this computer");
     expect(html).toContain(">Allow</button>");
     expect(checkboxes(html)).toHaveLength(0);
   });
 
-  it("offers slide import on this Mac instead of Not now", () => {
+  it("offers slide import on this computer instead of Not now", () => {
     const html = render({ kind: "assistant", vendor: "OpenAI", model: "", purpose: "import" });
     expect(html).toContain("Send slide text to OpenAI?");
-    expect(html).toContain(">Extract on this Mac</button>");
+    expect(html).toContain(">Extract on this computer</button>");
     expect(html).toContain(">Allow and import</button>");
     expect(html).not.toContain(">Not now</button>");
-    expect(html).toContain("To import without sending anything, choose Extract on this Mac.");
+    expect(html).toContain("To import without sending anything, choose Extract on this computer.");
   });
 
   it("points setup that consent cannot fix to the right settings", () => {

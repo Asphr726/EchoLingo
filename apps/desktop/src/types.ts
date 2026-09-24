@@ -356,6 +356,10 @@ export interface CredentialGroupStatus {
   fields: CredentialFieldStatus[];
   /** Effective non-secret settings (runtime preferences over defaults). */
   settings: Record<string, string>;
+  /** False when the OS secure store could not be reached; keys can then
+   *  only come from environment variables. Missing means available. */
+  store_available?: boolean;
+  store_error?: string | null;
 }
 
 export type CloudProbeRoleStatus =
@@ -414,6 +418,36 @@ export interface ModelProgress {
   total_bytes: number;
   bytes_per_second: number | null;
   phase: string;
+}
+
+export type GpuPackState = "not_installed" | "installing" | "ready" | "update_required" | "corrupt";
+
+/** NVIDIA GPU acceleration pack (Windows and Linux x64). Its download
+ *  reports progress on the model progress channel as `model_id: "gpu-pack"`. */
+export interface GpuAccelerationStatus {
+  /** False on macOS, where the card is hidden. */
+  supported_platform: boolean;
+  /** The first NVIDIA GPU, when one is detected. */
+  gpu: { name: string; compute_capability: string; driver_version: string } | null;
+  /** A GPU is present with a new enough compute capability and driver. */
+  eligible: boolean;
+  /** Why the GPU cannot be used, in words the user can act on. */
+  ineligible_reason: string | null;
+  pack_state: GpuPackState;
+  /** App version the installed pack was built for. */
+  pack_version: string | null;
+  /** Total download size, once the pack manifest has been fetched. */
+  download_bytes: number | null;
+  installed_bytes: number | null;
+  /** From the self-test that ran after installing. */
+  cuda_available: boolean | null;
+  device_name: string | null;
+  /** The "Use GPU acceleration" preference. */
+  enabled: boolean;
+  /** The running local runtime uses the pack now. */
+  active: boolean;
+  /** Set when the GPU runtime failed and the app went back to the CPU. */
+  fallback_reason: string | null;
 }
 
 export interface SessionRecord {
@@ -573,7 +607,7 @@ export type ConsentRequest = SessionConsentRequest | AssistantConsentRequest | S
 
 /** How a consent request was answered. "declined" is the dialog's quiet
  *  button, after which an action may go on without the upload (slide import
- *  extracts on this Mac); "cancelled" is Esc, Close, the backdrop or a newer
+ *  extracts on this computer); "cancelled" is Esc, Close, the backdrop or a newer
  *  request, after which nothing goes on. */
 export type ConsentAnswer = "granted" | "declined" | "cancelled";
 

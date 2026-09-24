@@ -2,8 +2,10 @@ import { ArrowSquareOut, CheckCircle, ClosedCaptioning, CloudArrowUp, Key, Lock,
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { api, subscribeModelProgress } from "../lib/bridge";
 import { GLOSSARY_LIMIT } from "../lib/context";
+import { GPU_PACK_PROGRESS_ID } from "../lib/gpu";
 import { clearPendingSection, onNavigate, peekPendingSection } from "../lib/navigation";
 import { assistantPresets, credentialNeed, groupHasKey, onAssistantChanged } from "../lib/notes";
+import { platform, secureStoreName } from "../lib/platform";
 import { providersForGroup, recipientName } from "../lib/providers";
 import { useApp } from "../state/AppContext";
 import type {
@@ -25,6 +27,7 @@ import type {
   StartSessionRequest,
 } from "../types";
 import { defaultAssistantPreferences } from "../types";
+import { GpuAccelerationCard, useGpuAcceleration } from "./GpuAccelerationCard";
 import { ProviderSelect } from "./ProviderSelect";
 
 const sections = [
@@ -97,6 +100,8 @@ export function SettingsView() {
   const [modelError, setModelError] = useState<string | null>(null);
   const { caption, catalog, draft, setDraft, snapshot, updateCaption } = useApp();
   const sessionActive = !["IDLE", "COMPLETED"].includes(snapshot.phase);
+  // Treat a status without the field (an older shell) as a working store.
+  const storeProblem = Object.values(credentialStatus).find((status) => status.store_available === false);
   const [runtime, setRuntime] = useState<RuntimePreferences>({
     preload_local_models: true,
     providers: {},
@@ -321,6 +326,7 @@ export function SettingsView() {
               </div>
               {modelError && <p className="settings-error" role="alert">{modelError}</p>}
             </SettingsGroup>
+            <GpuAccelerationSettings progress={modelProgress[GPU_PACK_PROGRESS_ID]} sessionActive={sessionActive} />
           </div>
         )}
 
@@ -338,6 +344,17 @@ export function SettingsView() {
             <SettingsGroup title="Credentials" description="Saved in the OS secure store. Secret values never enter EchoLingo settings, history, events, or logs; the inference service receives them only for the duration of a session.">
               {!catalog && <p className="settings-helper">Loading the provider catalog…</p>}
               {credentialError && <p className="settings-error" role="alert">{credentialError}</p>}
+              {storeProblem && (
+                <div className="settings-note settings-note--warning" role="status">
+                  <Warning size={19} weight="regular" aria-hidden="true" />
+                  <p>
+                    <strong>Keys cannot be saved right now.</strong> EchoLingo keeps them in {secureStoreName(platform())}, which could not be
+                    reached{storeProblem.store_error ? ` (${storeProblem.store_error})` : ""}. Make sure it is running and unlocked, then
+                    reopen EchoLingo. Until then, keys set as environment variables before EchoLingo starts (each card names its variable)
+                    still work.
+                  </p>
+                </div>
+              )}
               <div className="provider-cards">
                 {catalog?.credential_groups.map((group) => (
                   <CredentialGroupCard
@@ -433,9 +450,12 @@ export function SettingsView() {
               <Control label={`Font size — ${caption.font_size_px} px`}>
                 <input type="range" min="18" max="72" step="1" value={caption.font_size_px} onChange={(event) => void updateCaption({ ...caption, font_size_px: Number(event.target.value) })} />
               </Control>
-              <Control label={`Opacity — ${Math.round(caption.opacity * 100)}%`}>
-                <input type="range" min="0.35" max="1" step="0.05" value={caption.opacity} onChange={(event) => void updateCaption({ ...caption, opacity: Number(event.target.value) })} />
-              </Control>
+              {/* The caption window is translucent only on macOS; elsewhere the slider would do nothing. */}
+              {platform() === "mac" && (
+                <Control label={`Opacity — ${Math.round(caption.opacity * 100)}%`}>
+                  <input type="range" min="0.35" max="1" step="0.05" value={caption.opacity} onChange={(event) => void updateCaption({ ...caption, opacity: Number(event.target.value) })} />
+                </Control>
+              )}
               <Control label="Recent segments">
                 <select value={caption.recent_segments} onChange={(event) => void updateCaption({ ...caption, recent_segments: Number(event.target.value) })}>
                   <option value="1">1 segment</option><option value="2">2 segments</option><option value="3">3 segments</option>
@@ -464,6 +484,27 @@ export function SettingsView() {
         )}
       </section>
     </div>
+  );
+}
+
+/** Settings → Models: the NVIDIA GPU acceleration pack, shown only where it
+ *  exists (Windows and Linux). */
+function GpuAccelerationSettings({ progress, sessionActive }: { progress?: ModelProgress; sessionActive: boolean }) {
+  const gpu = useGpuAcceleration(progress, sessionActive);
+  if (!gpu.status?.supported_platform) return null;
+  return (
+    <SettingsGroup title="GPU acceleration" description="Runs speech recognition and translation on an NVIDIA graphics card. The acceleration pack is a separate, verified download; if the GPU runtime fails, EchoLingo falls back to the CPU.">
+      <GpuAccelerationCard
+        status={gpu.status}
+        progress={progress}
+        pending={gpu.pending}
+        error={gpu.error}
+        sessionActive={sessionActive}
+        onInstall={() => void gpu.install()}
+        onRemove={() => void gpu.remove()}
+        onToggle={(enabled) => void gpu.setEnabled(enabled)}
+      />
+    </SettingsGroup>
   );
 }
 
@@ -633,7 +674,7 @@ function AssistantSettings({
           </div>
         )}
       </SettingsGroup>
-      <SettingsGroup title="Consent" description="Nothing is sent to the assistant until you allow it, here or the first time you use it. Audio never leaves this Mac for notes or titles.">
+      <SettingsGroup title="Consent" description="Nothing is sent to the assistant until you allow it, here or the first time you use it. Audio never leaves this computer for notes or titles.">
         <PrivacyToggle
           icon={<LockKey size={20} weight="regular" aria-hidden="true" />}
           title="Send transcripts and attached files to this model for notes and titles"
@@ -702,6 +743,9 @@ function CredentialGroupCard({
   const [probe, setProbe] = useState<CloudProbeResult | null>(null);
 
   const fieldStatus = (key: string) => status?.fields.find((field) => field.key === key);
+  // Without the secure store, typed keys cannot be saved; environment
+  // variables still supply them.
+  const storeAvailable = status?.store_available !== false;
   const available = (key: string) => fieldStatus(key)?.available ?? false;
   const configured = group.fields.filter((field) => field.required).every((field) => available(field.key));
   const anyAvailable = group.fields.some((field) => available(field.key));
@@ -723,7 +767,7 @@ function CredentialGroupCard({
   const typedCount = Object.keys(typed).length;
   const tooShort = group.fields.find((field) => typed[field.key] !== undefined && typed[field.key].length < field.min_len);
   const missingRequired = group.fields.find((field) => field.required && !available(field.key) && typed[field.key] === undefined);
-  const canSave = !pending && !tooShort && (typedCount > 0 ? !missingRequired : settingsChanged);
+  const canSave = !pending && !tooShort && (typedCount > 0 ? storeAvailable && !missingRequired : settingsChanged);
 
   const asrId = providers.asr?.id ?? null;
   const recipient = recipientName(group.vendor);
@@ -755,6 +799,7 @@ function CredentialGroupCard({
         const runtime = await api.updateProviderSettings(group.id, settings);
         onRuntime(runtime);
         next = {
+          ...next,
           group_id: group.id,
           fields: next?.fields ?? group.fields.map((field) => ({ key: field.key, available: false, source: "none" as const })),
           settings: { ...(next?.settings ?? {}), ...settings, ...(runtime.providers[group.id] ?? {}) },
@@ -851,7 +896,8 @@ function CredentialGroupCard({
               autoCapitalize="off"
               spellCheck={false}
               value={values[field.key] ?? ""}
-              placeholder={available(field.key) ? "Saved — enter to replace" : `Enter ${field.label}`}
+              disabled={!storeAvailable}
+              placeholder={!storeAvailable ? (available(field.key) ? `From ${field.env_var}` : `Set ${field.env_var} instead`) : available(field.key) ? "Saved — enter to replace" : `Enter ${field.label}`}
               onChange={(event) => setValues((current) => ({ ...current, [field.key]: event.target.value }))}
             />
           </Control>

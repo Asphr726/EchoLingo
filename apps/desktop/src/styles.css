@@ -1,7 +1,7 @@
 :root {
-  --body-font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Avenir Next", "PingFang SC", "Hiragino Sans GB", "Hiragino Kaku Gothic ProN", "Apple SD Gothic Neo", "Segoe UI", system-ui, sans-serif;
-  --display-font: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Avenir Next", "PingFang SC", "Hiragino Sans GB", "Apple SD Gothic Neo", system-ui, sans-serif;
-  --mono-font: "SF Mono", ui-monospace, Menlo, SFMono-Regular, monospace;
+  --body-font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Avenir Next", "PingFang SC", "Hiragino Sans GB", "Hiragino Kaku Gothic ProN", "Apple SD Gothic Neo", "Segoe UI", "Microsoft YaHei UI", "Yu Gothic UI", "Malgun Gothic", "Noto Sans", "Noto Sans CJK SC", system-ui, sans-serif;
+  --display-font: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Avenir Next", "PingFang SC", "Hiragino Sans GB", "Apple SD Gothic Neo", "Segoe UI", "Microsoft YaHei UI", "Yu Gothic UI", "Malgun Gothic", "Noto Sans", "Noto Sans CJK SC", system-ui, sans-serif;
+  --mono-font: "SF Mono", ui-monospace, Menlo, SFMono-Regular, "Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace;
   font-family: var(--body-font);
   color: #272925;
   background: #eeede7;
@@ -426,6 +426,9 @@ input::placeholder { color: #9a9c93; }
 .settings-inline { display: flex; }
 .settings-note { display: flex; max-width: 570px; gap: 11px; padding: 14px; border-left: 2px solid #9cb09f; background: #e8eee8; color: #596159; }
 .settings-note p { margin: 0; font-size: 10px; line-height: 1.55; }
+.settings-note--warning { border-left-color: #c9a45f; background: #f4efe3; color: #7a5f35; }
+.settings-note--warning svg { flex-shrink: 0; }
+.settings-note strong { font-weight: 660; }
 .segmented-control { display: inline-grid; max-width: 390px; grid-template-columns: repeat(3, 1fr); gap: 3px; padding: 3px; border: 1px solid #d1d1c8; border-radius: 10px; background: #e8e7e0; }
 .segmented-control button { min-height: 31px; padding: 0 18px; border: 0; border-radius: 7px; background: transparent; color: #74766e; font-size: 11px; font-weight: 620; }
 .segmented-control .segmented-control--active { background: var(--surface-raised); color: var(--accent-deep); box-shadow: 0 4px 10px rgba(57, 60, 54, .07); }
@@ -456,6 +459,8 @@ input::placeholder { color: #9a9c93; }
 .model-progress::before { content: ""; grid-area: 1 / 1; align-self: end; height: 3px; border-radius: 2px; background: #d8d9d1; }
 .model-progress > span { z-index: 1; grid-area: 1 / 1; align-self: end; height: 3px; border-radius: 2px; background: var(--accent); transition: width .2s var(--ease); }
 .model-progress small { color: var(--muted); font-size: 8px; text-align: right; text-transform: capitalize; }
+.gpu-row .model-row-copy small, .gpu-row .model-progress small { text-transform: none; }
+.gpu-row .model-progress { width: 176px; }
 .privacy-toggle { display: grid; max-width: 590px; grid-template-columns: 34px minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 15px 0; border-top: 1px solid var(--line); }
 .privacy-toggle:first-child { border-top: 0; }
 .privacy-toggle-icon { display: grid; width: 32px; height: 32px; place-items: center; border-radius: 9px; background: var(--accent-soft); color: var(--accent-deep); }

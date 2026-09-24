@@ -52,7 +52,7 @@ export function LectureContextPanel({ locked }: { locked: boolean }) {
     const gate = askLlm ? assistantConsentRequest(assistant, "import") : null;
     if (gate) {
       const answer = await askConsent(gate);
-      // "Extract on this Mac" imports without the assistant; Esc or Close
+      // "Extract on this computer" imports without the assistant; Esc or Close
       // cancels the import.
       if (answer === "cancelled") return;
       llm = answer === "granted";
@@ -121,8 +121,8 @@ export function LectureContextPanel({ locked }: { locked: boolean }) {
             {useLlm
               ? `Slide text is sent to ${assistant?.display_name || "the AI assistant"} to pick out terms and translations.`
               : askLlm
-                ? `Text is extracted on this Mac. ${assistant?.display_name || "The AI assistant"} can also pick out terms if you allow it.`
-                : "Text is extracted on this Mac."}
+                ? `Text is extracted on this computer. ${assistant?.display_name || "The AI assistant"} can also pick out terms if you allow it.`
+                : "Text is extracted on this computer."}
           </span>
           <span id={countId} className={value.length > SESSION_CONTEXT_LIMIT * 0.9 ? "char-count char-count--near" : "char-count"}>
             {value.length.toLocaleString("en-US")} / {SESSION_CONTEXT_LIMIT.toLocaleString("en-US")}

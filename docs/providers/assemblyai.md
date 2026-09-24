@@ -16,7 +16,8 @@
 1. Sign up at <https://www.assemblyai.com/dashboard> and copy the API key
    shown on the dashboard home page.
 2. In EchoLingo open **Settings → Cloud providers → AssemblyAI**, paste the
-   key and choose **Save** (it is stored in the macOS Keychain).
+   key and choose **Save**. It is stored in the system secure store (macOS
+   Keychain, Windows Credential Manager, or Secret Service on Linux).
 3. Choose **Test**.
 
 Free accounts include starter credit. Streaming is billed per session hour

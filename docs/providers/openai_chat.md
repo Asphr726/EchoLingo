@@ -146,7 +146,7 @@ and `finish_reason = "timeout"`.
 | Symptom | Code | Meaning |
 |---|---|---|
 | "Cloud translation requires explicit transcript upload consent" | `privacy_policy_denied` | Enable **Settings → Privacy → Transcript upload**. |
-| "<Provider> requires an API key." | `authentication_failed` | No key in the keychain or the provider's env var. |
+| "<Provider> requires an API key." | `authentication_failed` | No key in the secure store or the provider's env var. |
 | "Set the base URL for the custom endpoint" | configuration error | `custom_chat` selected with an empty base URL. |
 | "<Provider> rejected the API key (HTTP 401/403)" | `authentication_failed` | Key invalid, revoked, wrong project, or the model is not enabled for the key (Gemini also answers 403 from unsupported countries). |
 | "<Provider> rate limit exceeded (HTTP 429)" | `rate_limited` | Free-tier per-minute limit or an exhausted balance/quota (DeepSeek and SiliconFlow answer 429 when prepaid credit runs out). A committed span is retried once; a provisional span waits for the next revision. |

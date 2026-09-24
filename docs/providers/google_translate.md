@@ -16,7 +16,8 @@ Translation only; the model name reported in events is `nmt`.
    only; leave application restrictions unset (the sidecar has no HTTP
    referrer and no fixed IP). Keys look like `AIza…` (39 characters).
 3. In EchoLingo open **Settings → Cloud providers → Google Cloud Translation**, paste
-   the key and choose **Save**. The key is stored in the macOS Keychain and
+   the key and choose **Save**. The key is stored in the system secure store
+   (macOS Keychain, Windows Credential Manager, or Secret Service on Linux) and
    reaches the sidecar only as the `GOOGLE_TRANSLATE_API_KEY` environment
    variable for the lifetime of a session. On the command line
    `GOOGLE_TRANSLATE_API_KEY` is the development fallback.

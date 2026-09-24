@@ -215,7 +215,7 @@ function AssistantFlow({ request }: { request: AssistantConsentRequest }) {
       <div>
         <dt>
           <LockKey size={15} weight="regular" aria-hidden="true" />
-          Stays on this Mac
+          Stays on this computer
         </dt>
         <dd>
           <Microphone size={13} weight="regular" aria-hidden="true" />
@@ -248,8 +248,8 @@ export function consentCopy(request: ConsentRequest): ConsentCopy {
       return {
         title: "Allow cloud processing?",
         body: request.note
-          ? "Testing needs the same permission a cloud session uses. Nothing leaves this Mac until you allow it."
-          : "The providers chosen for this session run in the cloud. Nothing leaves this Mac until you allow it.",
+          ? "Testing needs the same permission a cloud session uses. Nothing leaves this computer until you allow it."
+          : "The providers chosen for this session run in the cloud. Nothing leaves this computer until you allow it.",
         primary: "Allow and continue",
         footnote: "Saved as your default. Turn it off anytime in Settings → Privacy.",
       };
@@ -265,15 +265,15 @@ function assistantCopy(request: AssistantConsentRequest): ConsentCopy {
   if (request.purpose === "import") {
     return {
       title: `Send slide text to ${target}?`,
-      body: `${request.vendor} reads the text extracted from the slides you pick and suggests terms and translations for the lecture context. Allowing this also lets it write notes and titles from your transcripts. Nothing else is sent, and audio never leaves this Mac.`,
+      body: `${request.vendor} reads the text extracted from the slides you pick and suggests terms and translations for the lecture context. Allowing this also lets it write notes and titles from your transcripts. Nothing else is sent, and audio never leaves this computer.`,
       primary: "Allow and import",
-      secondary: "Extract on this Mac",
-      footnote: "To import without sending anything, choose Extract on this Mac. You can turn this permission off anytime in Settings → AI assistant.",
+      secondary: "Extract on this computer",
+      footnote: "To import without sending anything, choose Extract on this computer. You can turn this permission off anytime in Settings → AI assistant.",
     };
   }
   return {
     title: `Send this session to ${target}?`,
-    body: `To write notes and titles, the transcript and the text of files you attach go to ${request.vendor}. Nothing else is sent, and audio never leaves this Mac.`,
+    body: `To write notes and titles, the transcript and the text of files you attach go to ${request.vendor}. Nothing else is sent, and audio never leaves this computer.`,
     primary: "Allow",
     footnote: "Applies to notes and titles from now on. Turn it off anytime in Settings → AI assistant.",
   };
