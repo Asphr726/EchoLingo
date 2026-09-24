@@ -62,6 +62,10 @@ class QwenForcedAlignmentService:
             if self._model is None:
                 loader = self._loader
                 if loader is None:
+                    from .runtime.ascii_paths import install_nagisa_ascii_paths
+
+                    # qwen_asr imports nagisa, which loads its model on import.
+                    install_nagisa_ascii_paths()
                     try:
                         from qwen_asr import Qwen3ForcedAligner
                     except ImportError as error:

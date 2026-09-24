@@ -103,6 +103,9 @@ def main() -> int:
 
     # After watch-process: the native child's environment stays untouched.
     _configure_certificate_bundle()
+    from echolingo.runtime.ascii_paths import install_nagisa_ascii_paths
+
+    install_nagisa_ascii_paths()
     from echolingo.service.parent_watchdog import start_parent_watchdog_from_environment
 
     start_parent_watchdog_from_environment()
