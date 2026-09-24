@@ -17,6 +17,7 @@ dist/
 target/
 apps/desktop/src-tauri/binaries/
 apps/desktop/src-tauri/runtimes/
+apps/desktop/src-tauri/sidecar/
 *.log
 apps/desktop/src-tauri/gen/
 apps/desktop/.vite/

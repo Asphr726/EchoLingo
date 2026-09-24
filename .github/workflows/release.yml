@@ -1,0 +1,338 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+    branches: ["release/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  PYTHONUTF8: "1"
+  PYTHON_VERSION: "3.12"
+  TORCH_VERSION: "2.13.0"
+  TORCHAUDIO_VERSION: "2.11.0"
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-14
+            sidecar_mode: onefile
+            sidecar: apps/desktop/src-tauri/binaries/echolingo-sidecar-aarch64-apple-darwin
+            bundles: dmg
+            artifacts: target/release/bundle/dmg/*.dmg
+          - name: windows-x64
+            os: windows-latest
+            sidecar_mode: onedir
+            sidecar: apps/desktop/src-tauri/sidecar/echolingo-sidecar.exe
+            bundles: nsis
+            torch_index: https://download.pytorch.org/whl/cpu
+            artifacts: target/release/bundle/nsis/*-setup.exe
+          - name: linux-x64
+            os: ubuntu-22.04
+            sidecar_mode: onedir
+            sidecar: apps/desktop/src-tauri/sidecar/echolingo-sidecar
+            bundles: deb,appimage
+            torch_index: https://download.pytorch.org/whl/cpu
+            artifacts: |
+              target/release/bundle/deb/*.deb
+              target/release/bundle/appimage/*.AppImage
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: actions/checkout@v7
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev libasound2-dev libxdo-dev libssl-dev libdbus-1-dev \
+            pkg-config patchelf file libfuse2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements/*.txt
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - name: Cache llama.cpp archives
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/llama-cache
+          key: llama-${{ matrix.name }}-${{ hashFiles('scripts/fetch_llama_runtime.py') }}
+      - run: npm ci
+      - name: CPU-only torch
+        if: matrix.torch_index != ''
+        run: >-
+          python -m pip install "torch==$TORCH_VERSION" "torchaudio==$TORCHAUDIO_VERSION"
+          --index-url "${{ matrix.torch_index }}"
+      - name: Python environment
+        run: |
+          echo "torch==$TORCH_VERSION" > "$RUNNER_TEMP/constraints.txt"
+          python -m pip install -e ".[audio,qwen,packaging]" -r requirements/qwen-runtime.txt \
+            -c "$RUNNER_TEMP/constraints.txt"
+          python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+      - name: llama.cpp runtime
+        run: python scripts/fetch_llama_runtime.py --cache "$RUNNER_TEMP/llama-cache"
+      - name: Sidecar
+        run: >-
+          python scripts/build_sidecar.py --clean --mode ${{ matrix.sidecar_mode }}
+          --work "$RUNNER_TEMP/pyinstaller"
+      - name: Smoke test the sidecar and llama.cpp
+        run: python scripts/smoke_packaged.py prebundle --sidecar "${{ matrix.sidecar }}"
+      - name: Rust supervises the packaged sidecar
+        env:
+          ECHOLINGO_SIDECAR_EXECUTABLE: ${{ github.workspace }}/${{ matrix.sidecar }}
+        run: cargo test -p inference-ipc --locked -- --ignored rust_supervises_python_sidecar_end_to_end
+      - name: Tauri bundle
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
+          # linuxdeploy's strip breaks the frozen sidecar's libraries.
+          NO_STRIP: "true"
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: npm run tauri --workspace @echolingo/desktop -- build --ci --bundles ${{ matrix.bundles }}
+      - name: Smoke test the bundles
+        if: runner.os != 'Windows'
+        run: python scripts/smoke_packaged.py bundle
+      - name: Smoke test the installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: python scripts/smoke_packaged.py bundle --install-dir "$env:RUNNER_TEMP\安装 测试\EchoLingo"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: echolingo-${{ matrix.name }}
+          path: ${{ matrix.artifacts }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  gpu-pack:
+    name: gpu-pack (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+          - name: linux-x64
+            os: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      PACK_DIR: ${{ github.workspace }}/../gpu-pack/echolingo-gpu-pack
+    steps:
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /usr/share/swift /usr/local/.ghcup
+          sudo docker image prune --all --force > /dev/null || true
+          df -h /
+      - uses: actions/checkout@v7
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: CUDA torch environment
+        # CUDA wheels are several GB: no pip cache.
+        run: |
+          python -m pip install --no-cache-dir "torch==$TORCH_VERSION+cu130" \
+            "torchaudio==$TORCHAUDIO_VERSION+cu130" --index-url https://download.pytorch.org/whl/cu130
+          echo "torch==$TORCH_VERSION" > "$RUNNER_TEMP/constraints.txt"
+          python -m pip install --no-cache-dir -e ".[audio,qwen,packaging]" \
+            -r requirements/qwen-runtime.txt zstandard -c "$RUNNER_TEMP/constraints.txt"
+          df -h .
+      - name: CUDA sidecar
+        run: |
+          python scripts/build_sidecar.py --clean --mode onedir --out "$PACK_DIR/sidecar" \
+            --work "$RUNNER_TEMP/pyinstaller"
+          rm -rf "$RUNNER_TEMP/pyinstaller"
+      - name: Vulkan llama.cpp runtime
+        run: >-
+          python scripts/fetch_llama_runtime.py --variant vulkan --dest "$PACK_DIR/llama.cpp"
+          --cache "$RUNNER_TEMP/llama-cache"
+      - name: GPU pack (self-test --cuda, tar.zst parts, manifest)
+        run: |
+          python scripts/build_gpu_pack.py --pack-dir "$PACK_DIR" --out dist/gpu-pack
+          rm -rf "$PACK_DIR"
+          df -h .
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gpu-pack
+      - name: Rust installs the GPU pack from its parts
+        env:
+          ECHOLINGO_GPU_PACK_TEST_DIR: ${{ github.workspace }}/dist/gpu-pack
+        run: cargo test -p runtime-manager --locked -- --ignored gpu_pack_installs_from_local_parts
+      - uses: actions/upload-artifact@v7
+        with:
+          name: echolingo-gpu-pack-${{ matrix.name }}
+          path: dist/gpu-pack/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  smoke-models:
+    name: smoke-models (${{ matrix.name }})
+    needs: [build, gpu-pack]
+    if: >-
+      !cancelled() && needs.build.result == 'success' &&
+      (startsWith(github.ref, 'refs/tags/') || startsWith(github.ref, 'refs/heads/release/'))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+          - name: linux-x64
+            os: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+    steps:
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Smoke client
+        run: python -m pip install -e . "huggingface_hub==0.36.2" zstandard
+      - uses: actions/download-artifact@v8
+        with:
+          name: echolingo-${{ matrix.name }}
+          path: ${{ runner.temp }}/installer
+      - name: Install the NSIS setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem "$env:RUNNER_TEMP\installer\*-setup.exe" | Select-Object -First 1
+          python scripts/smoke_packaged.py install-nsis --installer $setup.FullName `
+            --install-dir "$env:RUNNER_TEMP\Echo 应用\EchoLingo"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "INSTALL_ROOT=$env:RUNNER_TEMP\Echo 应用\EchoLingo" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Install the .deb
+        if: runner.os == 'Linux'
+        run: |
+          debs=("$RUNNER_TEMP"/installer/*.deb)
+          deb=${debs[0]}
+          sudo apt-get update
+          sudo apt-get install -y "$deb"
+          package=$(dpkg-deb -f "$deb" Package)
+          sidecar=$(dpkg -L "$package" | grep '/sidecar/echolingo-sidecar$')
+          echo "INSTALL_ROOT=$(dirname "$(dirname "$sidecar")")" >> "$GITHUB_ENV"
+      - name: Models on the installed CPU runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          python scripts/smoke_models.py --install-root "$env:INSTALL_ROOT"
+          --models-dir "$env:RUNNER_TEMP\模型 目录"
+          --log-dir "$env:RUNNER_TEMP\smoke-logs\cpu" --label "${{ matrix.name }} installed CPU runtime"
+      - name: Models on the installed CPU runtime (Linux)
+        if: runner.os == 'Linux'
+        run: >-
+          python scripts/smoke_models.py --install-root "$INSTALL_ROOT"
+          --models-dir "$RUNNER_TEMP/模型 目录"
+          --log-dir "$RUNNER_TEMP/smoke-logs/cpu" --label "${{ matrix.name }} installed CPU runtime"
+      - uses: actions/download-artifact@v8
+        if: needs.gpu-pack.result == 'success'
+        with:
+          name: echolingo-gpu-pack-${{ matrix.name }}
+          path: ${{ runner.temp }}/gpu-pack
+      - name: Models on the GPU pack sidecar without a GPU (Windows)
+        if: runner.os == 'Windows' && needs.gpu-pack.result == 'success'
+        shell: pwsh
+        run: |
+          $manifest = Get-ChildItem "$env:RUNNER_TEMP\gpu-pack\echolingo-gpu-pack-*.json" | Select-Object -First 1
+          python scripts/smoke_models.py --gpu-pack-manifest $manifest.FullName `
+            --gpu-pack-dest "$env:RUNNER_TEMP\GPU 加速包" --install-root "$env:INSTALL_ROOT" `
+            --models-dir "$env:RUNNER_TEMP\模型 目录" --device cpu `
+            --log-dir "$env:RUNNER_TEMP\smoke-logs\gpu-pack" --label "${{ matrix.name }} GPU pack sidecar on CPU"
+      - name: Models on the GPU pack sidecar without a GPU (Linux)
+        if: runner.os == 'Linux' && needs.gpu-pack.result == 'success'
+        run: |
+          manifests=("$RUNNER_TEMP"/gpu-pack/echolingo-gpu-pack-*.json)
+          python scripts/smoke_models.py --gpu-pack-manifest "${manifests[0]}" \
+            --gpu-pack-dest "$RUNNER_TEMP/GPU 加速包" --install-root "$INSTALL_ROOT" \
+            --models-dir "$RUNNER_TEMP/模型 目录" --device cpu \
+            --log-dir "$RUNNER_TEMP/smoke-logs/gpu-pack" --label "${{ matrix.name }} GPU pack sidecar on CPU"
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: smoke-logs-${{ matrix.name }}
+          path: ${{ runner.temp }}/smoke-logs
+          retention-days: 7
+
+  release:
+    name: draft release
+    needs: [build, gpu-pack, smoke-models]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: echolingo-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Draft pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: >-
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --prerelease
+          --title "EchoLingo ${TAG#v} Beta" --notes-file ".github/release-notes/$TAG.md" dist/*
