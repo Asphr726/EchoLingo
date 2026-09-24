@@ -194,17 +194,37 @@ def prebundle(args: argparse.Namespace, version: str, results: Results) -> None:
 
 def bundle_macos(bundle_dir: Path, version: str, results: Results) -> None:
     dmg = find_one(bundle_dir, "*.dmg")
-    app = find_one(bundle_dir, "*.app")
-    if dmg is None or app is None:
-        results.fail(f"no .dmg/.app under {bundle_dir}")
+    if dmg is None:
+        results.fail(f"no .dmg under {bundle_dir}")
         return
     check_size(dmg, results)
-    run_self_test(app / "Contents/MacOS/echolingo-sidecar", version, results, app.name)
-    run_llama_version(app / "Contents/Resources/runtimes/llama.cpp/llama-server", results, app.name)
-    verify = subprocess.run(
-        ["codesign", "--verify", "--deep", "--strict", str(app)], capture_output=True, text=True
-    )
-    results.note(f"codesign --verify --deep --strict: exit {verify.returncode} {verify.stderr.strip()[:300]}")
+    # `--bundles dmg` removes the intermediate .app, and the image is what
+    # users get anyway: test the app inside it.
+    with tempfile.TemporaryDirectory() as mount:
+        attach = subprocess.run(
+            ["hdiutil", "attach", "-nobrowse", "-readonly", "-noautoopen", "-mountpoint", mount, str(dmg)],
+            capture_output=True,
+            text=True,
+        )
+        if attach.returncode != 0:
+            results.fail(f"hdiutil attach {dmg.name}: {attach.stderr.strip()[:300]}")
+            return
+        try:
+            # Top level only: the image also holds a symlink to /Applications.
+            app = next(iter(sorted(Path(mount).glob("*.app"))), None)
+            if app is None:
+                results.fail(f"no .app inside {dmg.name}")
+                return
+            run_self_test(app / "Contents/MacOS/echolingo-sidecar", version, results, app.name)
+            run_llama_version(app / "Contents/Resources/runtimes/llama.cpp/llama-server", results, app.name)
+            verify = subprocess.run(
+                ["codesign", "--verify", "--deep", "--strict", str(app)], capture_output=True, text=True
+            )
+            results.note(
+                f"codesign --verify --deep --strict: exit {verify.returncode} {verify.stderr.strip()[:300]}"
+            )
+        finally:
+            subprocess.run(["hdiutil", "detach", mount, "-force"], capture_output=True, text=True)
 
 
 def install_nsis(installer: Path, target: Path) -> subprocess.CompletedProcess[str]:
