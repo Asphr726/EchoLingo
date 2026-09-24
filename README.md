@@ -84,7 +84,7 @@ EchoLingo 是一款面向课堂的实时同声字幕工具：把老师的讲课�
 **Linux（Ubuntu 22.04+ / Debian 12+，x64）**
 
 1. 在下载目录里运行 `sudo apt install ./EchoLingo_0.2.0_amd64.deb` 安装。
-2. 如果提供的是 AppImage，先运行 `chmod +x EchoLingo_0.2.0_amd64.AppImage` 加上可执行权限，再直接打开。Ubuntu 22.04 及以上运行 AppImage 需要 libfuse2：`sudo apt install libfuse2`（Ubuntu 24.04 上的包名是 `libfuse2t64`）。
+2. 从应用菜单打开 EchoLingo，或在终端运行 `echolingo-desktop`。目前只提供 .deb 包，AppImage 在路线图中。
 3. 从应用菜单打开 EchoLingo，同样在 **Settings → Models** 下载本地模型。
 
 **NVIDIA GPU 加速包（可选）**。不安装时，识别和翻译都在 CPU 上运行。如果电脑有 NVIDIA GeForce RTX 20 系列、GTX 16 系列或更新的显卡，并且装了较新的驱动，可以打开 **Settings → Models → GPU acceleration**，点 **Download** 下载 GPU 加速包（约 2–3 GB）。加速包分段下载，每一段都会校验，安装后先做一次自检再启用；之后可以随时用 **Use GPU acceleration** 开关关闭。如果 GPU 运行时启动失败，EchoLingo 会自动退回 CPU，并在这张卡片上说明原因。AMD 和 Intel 显卡暂不支持。Linux 上用显卡翻译还需要 Vulkan 运行库（`sudo apt install libvulkan1`），没有它时翻译仍在 CPU 上运行。
@@ -255,7 +255,7 @@ AI 笔记和标题永远不会发送音频。
 
 ### 悬浮字幕窗没有保持在最上层（Linux）
 
-在 Wayland 桌面上，应用不一定能让自己的窗口始终置顶。可以用 X11 后端启动 EchoLingo，例如 `GDK_BACKEND=x11 echolingo-desktop`（AppImage 用 `GDK_BACKEND=x11 ./EchoLingo_0.2.0_amd64.AppImage`），或者登录时选择 X11 会话。
+在 Wayland 桌面上，应用不一定能让自己的窗口始终置顶。可以用 X11 后端启动 EchoLingo，例如 `GDK_BACKEND=x11 echolingo-desktop`，或者登录时选择 X11 会话。
 
 ### 无法保存密钥（Linux）
 
@@ -296,7 +296,7 @@ EchoLingo 通过 Secret Service 保存密钥。请安装或解锁 GNOME 钥匙�
 
 - **Windows 和 Linux 版**：在真实电脑上测试通过后公开发布。
 - 支持 AMD 和 Intel 显卡的 GPU 加速。
-- Linux 上的系统声音采集。
+- Linux 上的系统声音采集，以及适用于更多发行版的 AppImage 包。
 - Windows 代码签名和 Apple 公证，免去首次打开时的手动步骤。
 - Windows 和 Linux 的 ARM64 版本。
 - 支持更多语言。
@@ -330,7 +330,7 @@ npm run desktop:build                            # Windows 和 Linux：生成安
 APPLE_SIGNING_IDENTITY=- npm run desktop:build   # macOS：本机自签名构建
 ```
 
-构建产物位于 `target/release/bundle/`：macOS 是 `dmg/EchoLingo_0.2.0_aarch64.dmg`，Windows 是 `nsis/EchoLingo_0.2.0_x64-setup.exe`，Linux 是 `deb/EchoLingo_0.2.0_amd64.deb`（以及 `appimage/`）。`APPLE_SIGNING_IDENTITY=-` 生成的是只适合自己使用的临时签名；公开分发需要 Developer ID 证书和 Apple 公证。
+构建产物位于 `target/release/bundle/`：macOS 是 `dmg/EchoLingo_0.2.0_aarch64.dmg`，Windows 是 `nsis/EchoLingo_0.2.0_x64-setup.exe`，Linux 是 `deb/EchoLingo_0.2.0_amd64.deb`。`APPLE_SIGNING_IDENTITY=-` 生成的是只适合自己使用的临时签名；公开分发需要 Developer ID 证书和 Apple 公证。
 
 运行测试：
 

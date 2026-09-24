@@ -84,7 +84,7 @@ The steps below are for macOS. For Windows and Linux, see [Windows / Linux](#win
 **Linux (Ubuntu 22.04+ / Debian 12+, x64)**
 
 1. In the folder you downloaded it to, install the package with `sudo apt install ./EchoLingo_0.2.0_amd64.deb`.
-2. If an AppImage is provided instead, make it executable with `chmod +x EchoLingo_0.2.0_amd64.AppImage` and run it. On Ubuntu 22.04 and later, AppImages need libfuse2: `sudo apt install libfuse2` (the package is `libfuse2t64` on Ubuntu 24.04).
+2. Open EchoLingo from the application menu, or run `echolingo-desktop` in a terminal. Only a .deb package is available for now; an AppImage is on the roadmap.
 3. Open EchoLingo from the applications menu and download the local models in **Settings → Models**.
 
 **NVIDIA GPU acceleration pack (optional).** Without it, recognition and translation run on the CPU. If the computer has an NVIDIA GeForce RTX 20-series or GTX 16-series card or newer with a recent driver, open **Settings → Models → GPU acceleration** and click **Download**. The pack (about 2–3 GB) is downloaded in parts, every part is checked, and a self-test runs before the pack is switched on; **Use GPU acceleration** turns it off again at any time. If the GPU runtime fails to start, EchoLingo falls back to the CPU and the card says why. AMD and Intel graphics cards are not supported yet. On Linux, GPU translation also needs the Vulkan loader (`sudo apt install libvulkan1`); without it translation stays on the CPU.
@@ -255,7 +255,7 @@ Without the GPU acceleration pack, recognition runs on the CPU, and slower proce
 
 ### The floating caption does not stay on top (Linux)
 
-On Wayland desktops, an app cannot always keep its own window above the others. Start EchoLingo with the X11 backend, for example `GDK_BACKEND=x11 echolingo-desktop` (or `GDK_BACKEND=x11 ./EchoLingo_0.2.0_amd64.AppImage`), or log in to an X11 session.
+On Wayland desktops, an app cannot always keep its own window above the others. Start EchoLingo with the X11 backend, for example `GDK_BACKEND=x11 echolingo-desktop`, or log in to an X11 session.
 
 ### Keys cannot be saved (Linux)
 
@@ -296,7 +296,7 @@ Yes. Once the models are downloaded, local recognition and translation need no n
 
 - **Windows and Linux**: published once they have been tested on real computers.
 - GPU acceleration on AMD and Intel graphics cards.
-- System audio capture on Linux.
+- System audio capture on Linux, and an AppImage package for more distributions.
 - Code signing on Windows and Apple notarization, so the first launch needs no manual steps.
 - ARM64 builds for Windows and Linux.
 - More languages.
@@ -330,7 +330,7 @@ npm run desktop:build                            # Windows and Linux: installer 
 APPLE_SIGNING_IDENTITY=- npm run desktop:build   # macOS: local ad-hoc signed build
 ```
 
-The build ends up in `target/release/bundle/`: `dmg/EchoLingo_0.2.0_aarch64.dmg` on macOS, `nsis/EchoLingo_0.2.0_x64-setup.exe` on Windows, and `deb/EchoLingo_0.2.0_amd64.deb` (plus `appimage/`) on Linux. `APPLE_SIGNING_IDENTITY=-` produces an ad-hoc signature that is only suitable for your own Mac; public distribution needs a Developer ID certificate and Apple notarization.
+The build ends up in `target/release/bundle/`: `dmg/EchoLingo_0.2.0_aarch64.dmg` on macOS, `nsis/EchoLingo_0.2.0_x64-setup.exe` on Windows, and `deb/EchoLingo_0.2.0_amd64.deb` on Linux. `APPLE_SIGNING_IDENTITY=-` produces an ad-hoc signature that is only suitable for your own Mac; public distribution needs a Developer ID certificate and Apple notarization.
 
 Run the tests:
 

@@ -341,7 +341,7 @@ def test_windows_and_linux_bundle_the_onedir_sidecar_as_a_resource() -> None:
     assert windows["targets"] == ["nsis"]
     assert windows["windows"]["nsis"]["installMode"] == "currentUser"
     assert windows["windows"]["webviewInstallMode"]["type"] == "embedBootstrapper"
-    assert linux["targets"] == ["deb", "appimage"]
+    assert linux["targets"] == ["deb"]
     assert linux["linux"]["deb"]["depends"] == ["libasound2t64 | libasound2"]
 
 

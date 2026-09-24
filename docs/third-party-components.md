@@ -74,7 +74,7 @@ build of llama.cpp listed above.
 | hf-hub 1.0 | pinned, verified model downloads | Apache-2.0 |
 | SQLx (SQLite) | session history | MIT OR Apache-2.0 |
 | Microsoft Edge WebView2 Runtime (Windows) | renders the interface; the installer installs it when it is missing | Microsoft Software License Terms |
-| WebKitGTK (Linux) | renders the interface; a system package for the `.deb`, bundled inside the AppImage | LGPL-2.1-or-later |
+| WebKitGTK (Linux) | renders the interface; a system package the `.deb` depends on | LGPL-2.1-or-later |
 
 ## Cloud services
 

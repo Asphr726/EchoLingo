@@ -44,11 +44,10 @@ jobs:
             os: ubuntu-22.04
             sidecar_mode: onedir
             sidecar: apps/desktop/src-tauri/sidecar/echolingo-sidecar
-            bundles: deb,appimage
+            # linuxdeploy fails on the one-folder sidecar; AppImage is on the roadmap.
+            bundles: deb
             torch_index: https://download.pytorch.org/whl/cpu
-            artifacts: |
-              target/release/bundle/deb/*.deb
-              target/release/bundle/appimage/*.AppImage
+            artifacts: target/release/bundle/deb/*.deb
     runs-on: ${{ matrix.os }}
     timeout-minutes: 150
     defaults:
