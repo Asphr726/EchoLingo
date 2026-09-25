@@ -312,6 +312,19 @@ def test_publish_creates_the_manifest_release_once_and_replaces_latest_json(tmp_
     assert ("release", "upload") in gh.commands()
 
 
+def test_publish_refuses_a_manifest_release_that_is_not_a_prerelease(tmp_path, capsys) -> None:
+    for state, message in (
+        ({"isDraft": True, "isPrerelease": True}, "is a draft"),
+        ({"isDraft": False, "isPrerelease": False}, "is not a pre-release"),
+    ):
+        gh = gh_for(MACOS, f"{MACOS}.sig")
+        gh.releases["updater"] = state
+        assert run(tmp_path / message.replace(" ", "-"), gh, "--publish") == 1
+        assert message in capsys.readouterr().err
+        assert ("release", "upload") not in gh.commands()
+        assert ("release", "create") not in gh.commands()
+
+
 def test_publish_stops_when_a_download_is_not_public(tmp_path, capsys) -> None:
     gh = gh_for(MACOS, f"{MACOS}.sig")
     assert run(tmp_path, gh, "--publish", opener=FakeOpener(gh, missing=(MACOS,))) == 1

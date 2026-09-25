@@ -370,6 +370,12 @@ def publish_manifest(manifest: dict[str, Any], repo: str, runner: Runner, direct
         print(f"created the {MANIFEST_TAG} pre-release on {branch}")
     elif existing.get("isDraft"):
         raise ManifestError(f"the {MANIFEST_TAG} release is a draft; publish it as a pre-release first")
+    elif not existing.get("isPrerelease"):
+        # A full release could become the repository's "Latest" release.
+        raise ManifestError(
+            f"the {MANIFEST_TAG} release is not a pre-release; mark it as one first "
+            f"(gh release edit {MANIFEST_TAG} --prerelease --latest=false)"
+        )
     runner(["release", "upload", MANIFEST_TAG, str(path), "--repo", repo, "--clobber"])
 
 
