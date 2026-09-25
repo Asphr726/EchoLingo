@@ -205,11 +205,12 @@
       ]
     },
     {
-      "default_model": "deepseek-chat",
+      "default_model": "deepseek-flash",
       "display_name": "DeepSeek",
       "group_id": "deepseek",
       "models": [
-        "deepseek-chat"
+        "deepseek-flash",
+        "deepseek-v4-pro"
       ]
     },
     {
@@ -424,13 +425,13 @@
       "id": "deepseek",
       "settings": [
         {
-          "default": "deepseek-chat",
+          "default": "deepseek-flash",
           "env_var": "ECHOLINGO_DEEPSEEK_CHAT_MODEL",
           "key": "chat_model",
           "kind": "text",
           "label": "Chat translation model",
           "options": [],
-          "placeholder": "deepseek-chat"
+          "placeholder": "deepseek-flash"
         }
       ],
       "vendor": "DeepSeek"

@@ -28,7 +28,7 @@ class FakeClient:
         self,
         *,
         streams: list[list[str]] | None = None,
-        completions: list[str] | None = None,
+        completions: list[str | ChatResult] | None = None,
         error: Exception | None = None,
         block: asyncio.Event | None = None,
     ) -> None:
@@ -63,8 +63,11 @@ class FakeClient:
         self.calls.append(("complete", messages, kwargs))
         if self.error is not None:
             raise self.error
+        answer = self.completions.pop(0)
+        if isinstance(answer, ChatResult):
+            return answer
         return ChatResult(
-            text=self.completions.pop(0),
+            text=answer,
             finish_reason="stop",
             usage={"prompt_tokens": 50, "completion_tokens": 10},
         )
@@ -485,7 +488,46 @@ async def test_empty_title_is_an_error() -> None:
     client = FakeClient(completions=['""'])
     assistant, _seen = make_service(client)
     result = result_of(await run_task(assistant, "title", notes_payload(units(5))))
+    assert result["result"] == {
+        "code": "empty_response",
+        "message": "Qwen (Alibaba Model Studio) returned no title.",
+    }
+    # A complete but empty answer is not retried.
+    assert len(client.calls) == 1
+
+
+def reasoning_only(finish: str = "length") -> ChatResult:
+    return ChatResult(text="", finish_reason=finish, usage={"prompt_tokens": 50, "completion_tokens": 200})
+
+
+async def test_title_retries_once_when_reasoning_used_the_budget() -> None:
+    client = FakeClient(completions=[reasoning_only(), "Texture Perception"])
+    assistant, _seen = make_service(client)
+    result = result_of(await run_task(assistant, "title", notes_payload(units(5), output_language="en")))
+    assert result["ok"] is True, result
+    assert result["result"]["title"] == "Texture Perception"
+    (_, first_messages, first), (_, second_messages, second) = client.calls
+    assert first["max_tokens"] == service.TITLE_MAX_TOKENS
+    assert second["max_tokens"] == service.TITLE_RETRY_MAX_TOKENS == 4096
+    assert second_messages == first_messages
+
+
+async def test_title_still_empty_after_the_retry_blames_reasoning() -> None:
+    client = FakeClient(completions=[reasoning_only(), reasoning_only()])
+    assistant, _seen = make_service(client)
+    result = result_of(await run_task(assistant, "title", notes_payload(units(5))))
+    assert result["ok"] is False
     assert result["result"]["code"] == "empty_response"
+    message = result["result"]["message"]
+    assert message.startswith("Qwen (Alibaba Model Studio) spent its reply budget on reasoning")
+    assert "model without reasoning" in message and "Try again" in message
+    assert len(client.calls) == 2
+
+    # The retry finished but wrote nothing: a plain empty answer.
+    client = FakeClient(completions=[reasoning_only(), reasoning_only("stop")])
+    assistant, _seen = make_service(client)
+    result = result_of(await run_task(assistant, "title", notes_payload(units(5))))
+    assert result["result"]["message"] == "Qwen (Alibaba Model Studio) returned no title."
 
 
 @pytest.mark.parametrize(
@@ -611,6 +653,8 @@ async def test_context_import_with_llm_merges_term_pairs(tmp_path) -> None:
     assert "Béla Julesz" not in terms_line
     system = client.calls[0][1][0]["content"]
     assert "Simplified Chinese" in system
+    # A short list: the model's reasoning phase is turned off where possible.
+    assert client.calls[0][2]["disable_thinking"] is True
     assert seen == [LLM]
 
 
@@ -890,4 +934,67 @@ async def test_logs_carry_no_transcript_model_text_or_key(caplog) -> None:
     logged = "\n".join(record.getMessage() for record in caplog.records if record.levelno >= logging.INFO)
     assert "assistant notes" in logged and "continuing" in logged
     for forbidden in (secret, "zygomorphic", "flurbination", written, "texture perception"):
+        assert forbidden not in logged
+
+
+async def test_deepseek_title_after_reasoning_hit_the_limit(caplog) -> None:
+    """Over a mock HTTP transport: thinking is turned off in the request, an
+    answer that is all reasoning and no content is retried once with a larger
+    budget, and neither the reasoning nor the title reaches the logs."""
+    import json as json_module
+    import logging
+
+    import httpx
+
+    from echolingo.assistant.llm import ChatClient, resolve_endpoint
+
+    secret = "sk-deepseek-log-check-0123456789"
+    spoken = "zygomorphic flurbination"
+    reasoning = "pondering the quixotic-marmalade lecture"
+    title = "Quixotic Marmalade Perception"
+    empty = {
+        "choices": [
+            {"message": {"content": "", "reasoning_content": reasoning}, "finish_reason": "length"}
+        ],
+        "usage": {"prompt_tokens": 900, "completion_tokens": 200},
+    }
+    answered = {"choices": [{"message": {"content": title}, "finish_reason": "stop"}]}
+
+    def run_with(answers: list[dict]):
+        requests: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(json_module.loads(request.content))
+            return httpx.Response(200, json=answers[len(requests) - 1])
+
+        transport = httpx.MockTransport(handler)
+
+        def factory(llm_field, env):
+            return ChatClient(
+                resolve_endpoint(llm_field, env), client=httpx.AsyncClient(transport=transport)
+            )
+
+        assistant = AssistantService(environ={"DEEPSEEK_API_KEY": secret}, client_factory=factory)
+        payload = notes_payload(units(6, words=spoken), llm={"group": "deepseek", "model": ""})
+        return assistant, payload, requests
+
+    caplog.set_level(logging.INFO)
+    assistant, payload, requests = run_with([empty, answered])
+    result = result_of(await run_task(assistant, "title", payload))
+    assert result["ok"] is True, result
+    assert result["result"] == {"title": title, "provider": "deepseek", "model": "deepseek-flash"}
+    assert [request["max_tokens"] for request in requests] == [200, 4096]
+    assert all(request["thinking"] == {"type": "disabled"} for request in requests)
+    assert all(request["stream"] is False for request in requests)
+
+    assistant, payload, requests = run_with([empty, empty])
+    failed = result_of(await run_task(assistant, "title", payload))
+    assert failed["result"]["code"] == "empty_response"
+    assert "DeepSeek spent its reply budget on reasoning" in failed["result"]["message"]
+    assert reasoning not in json_module.dumps(failed)
+    assert len(requests) == 2
+
+    logged = "\n".join(record.getMessage() for record in caplog.records if record.levelno >= logging.INFO)
+    assert "retrying once" in logged
+    for forbidden in (secret, "zygomorphic", "flurbination", "quixotic", "Quixotic", "pondering"):
         assert forbidden not in logged

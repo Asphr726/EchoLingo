@@ -11,7 +11,7 @@ translator is a supported Hybrid combination.
 | Preset id | Service | Default model | Key env (dev fallback) | Base URL |
 |---|---|---|---|---|
 | `openai_chat` | OpenAI | `gpt-4o-mini` | `OPENAI_API_KEY` | `https://api.openai.com/v1` |
-| `deepseek_chat` | DeepSeek | `deepseek-chat` | `DEEPSEEK_API_KEY` | `https://api.deepseek.com/v1` |
+| `deepseek_chat` | DeepSeek | `deepseek-flash` | `DEEPSEEK_API_KEY` | `https://api.deepseek.com/v1` |
 | `gemini_chat` | Google Gemini (AI Studio) | `gemini-2.0-flash` | `GEMINI_API_KEY` | `https://generativelanguage.googleapis.com/v1beta/openai` |
 | `groq_chat` | Groq | `llama-3.3-70b-versatile` | `GROQ_API_KEY` | `https://api.groq.com/openai/v1` |
 | `openrouter_chat` | OpenRouter | `openai/gpt-4o-mini` | `OPENROUTER_API_KEY` | `https://openrouter.ai/api/v1` |
@@ -133,7 +133,10 @@ block (`source => target`) and an `Earlier context (do not translate):` block
 follow when they exist, and provisional (uncommitted) spans add "The text may
 be an unfinished sentence; translate what is present without completing it."
 The user message is the source text alone. `max_tokens` is
-`min(max_output_tokens, max(24, 3 × source length + 16))`.
+`min(max_output_tokens, max(24, 3 × source length + 16))`. DeepSeek requests
+also carry `"thinking": {"type": "disabled"}`: its current models
+(`deepseek-flash`, `deepseek-v4-pro`) reason before answering by default,
+which would spend that budget before any translation is written.
 
 Answers are cleaned of a leading "Translation:" / "译文：" label, "Here is the
 translation:" preambles and wrapping quotes. A stream that repeats the same

@@ -28,7 +28,7 @@ from typing import Any
 from ..errors import BackendError
 from . import prompts, terms as terms_module
 from .attachments import ExtractedAttachment, extract_attachments, parse_attachment_items
-from .llm import AssistantError, ChatClient, add_usage, build_client
+from .llm import AssistantError, ChatClient, add_usage, build_client, strip_reasoning
 from .output import (
     PreambleGate,
     clean_markdown,
@@ -65,6 +65,8 @@ PREAMBLE_LIMIT_SECTION = 1500
 # title
 TITLE_SAMPLE_CHARS = 6000
 TITLE_MAX_TOKENS = 200
+# One retry when a reasoning model used the whole budget before the title.
+TITLE_RETRY_MAX_TOKENS = 4096
 # context
 CONTEXT_MATERIALS_BUDGET = 30_000
 CONTEXT_MAX_TOKENS = 2048
@@ -431,21 +433,34 @@ class AssistantService:
         if not lines:
             raise AssistantError("empty_transcript", "The session has no transcript yet.")
         excerpts = sample_excerpts(lines, TITLE_SAMPLE_CHARS)
+        messages = _messages(
+            prompts.title_system_prompt(language),
+            prompts.title_user_message(excerpts, session.context, session.glossary),
+        )
         async with self._client(payload) as client:
             events.progress("writing")
             answer = await client.complete(
-                _messages(
-                    prompts.title_system_prompt(language),
-                    prompts.title_user_message(excerpts, session.context, session.glossary),
-                ),
-                max_tokens=TITLE_MAX_TOKENS,
-                temperature=0.3,
+                messages, max_tokens=TITLE_MAX_TOKENS, temperature=0.3
             )
             title = sanitize_title(answer.text)
-            if not title:
-                raise AssistantError(
-                    "empty_response", f"{_display_name(client)} returned no title."
+            if not title and answer.finish_reason == "length":
+                # A reasoning model can stop at the output limit before it
+                # writes anything.
+                logger.info("assistant title: no text before the output limit; retrying once")
+                answer = await client.complete(
+                    messages, max_tokens=TITLE_RETRY_MAX_TOKENS, temperature=0.3
                 )
+                title = sanitize_title(answer.text)
+            if not title:
+                display = _display_name(client)
+                if answer.finish_reason == "length":
+                    raise AssistantError(
+                        "empty_response",
+                        f"{display} spent its reply budget on reasoning and returned no "
+                        "title. Try again, or choose a model without reasoning in "
+                        "Settings → AI assistant.",
+                    )
+                raise AssistantError("empty_response", f"{display} returned no title.")
             return {"title": title, "provider": client.provider, "model": client.model}
 
     # ------------------------------------------------------------------ notes
@@ -706,6 +721,7 @@ class AssistantService:
             [_copy_for_prompt(item) for item in extracted], CONTEXT_MATERIALS_BUDGET
         )
         async with self._client(payload) as client:
+            # A short list: reasoning would only spend the budget.
             answer = await client.complete_streamed(
                 _messages(
                     prompts.terms_system_prompt(target_language),
@@ -714,8 +730,9 @@ class AssistantService:
                 max_tokens=CONTEXT_MAX_TOKENS,
                 temperature=0.2,
                 max_continuations=0,
+                disable_thinking=True,
             )
-        return terms_module.parse_term_lines(answer.text)
+        return terms_module.parse_term_lines(strip_reasoning(answer.text))
 
 
 def _separator(written: str) -> str:

@@ -188,7 +188,7 @@ _group(
     )
 )
 for _preset, _display, _vendor, _docs, _note, _model in (
-    ("deepseek", "DeepSeek", "DeepSeek", "https://platform.deepseek.com/", "Pay as you go; very low token prices.", "deepseek-chat"),
+    ("deepseek", "DeepSeek", "DeepSeek", "https://platform.deepseek.com/", "Pay as you go; very low token prices.", "deepseek-flash"),
     ("gemini", "Google Gemini", "Google", "https://aistudio.google.com/apikey", "AI Studio keys include a free tier with rate limits.", "gemini-2.0-flash"),
     ("groq", "Groq", "Groq", "https://console.groq.com/keys", "Free tier with per-minute rate limits.", "llama-3.3-70b-versatile"),
     ("openrouter", "OpenRouter", "OpenRouter", "https://openrouter.ai/keys", "Some models are free; others are billed per token.", "openai/gpt-4o-mini"),
@@ -619,7 +619,7 @@ def _mt_hymt_local(config, env):
 CHAT_PRESETS: dict[str, tuple[str, str, str, str]] = {
     # provider id -> (credential group, base_url, default model, api key env)
     "openai_chat": ("openai", "https://api.openai.com/v1", "gpt-4o-mini", "OPENAI_API_KEY"),
-    "deepseek_chat": ("deepseek", "https://api.deepseek.com/v1", "deepseek-chat", "DEEPSEEK_API_KEY"),
+    "deepseek_chat": ("deepseek", "https://api.deepseek.com/v1", "deepseek-flash", "DEEPSEEK_API_KEY"),
     "gemini_chat": ("gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "gemini-2.0-flash", "GEMINI_API_KEY"),
     "groq_chat": ("groq", "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile", "GROQ_API_KEY"),
     "openrouter_chat": ("openrouter", "https://openrouter.ai/api/v1", "openai/gpt-4o-mini", "OPENROUTER_API_KEY"),
@@ -705,7 +705,7 @@ _assistant(
     display_name="Qwen (Alibaba Model Studio)",
 )
 _assistant("openai", "gpt-4o-mini", ("gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"))
-_assistant("deepseek", "deepseek-chat", ("deepseek-chat",))
+_assistant("deepseek", "deepseek-flash", ("deepseek-flash", "deepseek-v4-pro"))
 _assistant("gemini", "gemini-2.0-flash", ("gemini-2.0-flash", "gemini-2.5-flash"), stream_usage=False)
 _assistant("groq", "llama-3.3-70b-versatile", ("llama-3.3-70b-versatile",))
 _assistant("openrouter", "openai/gpt-4o-mini", ("openai/gpt-4o-mini",))

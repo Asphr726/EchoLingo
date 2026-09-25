@@ -90,7 +90,10 @@ each session automatically.
 2. In **Settings → AI assistant** choose that provider and, optionally, a
    model (the default is shown as the placeholder; long lectures need a model
    with a large context window, e.g. `qwen-plus`, `gpt-4o-mini`,
-   `gemini-2.0-flash`).
+   `gemini-2.0-flash`, `deepseek-flash`). Reasoning ("thinking") models can
+   spend a title's short reply on reasoning: EchoLingo turns thinking off for
+   titles, **Test** and slide terms on Qwen and DeepSeek, and retries a title
+   that came back empty once with a larger budget.
 3. Turn on **Send transcripts and attached files to this model for notes and
    titles**, or allow it in the dialog the first time you create notes.
    Nothing is sent before this consent is given; it covers the selected

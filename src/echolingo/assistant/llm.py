@@ -17,6 +17,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
@@ -64,6 +65,23 @@ _CONTEXT_WORDING = (
 )
 _UNSUPPORTED_WORDING = ("unsupported", "not supported", "not support", "only the default")
 _CONTENT_FILTER_WORDING = ("data_inspection_failed", "content_filter", "inappropriate content")
+
+# The request field that switches a provider's reasoning ("thinking") phase
+# off. Qwen3-family models on DashScope otherwise spend the budget on hidden
+# reasoning (and refuse non-streaming calls with thinking enabled); DeepSeek's
+# current models think by default and can spend a short budget before the
+# answer starts.
+_THINKING_OFF: dict[str, tuple[str, Any]] = {
+    "dashscope": ("enable_thinking", False),
+    "deepseek": ("thinking", {"type": "disabled"}),
+}
+# Providers whose every call turns thinking off; the others only for the
+# short tasks that ask for it (titles, the probe, term lists).
+_THINKING_OFF_ALWAYS = frozenset({"dashscope"})
+
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
 
 
 class AssistantError(BackendError):
@@ -177,6 +195,27 @@ def add_usage(total: dict[str, int], usage: Mapping[str, int] | None) -> None:
             total[key] = total.get(key, 0) + int(usage[key])
 
 
+def strip_reasoning(text: str) -> str:
+    """Drop the ``<think>…</think>`` reasoning that self-hosted reasoning
+    models (Ollama and similar) put in the answer text.
+
+    A reply cut off inside a leading, unterminated block has no answer and
+    becomes empty; a stray closing tag (chat templates that open the block in
+    the prompt) drops everything before it.
+    """
+    lowered = text.lower()
+    if _THINK_OPEN not in lowered and _THINK_CLOSE not in lowered:
+        return text
+    text = _THINK_BLOCK.sub("", text)
+    lowered = text.lower()
+    close = lowered.rfind(_THINK_CLOSE)
+    if close >= 0:
+        text = text[close + len(_THINK_CLOSE) :]
+    elif lowered.lstrip().startswith(_THINK_OPEN):
+        return ""
+    return text.lstrip()
+
+
 def trim_overlap(previous: str, head: str, *, min_overlap: int = 16, window: int = 400) -> str:
     """Drop a repeated prefix of a continuation that restates the previous tail."""
     tail = previous[-window:]
@@ -214,7 +253,8 @@ class ChatClient:
         # Optional request fields; each is dropped for the rest of this
         # client's life once the endpoint rejects it with HTTP 400/422.
         self._stream_usage = endpoint.stream_usage
-        self._disable_thinking = endpoint.provider == "dashscope"
+        self._thinking_off = _THINKING_OFF.get(endpoint.provider)
+        self._thinking_off_always = endpoint.provider in _THINKING_OFF_ALWAYS
         self._send_temperature = True
         # OpenAI reasoning models accept only ``max_completion_tokens``.
         self._max_tokens_field = "max_tokens"
@@ -258,6 +298,7 @@ class ChatClient:
         max_tokens: int,
         temperature: float,
         stream: bool,
+        disable_thinking: bool = False,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": model,
@@ -269,10 +310,9 @@ class ChatClient:
             body["temperature"] = float(temperature)
         if stream and self._stream_usage:
             body["stream_options"] = {"include_usage": True}
-        if self._disable_thinking:
-            # Qwen3-family models otherwise spend the budget on hidden reasoning
-            # (and refuse non-streaming calls with thinking enabled).
-            body["enable_thinking"] = False
+        if self._thinking_off is not None and (disable_thinking or self._thinking_off_always):
+            name, value = self._thinking_off
+            body[name] = value
         return body
 
     # ----------------------------------------------------------------- errors
@@ -351,22 +391,24 @@ class ChatClient:
             return ""
 
     def _adjust_for_rejection(
-        self, status: int, body: str, max_tokens: int, stream: bool
+        self, status: int, body: str, max_tokens: int, sent: Mapping[str, Any]
     ) -> int | None:
         """Relax the request after an HTTP 400/422 that names an optional field.
 
-        Returns the ``max_tokens`` to retry with, or ``None`` when the error is
-        not about a field this client can drop.
+        ``sent`` is the rejected request body. Returns the ``max_tokens`` to
+        retry with, or ``None`` when the error is not about a field this client
+        can drop.
         """
         if status not in (400, 422):
             return None
         lowered = body.lower()
         unsupported = any(word in lowered for word in _UNSUPPORTED_WORDING)
-        if stream and self._stream_usage and "stream_options" in lowered:
+        if "stream_options" in sent and "stream_options" in lowered:
             self._stream_usage = False
             return max_tokens
-        if self._disable_thinking and "enable_thinking" in lowered:
-            self._disable_thinking = False
+        thinking = self._thinking_off
+        if thinking is not None and thinking[0] in sent and thinking[0] in lowered:
+            self._thinking_off = None
             return max_tokens
         if (
             self._max_tokens_field == "max_tokens"
@@ -394,36 +436,37 @@ class ChatClient:
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.3,
+        disable_thinking: bool = False,
     ) -> AsyncIterator[ChatDelta]:
         """Stream one completion.
 
         Yields text deltas; the final item has empty text and carries
         ``finish_reason`` and ``usage``. Cancelling the consuming task closes
-        the HTTP response.
+        the HTTP response. ``disable_thinking`` turns the model's reasoning
+        phase off where the provider has a field for it.
         """
         model = model or self.endpoint.model
         finish_reason: str | None = None
         usage: dict[str, int] | None = None
         attempt_max_tokens = int(max_tokens)
         for attempt in range(MAX_REQUEST_ATTEMPTS):
+            request = self.payload(
+                messages,
+                model=model,
+                max_tokens=attempt_max_tokens,
+                temperature=temperature,
+                stream=True,
+                disable_thinking=disable_thinking,
+            )
             try:
                 async with self.client.stream(
-                    "POST",
-                    self.chat_url(),
-                    headers=self.headers(),
-                    json=self.payload(
-                        messages,
-                        model=model,
-                        max_tokens=attempt_max_tokens,
-                        temperature=temperature,
-                        stream=True,
-                    ),
+                    "POST", self.chat_url(), headers=self.headers(), json=request
                 ) as response:
                     if response.status_code >= 400:
                         body = await self._read_error_body(response)
                         retry = (
                             self._adjust_for_rejection(
-                                response.status_code, body, attempt_max_tokens, True
+                                response.status_code, body, attempt_max_tokens, request
                             )
                             if attempt + 1 < MAX_REQUEST_ATTEMPTS
                             else None
@@ -478,6 +521,7 @@ class ChatClient:
         max_tokens: int = 4096,
         temperature: float = 0.3,
         max_continuations: int = MAX_CONTINUATIONS,
+        disable_thinking: bool = False,
     ) -> AsyncIterator[ChatDelta]:
         """Stream a completion, continuing up to ``max_continuations`` times
         when the model stops at its output limit.
@@ -497,7 +541,11 @@ class ChatClient:
             dedupe = attempt > 0
             finish = None
             async for delta in self.stream_chat(
-                history, model=model, max_tokens=max_tokens, temperature=temperature
+                history,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                disable_thinking=disable_thinking,
             ):
                 if delta.text:
                     if dedupe:
@@ -554,6 +602,7 @@ class ChatClient:
         max_tokens: int = 4096,
         temperature: float = 0.3,
         max_continuations: int = MAX_CONTINUATIONS,
+        disable_thinking: bool = False,
     ) -> ChatResult:
         parts: list[str] = []
         final = ChatDelta()
@@ -563,6 +612,7 @@ class ChatClient:
             max_tokens=max_tokens,
             temperature=temperature,
             max_continuations=max_continuations,
+            disable_thinking=disable_thinking,
         ):
             if delta.text:
                 parts.append(delta.text)
@@ -585,21 +635,27 @@ class ChatClient:
         max_tokens: int = 1024,
         temperature: float = 0.2,
     ) -> ChatResult:
-        """One non-streaming completion."""
+        """One non-streaming completion for a short task (a title, the probe).
+
+        The model's reasoning phase is turned off where the provider allows
+        it, and ``<think>`` blocks are removed from the text; a reasoning
+        model that used the whole budget returns empty text with
+        ``finish_reason == "length"``.
+        """
         model = model or self.endpoint.model
         attempt_max_tokens = int(max_tokens)
         for attempt in range(MAX_REQUEST_ATTEMPTS):
+            request = self.payload(
+                messages,
+                model=model,
+                max_tokens=attempt_max_tokens,
+                temperature=temperature,
+                stream=False,
+                disable_thinking=True,
+            )
             try:
                 response = await self.client.post(
-                    self.chat_url(),
-                    headers=self.headers(),
-                    json=self.payload(
-                        messages,
-                        model=model,
-                        max_tokens=attempt_max_tokens,
-                        temperature=temperature,
-                        stream=False,
-                    ),
+                    self.chat_url(), headers=self.headers(), json=request
                 )
             except httpx.HTTPError as error:
                 raise self._transport_error(error) from None
@@ -607,7 +663,7 @@ class ChatClient:
                 body = await self._read_error_body(response)
                 retry = (
                     self._adjust_for_rejection(
-                        response.status_code, body, attempt_max_tokens, False
+                        response.status_code, body, attempt_max_tokens, request
                     )
                     if attempt + 1 < MAX_REQUEST_ATTEMPTS
                     else None
@@ -638,7 +694,7 @@ class ChatClient:
         message = choice.get("message")
         content = message.get("content") if isinstance(message, dict) else None
         return ChatResult(
-            text=content if isinstance(content, str) else "",
+            text=strip_reasoning(content) if isinstance(content, str) else "",
             finish_reason=str(choice["finish_reason"]) if choice.get("finish_reason") else None,
             usage=_usage(body.get("usage")) or {},
         )

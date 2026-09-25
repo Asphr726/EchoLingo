@@ -143,6 +143,15 @@ def test_gemini_and_custom_omit_stream_options_and_window_requests_never_carry_i
     assert openai.build_payload(request(), model="gpt-4o-mini", stream=True)["stream_options"] == {"include_usage": True}
 
 
+def test_deepseek_requests_turn_thinking_off() -> None:
+    deepseek = OpenAiChatTranslation(provider="deepseek_chat", base_url=CHAT_PRESETS["deepseek_chat"][1], model="deepseek-flash", api_key=KEY)
+    for stream in (True, False):
+        assert deepseek.build_payload(request(), model="deepseek-flash", stream=stream)["thinking"] == {"type": "disabled"}
+    for preset in set(CHAT_PRESETS) - {"deepseek_chat"}:
+        other = OpenAiChatTranslation(provider=preset, base_url="http://127.0.0.1:11434/v1", model="m", api_key=KEY)
+        assert "thinking" not in other.build_payload(request(), model="m", stream=True)
+
+
 def test_display_names_cover_every_registered_preset() -> None:
     assert set(DISPLAY_NAMES) == set(CHAT_PRESETS)
     assert DISPLAY_NAMES["custom_chat"] == "Custom endpoint"
@@ -222,8 +231,8 @@ async def test_keyed_presets_require_an_api_key(preset: str) -> None:
 
 
 def test_prompt_carries_glossary_and_source_only_background() -> None:
-    adapter = OpenAiChatTranslation(provider="deepseek_chat", base_url="https://api.deepseek.com/v1", model="deepseek-chat", api_key=KEY, background_spans=2)
-    payload = adapter.build_payload(contextual_request(), model="deepseek-chat", stream=True)
+    adapter = OpenAiChatTranslation(provider="deepseek_chat", base_url="https://api.deepseek.com/v1", model="deepseek-flash", api_key=KEY, background_spans=2)
+    payload = adapter.build_payload(contextual_request(), model="deepseek-flash", stream=True)
     system, user = system_and_user(payload)
 
     assert user == "hello world"

@@ -46,6 +46,13 @@ STREAM_USAGE_PROVIDERS: frozenset[str] = frozenset(
     {"openai_chat", "deepseek_chat", "groq_chat", "openrouter_chat", "siliconflow_chat"}
 )
 
+# Presets whose models reason ("think") before answering unless the request
+# turns it off, with the field that does. Reasoning would spend the small
+# caption budget before any translation is written.
+THINKING_OFF_FIELDS: dict[str, tuple[str, object]] = {
+    "deepseek_chat": ("thinking", {"type": "disabled"}),
+}
+
 # OpenRouter attribution headers (https://openrouter.ai/docs/api-reference/overview).
 OPENROUTER_HEADERS: dict[str, str] = {
     "HTTP-Referer": "https://github.com/echolingo",
@@ -221,6 +228,9 @@ class OpenAiChatTranslation(OpenAiCompatibleChatTranslation):
         }
         if stream and self.provider in STREAM_USAGE_PROVIDERS:
             payload["stream_options"] = {"include_usage": True}
+        thinking_off = THINKING_OFF_FIELDS.get(self.provider)
+        if thinking_off is not None:
+            payload[thinking_off[0]] = thinking_off[1]
         return payload
 
     # --------------------------------------------------------------- answers

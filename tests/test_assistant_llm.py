@@ -415,3 +415,157 @@ async def test_reasoning_model_parameter_rejections_are_adapted() -> None:
     assert result.text == "OK"
     assert len(payloads) == 3
     assert payloads[-1]["max_completion_tokens"] == 64 and "temperature" not in payloads[-1]
+
+
+# ------------------------------------------------------------ reasoning models
+
+
+def deepseek_endpoint() -> LlmEndpoint:
+    return openai_endpoint(
+        provider="deepseek",
+        display_name="DeepSeek",
+        base_url="https://api.deepseek.com/v1",
+        model="deepseek-flash",
+    )
+
+
+async def test_deepseek_turns_thinking_off_for_one_shot_calls_only() -> None:
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        seen.append(payload)
+        if payload["stream"]:
+            return httpx.Response(200, content=sse(text_chunk("# Notes", "stop")))
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "Vision"}, "finish_reason": "stop"}]}
+        )
+
+    client = client_for(deepseek_endpoint(), handler)
+    result = await client.complete([{"role": "user", "content": "title"}], max_tokens=200)
+    assert result.text == "Vision"
+    text, _final = await collect(client)
+    assert text == "# Notes"
+    one_shot, streamed = seen
+    assert one_shot["thinking"] == {"type": "disabled"}
+    assert "enable_thinking" not in one_shot
+    # The streamed notes calls are sent exactly as before.
+    assert "thinking" not in streamed and "enable_thinking" not in streamed
+
+    # A short streamed task can ask for it explicitly.
+    await client.complete_streamed(
+        [{"role": "user", "content": "terms"}], max_continuations=0, disable_thinking=True
+    )
+    assert seen[-1]["thinking"] == {"type": "disabled"}
+
+
+async def test_rejected_thinking_field_is_dropped_and_retried() -> None:
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        seen.append(payload)
+        if "thinking" in payload:
+            return httpx.Response(
+                400, json={"error": {"message": "Unrecognized request argument supplied: thinking"}}
+            )
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "Vision"}, "finish_reason": "stop"}]}
+        )
+
+    client = client_for(deepseek_endpoint(), handler)
+    first = await client.complete([{"role": "user", "content": "title"}])
+    second = await client.complete([{"role": "user", "content": "title"}])
+    assert first.text == second.text == "Vision"
+    # Dropped for the rest of the client's life after one rejection.
+    assert ["thinking" in payload for payload in seen] == [True, False, False]
+
+
+async def test_a_rejection_naming_an_unsent_thinking_field_is_not_retried() -> None:
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(400, json={"error": {"message": "thinking is not the problem"}})
+
+    # Streamed notes never send the field, so there is nothing to drop.
+    client = client_for(deepseek_endpoint(), handler)
+    with pytest.raises(AssistantError):
+        await collect(client)
+    assert len(seen) == 1
+
+
+async def test_dashscope_keeps_enable_thinking_off_on_every_call() -> None:
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        seen.append(payload)
+        if payload["stream"]:
+            return httpx.Response(200, content=sse(text_chunk("ok", "stop")))
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]}
+        )
+
+    client = client_for(dashscope_endpoint(), handler)
+    await client.complete([{"role": "user", "content": "hi"}])
+    await collect(client)
+    assert [payload["enable_thinking"] for payload in seen] == [False, False]
+    assert all("thinking" not in payload for payload in seen)
+
+
+async def test_dashscope_rejecting_enable_thinking_drops_it() -> None:
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        seen.append(payload)
+        if "enable_thinking" in payload:
+            return httpx.Response(400, json={"error": {"message": "enable_thinking is not supported"}})
+        return httpx.Response(200, content=sse(text_chunk("ok", "stop")))
+
+    client = client_for(dashscope_endpoint(), handler)
+    text, _final = await collect(client)
+    assert text == "ok"
+    assert ["enable_thinking" in payload for payload in seen] == [True, False]
+
+
+@pytest.mark.parametrize(
+    ("raw", "text"),
+    [
+        ("<think>The lecture is about textons.</think>\n\nTexture Perception", "Texture Perception"),
+        ("<THINK>a</THINK><think>b</think>Vision", "Vision"),
+        ("<think>still reasoning when the budget ran out", ""),
+        ("  \n<think>\nunterminated", ""),
+        ("reasoning opened by the chat template</think>\nSaccades", "Saccades"),
+        ("Plain answer", "Plain answer"),
+        ("Title <think>aside</think>", "Title "),
+    ],
+)
+def test_strip_reasoning(raw, text) -> None:
+    assert llm.strip_reasoning(raw) == text
+
+
+async def test_complete_strips_think_blocks_and_ignores_reasoning_content() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert "thinking" not in payload and "enable_thinking" not in payload
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": "<think>Let me see.</think>\nTexture Perception",
+                            "reasoning_content": "hidden chain of thought",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    client = client_for(openai_endpoint(provider="custom_openai", display_name="Custom"), handler)
+    result = await client.complete([{"role": "user", "content": "title"}])
+    assert result.text == "Texture Perception"
+    assert result.finish_reason == "stop"
