@@ -173,7 +173,7 @@ def test_log_watcher_reads_only_new_lines(tmp_path) -> None:
         handle.write("update install state=installed version=0.3.1\n")
     pattern = smoke.version_pattern(smoke.INSTALLED_PATTERN, "0.3.1")
     assert watcher.search(pattern) == "update install state=installed version=0.3.1"
-    log.write_text("new\n")  # recreated and shorter
+    log.write_text("new\n", newline="\n")  # recreated and shorter
     assert watcher.text() == "new\n"
 
 
