@@ -432,6 +432,24 @@ impl UpdateRegistry {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// The `operation` lock for a check, or `None` when the check should be
+    /// skipped. A manual check waits for a running launch check and then asks
+    /// again, so its own outcome (an error included) is shown; any other
+    /// check, or a manual one during an install, is skipped.
+    async fn check_operation(
+        &self,
+        trigger: Trigger,
+        updating: &AtomicBool,
+    ) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        if let Ok(operation) = self.operation.try_lock() {
+            return Some(operation);
+        }
+        if trigger != Trigger::Manual || updating.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(self.operation.lock().await)
+    }
+
     /// Enter `Checking`; returns the state to go back to after a quiet
     /// failure.
     fn begin_check(&self, clear_error: bool) -> UpdateState {
@@ -640,9 +658,13 @@ async fn fetch(app: &AppHandle) -> Result<Option<Update>, String> {
 /// check that fails is only logged; a manual one shows its error.
 async fn check(app: &AppHandle, trigger: Trigger) {
     let state = app.state::<RuntimeState>();
-    // A check or install is already running; its result arrives as an
-    // event.
-    let Ok(_operation) = state.updater.operation.try_lock() else {
+    // Otherwise a check or install is already running; its result arrives
+    // as an event.
+    let Some(_operation) = state
+        .updater
+        .check_operation(trigger, &state.updating)
+        .await
+    else {
         return;
     };
     if state.updating.load(Ordering::Acquire) {
@@ -1277,6 +1299,37 @@ mod tests {
             "see http://127.0.0.1:8080/latest.json#[redacted] and https://example.com/x"
         );
         assert_eq!(redact_urls("no links here"), "no links here");
+    }
+
+    #[tokio::test]
+    async fn only_a_manual_check_waits_for_a_running_check() {
+        let registry = UpdateRegistry::default();
+        let updating = AtomicBool::new(false);
+        assert!(registry
+            .check_operation(Trigger::Launch, &updating)
+            .await
+            .is_some());
+
+        let running = registry.operation.lock().await;
+        for trigger in [Trigger::Launch, Trigger::Test] {
+            assert!(registry.check_operation(trigger, &updating).await.is_none());
+        }
+        // An install holds the lock: a manual check does not wait for it.
+        updating.store(true, Ordering::Release);
+        assert!(registry
+            .check_operation(Trigger::Manual, &updating)
+            .await
+            .is_none());
+        updating.store(false, Ordering::Release);
+
+        let mut waiting = std::pin::pin!(registry.check_operation(Trigger::Manual, &updating));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut waiting)
+                .await
+                .is_err()
+        );
+        drop(running);
+        assert!(waiting.await.is_some());
     }
 
     #[test]
