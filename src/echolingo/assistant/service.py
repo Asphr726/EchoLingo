@@ -66,7 +66,11 @@ PREAMBLE_LIMIT_SECTION = 1500
 TITLE_SAMPLE_CHARS = 6000
 TITLE_MAX_TOKENS = 200
 # One retry when a reasoning model used the whole budget before the title.
-TITLE_RETRY_MAX_TOKENS = 4096
+TITLE_RETRY_MAX_TOKENS = 2048
+# The desktop shell stops a title job after 90 s. The retry gives up this long
+# after the task started, so the reason reaches the user rather than a
+# generic timeout; a slow reasoning model can take minutes for 2048 tokens.
+TITLE_DEADLINE_S = 75.0
 # context
 CONTEXT_MATERIALS_BUDGET = 30_000
 CONTEXT_MAX_TOKENS = 2048
@@ -306,6 +310,14 @@ def _display_name(client: Any) -> str:
     return getattr(endpoint, "display_name", None) or getattr(client, "provider", "The model")
 
 
+def _reasoning_title_error(client: Any) -> AssistantError:
+    return AssistantError(
+        "empty_response",
+        f"{_display_name(client)} spent its reply budget on reasoning and returned no "
+        "title. Try again, or choose a model without reasoning in Settings → AI assistant.",
+    )
+
+
 # ------------------------------------------------------------------ service
 
 
@@ -437,6 +449,7 @@ class AssistantService:
             prompts.title_system_prompt(language),
             prompts.title_user_message(excerpts, session.context, session.glossary),
         )
+        deadline = asyncio.get_running_loop().time() + TITLE_DEADLINE_S
         async with self._client(payload) as client:
             events.progress("writing")
             answer = await client.complete(
@@ -447,20 +460,21 @@ class AssistantService:
                 # A reasoning model can stop at the output limit before it
                 # writes anything.
                 logger.info("assistant title: no text before the output limit; retrying once")
-                answer = await client.complete(
-                    messages, max_tokens=TITLE_RETRY_MAX_TOKENS, temperature=0.3
-                )
+                try:
+                    async with asyncio.timeout_at(deadline):
+                        answer = await client.complete(
+                            messages, max_tokens=TITLE_RETRY_MAX_TOKENS, temperature=0.3
+                        )
+                except TimeoutError:
+                    logger.info("assistant title: the retry ran out of time")
+                    raise _reasoning_title_error(client) from None
                 title = sanitize_title(answer.text)
             if not title:
-                display = _display_name(client)
                 if answer.finish_reason == "length":
-                    raise AssistantError(
-                        "empty_response",
-                        f"{display} spent its reply budget on reasoning and returned no "
-                        "title. Try again, or choose a model without reasoning in "
-                        "Settings → AI assistant.",
-                    )
-                raise AssistantError("empty_response", f"{display} returned no title.")
+                    raise _reasoning_title_error(client)
+                raise AssistantError(
+                    "empty_response", f"{_display_name(client)} returned no title."
+                )
             return {"title": title, "provider": client.provider, "model": client.model}
 
     # ------------------------------------------------------------------ notes

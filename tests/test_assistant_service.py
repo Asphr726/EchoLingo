@@ -4,6 +4,7 @@ windowed), titles, context import, probe, consent gate and cancellation."""
 from __future__ import annotations
 
 import asyncio
+import re
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -508,7 +509,7 @@ async def test_title_retries_once_when_reasoning_used_the_budget() -> None:
     assert result["result"]["title"] == "Texture Perception"
     (_, first_messages, first), (_, second_messages, second) = client.calls
     assert first["max_tokens"] == service.TITLE_MAX_TOKENS
-    assert second["max_tokens"] == service.TITLE_RETRY_MAX_TOKENS == 4096
+    assert second["max_tokens"] == service.TITLE_RETRY_MAX_TOKENS == 2048
     assert second_messages == first_messages
 
 
@@ -528,6 +529,42 @@ async def test_title_still_empty_after_the_retry_blames_reasoning() -> None:
     assistant, _seen = make_service(client)
     result = result_of(await run_task(assistant, "title", notes_payload(units(5))))
     assert result["result"]["message"] == "Qwen (Alibaba Model Studio) returned no title."
+
+
+async def test_title_retry_gives_up_before_the_shell_stops_the_job(monkeypatch) -> None:
+    class SlowRetry(FakeClient):
+        async def complete(self, messages, **kwargs) -> ChatResult:
+            if self.calls:
+                # The retry of a model that keeps reasoning.
+                self.calls.append(("complete", messages, kwargs))
+                await asyncio.sleep(3600)
+            return await super().complete(messages, **kwargs)
+
+    monkeypatch.setattr(service, "TITLE_DEADLINE_S", 0.2)
+    client = SlowRetry(completions=[reasoning_only()])
+    assistant, _seen = make_service(client)
+    result = result_of(
+        await asyncio.wait_for(run_task(assistant, "title", notes_payload(units(5))), timeout=5)
+    )
+    assert result["ok"] is False
+    assert result["result"]["code"] == "empty_response"
+    assert result["result"]["message"].startswith(
+        "Qwen (Alibaba Model Studio) spent its reply budget on reasoning"
+    )
+    assert [call[2]["max_tokens"] for call in client.calls] == [
+        service.TITLE_MAX_TOKENS,
+        service.TITLE_RETRY_MAX_TOKENS,
+    ]
+
+
+def test_title_deadline_leaves_margin_before_the_shell_timeout() -> None:
+    source = (
+        Path(__file__).resolve().parents[1] / "apps/desktop/src-tauri/src/assistant.rs"
+    ).read_text(encoding="utf-8")
+    match = re.search(r"Self::Title => Duration::from_secs\((\d+)\)", source)
+    assert match is not None
+    # Room for the sidecar round trip and the result event.
+    assert int(match.group(1)) - service.TITLE_DEADLINE_S >= 10
 
 
 @pytest.mark.parametrize(
@@ -983,7 +1020,7 @@ async def test_deepseek_title_after_reasoning_hit_the_limit(caplog) -> None:
     result = result_of(await run_task(assistant, "title", payload))
     assert result["ok"] is True, result
     assert result["result"] == {"title": title, "provider": "deepseek", "model": "deepseek-flash"}
-    assert [request["max_tokens"] for request in requests] == [200, 4096]
+    assert [request["max_tokens"] for request in requests] == [200, 2048]
     assert all(request["thinking"] == {"type": "disabled"} for request in requests)
     assert all(request["stream"] is False for request in requests)
 
