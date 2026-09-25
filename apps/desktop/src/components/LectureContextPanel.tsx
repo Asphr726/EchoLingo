@@ -149,8 +149,8 @@ export function LectureContextPanel({ locked }: { locked: boolean }) {
         <p className="lecture-context-privacy">
           <LockKey size={13} weight="regular" aria-hidden="true" />
           <span>
-            Context is sent to cloud recognition/translation only when those uploads are enabled. Recognition uses only
-            names and terms written in the lecture’s spoken language; context in another language is background for
+            Context is sent to cloud recognition/translation only when those uploads are enabled. Only names and terms
+            written in the lecture’s spoken language help recognition; context in another language is background for
             translation. Standing terms for every lecture live in the{" "}
             <button className="text-button text-button--inline" type="button" onClick={() => requestNavigation({ view: "settings", section: "translation" })}>
               glossary
