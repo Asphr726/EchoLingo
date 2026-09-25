@@ -548,9 +548,31 @@ def test_a_roll_resets_the_latch_and_the_next_segment_starts_after_the_rolled_au
     rig.audio(1.0, speech=False)
     # The speech before the roll belongs to the rolled segment.
     assert rig.decode("")[0] == PLAIN_PROMPT
-    rig.audio(0.5, speech=True)
+    rig.audio(1.0, speech=True)
     assert rig.decode("Okay")[0] == CONTEXT_PROMPT
     assert rig.streamer.context_latches == 2
+
+
+@pytest.mark.parametrize("held_back", ["right_context", "pending"])
+def test_speech_the_decoder_has_not_received_does_not_latch(held_back: str) -> None:
+    rig = GateRig(echolingo_silence_roll_ms=0)
+    rig.audio(1.0, speech=False)
+    assert rig.decode("")[0] == PLAIN_PROMPT
+    if held_back == "right_context":
+        # 0.5 s of speech, all inside the 640 ms right context.
+        rig.audio(0.5, speech=True)
+    else:
+        # A causal encoder (no right context) still holding the 0.5 s back.
+        rig.streamer.model.audio_encoder.right_context_frames = 0
+        rig.streamer.state.audio.pending_frames = 50
+        rig.audio(0.5, speech=True)
+    assert rig.decode("")[0] == PLAIN_PROMPT
+    assert rig.streamer.context_latches == 0
+    # The next decode receives the speech and latches.
+    rig.streamer.state.audio.pending_frames = 0
+    rig.audio(0.5, speech=True)
+    assert rig.decode("Okay so")[0] == CONTEXT_PROMPT
+    assert rig.streamer.context_latches == 1
 
 
 def test_latch_is_deferred_when_the_segment_already_committed_text() -> None:

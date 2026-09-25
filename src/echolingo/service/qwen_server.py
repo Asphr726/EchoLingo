@@ -382,10 +382,12 @@ def make_segmented_streamer_class(base: type) -> type:
         def prompt_template_token_ids(self) -> list[int] | None:
             """The plain prompt until the segment holds speech, then the context.
 
-            Called once per decode, after the new audio was appended. Once
-            the context is on it stays on until the segment rolls: re-decoding
-            the segment under another prompt could revise words that were
-            already committed.
+            Called once per decode, after the new audio was appended. Only the
+            audio steps the decoder receives count: speech still in the
+            encoder's right context (or held back by the causal encoder) would
+            put the context over silent steps. Once the context is on it stays
+            on until the segment rolls: re-decoding the segment under another
+            prompt could revise words that were already committed.
             """
             template = super().prompt_template_token_ids()
             plain = self.echolingo_plain_prompt_template
@@ -399,8 +401,8 @@ def make_segmented_streamer_class(base: type) -> type:
             ):
                 return template
             if timeline.available:
-                start, _, head = self._segment_samples()
-                speech = timeline.speech_samples(start, head)
+                start, encoded, _ = self._segment_samples()
+                speech = timeline.speech_samples(start, encoded)
                 if speech < self._ms_samples(CONTEXT_GATE_MIN_SPEECH_MS):
                     self._context_gated = True
                     return list(plain)
@@ -447,7 +449,8 @@ def make_segmented_streamer_class(base: type) -> type:
                 return False
             if encoded - last_speech < self._ms_samples(self.echolingo_silence_roll_ms):
                 return False
-            # Speech in the encoder's right context is about to be decoded.
+            # No roll while speech in the encoder's right context is still to
+            # be decoded into this segment.
             return timeline.speech_samples(encoded, head) == 0
 
         def _segment_samples(self) -> tuple[int, int, int]:
