@@ -128,7 +128,8 @@ export function UpdatesCard({
   const notes = useMemo(() => (available?.notes ? parseNotesDocument(available.notes).blocks : []), [available?.notes]);
   const released = formatReleaseDate(available?.date ?? null);
   const progress = view.busy ? updateProgress(status) : null;
-  const installDisabled = pending !== null || Boolean(view.blockedReason);
+  // The shell refuses an install while a check runs.
+  const installDisabled = pending !== null || view.checking || Boolean(view.blockedReason);
   const shownError = error ?? status.error;
   // Next to the install when there is one, else under the check.
   const errorLine = shownError ? <p className="settings-error" role="alert">{shownError}</p> : null;
@@ -194,9 +195,11 @@ export function UpdatesCard({
                 <span style={{ width: `${progress.percentage}%` }} />
                 <small>{progress.label}</small>
               </div>
-              <p className="visually-hidden" aria-live="polite">{progress.announcement}</p>
             </div>
           )}
+          {/* Mounted before the download starts: a live region that appears
+              together with its text is often not read out. */}
+          <p className="visually-hidden" aria-live="polite">{progress?.announcement ?? ""}</p>
           {view.blockedReason && (
             <p className="settings-helper" id="update-blocked-reason">{view.blockedReason}</p>
           )}

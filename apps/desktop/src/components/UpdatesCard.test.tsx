@@ -157,6 +157,15 @@ describe("UpdatesCard", () => {
     expect(html).toContain(`id="update-blocked-reason">${reason}</p>`);
   });
 
+  it("keeps the progress announcer mounted before the download starts", () => {
+    expect(render(available)).toContain('<p class="visually-hidden" aria-live="polite"></p>');
+  });
+
+  it("disables the install while a new check runs", () => {
+    const html = render({ ...available, state: "checking" });
+    expect(html).toMatch(/<button class="button button--primary" type="button" disabled="">.*Download and install<\/button>/);
+  });
+
   it("says a check is running", () => {
     const html = render({ ...idle, state: "checking" });
     expect(html).toContain('<small role="status">Checking for updates…</small>');
