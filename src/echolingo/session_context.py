@@ -535,7 +535,10 @@ def parse_session_context(
     if allowed is not None:
         topic_lines, hint_terms = [], []
         for line in acc.topic_lines:
-            (topic_lines if _fits_scripts(line, allowed) else moved_lines).append(line)
+            # A "Topic:"-style label would count as letters of its own script.
+            label = _TOPIC_LABEL_RE.match(line)
+            body = line[label.end() :] if label else line
+            (topic_lines if _fits_scripts(body, allowed) else moved_lines).append(line)
         for term in acc.hints:
             if _fits_scripts(term, allowed):
                 hint_terms.append(term)

@@ -134,6 +134,22 @@ def test_mixed_lines_follow_the_majority_of_their_letters() -> None:
     assert parsed.domain == f"{TITLE} {parsed.translation_domain}"
 
 
+def test_a_topic_label_does_not_decide_the_script_of_its_line() -> None:
+    from echolingo.assistant.terms import compose_context
+
+    # The lecture-context import writes "Topic: <titles>"; the five Latin
+    # letters of the label outnumber a short Chinese title.
+    for text in (compose_context(["机器学习"], ["saccade"]), "Course: 计算机视觉\nsaccade"):
+        parsed = parse_session_context(text, source_language="en")
+        assert parsed.topic == "" and parsed.hint_terms == ("saccade",)
+        assert parsed.asr_prompt == "Terms: saccade"
+        assert parsed.translation_domain in ("Topic: 机器学习", "Course: 计算机视觉")
+    # A label in another script keeps a same-script topic in the prompt.
+    kept = parse_session_context("主题：Machine Learning Basics", source_language="en")
+    assert kept.topic == "主题：Machine Learning Basics" and kept.translation_domain == ""
+    assert parse_session_context("Topic: 机器学习", source_language="zh").topic == "Topic: 机器学习"
+
+
 def test_translation_domain_is_bounded_like_the_topic() -> None:
     lines = "\n".join(f"第{index}讲：纹理感知与视觉搜索的基本原理与实验方法。" for index in range(8))
     parsed = parse_session_context(f"{lines}\n{TITLE}", source_language="en")
