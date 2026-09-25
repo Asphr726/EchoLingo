@@ -444,6 +444,24 @@ def test_production_configs_have_no_dangerous_keys() -> None:
     assert results.failures == []
 
 
+def test_release_config_check_finds_repeated_keys(tmp_path) -> None:
+    smoke = load_script("smoke_packaged")
+    for path in sorted(TAURI.glob("tauri*.json")):
+        assert smoke.duplicate_keys(path.read_text(encoding="utf-8")) == [], path.name
+    assert smoke.duplicate_keys('{"plugins": {"a": 1, "a": 2}, "bundle": {}, "plugins": {}}') == [
+        "a",
+        "plugins",
+    ]
+    for name in ("tauri.conf.json", "tauri.updater.conf.json"):
+        (tmp_path / name).write_text((TAURI / name).read_text(encoding="utf-8"), encoding="utf-8")
+    config = (tmp_path / "tauri.conf.json").read_text(encoding="utf-8")
+    plugins = config[config.index('  "plugins"'):config.index('  "bundle"')]
+    (tmp_path / "tauri.conf.json").write_text(config.replace('  "bundle"', plugins + '  "bundle"'))
+    results = smoke.Results()
+    smoke.check_configs(tmp_path, results)
+    assert results.failures == ["tauri.conf.json: repeated keys plugins; only the last one counts"]
+
+
 def test_release_config_check_requires_signed_versions(tmp_path) -> None:
     smoke = load_script("smoke_packaged")
     for name in ("tauri.conf.json", "tauri.updater.conf.json"):

@@ -214,8 +214,24 @@ def dangerous_keys(value: Any, path: str = "") -> list[str]:
     return found
 
 
+def duplicate_keys(text: str) -> list[str]:
+    """Keys repeated within one JSON object; json.loads silently keeps only the last."""
+    found: list[str] = []
+
+    def collect(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        keys = [key for key, _ in pairs]
+        found.extend(key for index, key in enumerate(keys) if key in keys[:index])
+        return dict(pairs)
+
+    json.loads(text, object_pairs_hook=collect)
+    return found
+
+
 def check_configs(tauri_dir: Path, results: Results) -> None:
     for path in sorted(tauri_dir.glob("tauri*.json")):
+        repeated = duplicate_keys(path.read_text(encoding="utf-8"))
+        if repeated:
+            results.fail(f"{path.name}: repeated keys {', '.join(repeated)}; only the last one counts")
         found = dangerous_keys(read_json(path))
         if found:
             results.fail(f"{path.name}: {', '.join(found)} must not ship")
