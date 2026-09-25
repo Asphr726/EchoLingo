@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -23,6 +22,7 @@ from ..translation import StreamingTranslationCoordinator
 from ..vad import make_vad
 from ..resample import StreamingResampler
 from .protocol import AudioPacket
+from .resources import runtime_resource_path
 from .sink import SidecarEventSink
 from .alignment import SessionAlignmentCapture
 
@@ -37,22 +37,6 @@ def resolve_frontend_profile(product_profile: str) -> str:
         "raw": "raw",
     }
     return aliases.get(product_profile, product_profile)
-
-
-def runtime_resource_path(relative: str) -> Path:
-    candidates = []
-    configured = os.environ.get("ECHOLINGO_RESOURCE_ROOT")
-    if configured:
-        candidates.append(Path(configured))
-    frozen_root = getattr(sys, "_MEIPASS", None)
-    if frozen_root:
-        candidates.append(Path(frozen_root))
-    candidates.append(Path.cwd())
-    for root in candidates:
-        candidate = root / relative
-        if candidate.exists():
-            return candidate
-    return candidates[0] / relative
 
 
 def desktop_config(payload: dict[str, Any]):
@@ -100,8 +84,16 @@ def desktop_config(payload: dict[str, Any]):
 
 
 def session_context_for(config) -> SessionContext:
-    """Parsed topic, hint terms and glossary for one validated config."""
-    return parse_session_context(config.context.session_context, config.context.glossary)
+    """Parsed topic, hint terms and glossary for one validated config.
+
+    Context written in scripts the ASR source language does not use is kept
+    out of the ASR prompt and reaches translation only.
+    """
+    return parse_session_context(
+        config.context.session_context,
+        config.context.glossary,
+        source_language=config.asr.language,
+    )
 
 
 def align_local_profiles(config, capabilities) -> None:
@@ -279,10 +271,12 @@ class DesktopInferenceSession:
         if not session_context.empty:
             # Counts only: the context text itself stays out of the log.
             logger.info(
-                "session context: topic %d chars, %d hint terms, %d glossary pairs",
+                "session context: topic %d chars, %d hint terms, %d glossary pairs, "
+                "%d chars for translation only",
                 len(session_context.topic),
                 len(session_context.hint_terms),
                 len(session_context.glossary),
+                len(session_context.translation_domain),
             )
         translation = None
         if translation_backend is not None:
@@ -292,7 +286,7 @@ class DesktopInferenceSession:
                 target_lang=config.translation.target_language,
                 context_segments=config.translation.context_segments,
                 glossary=session_context.glossary,
-                domain=session_context.topic or None,
+                domain=session_context.domain or None,
                 provisional_enabled=registry.get(
                     "translation", decision.translation_provider
                 ).streaming_partials,

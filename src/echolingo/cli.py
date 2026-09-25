@@ -146,7 +146,9 @@ async def _run_source(source, args) -> Path:
     asr = BackendFactory(config).asr(route.asr_provider)
     translation_backend = BackendFactory(config).translation(route.translation_provider)
     session_context = parse_session_context(
-        config.context.session_context, config.context.glossary
+        config.context.session_context,
+        config.context.glossary,
+        source_language=config.asr.language,
     )
     translation = None
     if translation_backend is not None:
@@ -156,7 +158,7 @@ async def _run_source(source, args) -> Path:
             target_lang=config.translation.target_language,
             context_segments=config.translation.context_segments,
             glossary=session_context.glossary,
-            domain=session_context.topic or None,
+            domain=session_context.domain or None,
             provisional_enabled=registry.get(
                 "translation", route.translation_provider
             ).streaming_partials,

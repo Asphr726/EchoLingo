@@ -27,6 +27,13 @@ Hint terms are deduplicated case-insensitively (first spelling wins) and
 capped at 200, as are glossary pairs. The ASR prompt is the topic (≤ 400
 chars) plus a ``Terms: a, b, c`` line, packed to ≤ 1000 chars.
 
+With a source language, topic lines and hint terms written mostly in scripts
+that language does not use (a Chinese title for an English lecture) stay out
+of the ASR prompt: a recognizer biased with them renders the text in the
+source language and emits it during silence. They go to ``translation_domain``
+instead, which only reaches the translation prompt. Glossary pairs are kept
+whatever their script.
+
 Nothing here logs the text: the context may describe a private lecture.
 """
 
@@ -46,6 +53,7 @@ __all__ = [
     "SESSION_CONTEXT_MAX_CHARS",
     "SessionContext",
     "TOPIC_PROMPT_MAX_CHARS",
+    "asr_scripts",
     "build_asr_prompt",
     "clip_text",
     "parse_session_context",
@@ -72,10 +80,25 @@ class SessionContext:
     hint_terms: tuple[str, ...] = ()
     glossary: tuple[GlossaryTerm, ...] = ()
     asr_prompt: str = ""
+    # Topic lines and hint terms kept out of the ASR prompt because they are
+    # written in scripts the source language does not use (≤ 400 chars).
+    translation_domain: str = ""
 
     @property
     def empty(self) -> bool:
-        return not (self.topic or self.hint_terms or self.glossary)
+        return not (self.topic or self.hint_terms or self.glossary or self.translation_domain)
+
+    @property
+    def domain(self) -> str:
+        """Topic text for translation prompts: the topic, then ``translation_domain``.
+
+        The topic is shortened when both are present so the pair stays within
+        the topic budget and the translation-only part is never cut off.
+        """
+        if not self.translation_domain:
+            return self.topic
+        topic = clip_text(self.topic, TOPIC_PROMPT_MAX_CHARS - len(self.translation_domain) - 1)
+        return f"{topic} {self.translation_domain}" if topic else self.translation_domain
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +148,49 @@ def _scripts(text: str) -> frozenset[str]:
 
 def _is_cjk(char: str) -> bool:
     return _script(char) in {"han", "kana", "hangul"}
+
+
+# Scripts a recognizer can use in its prompt, per source language. Latin is
+# always allowed: technical terms, names and acronyms are written in it
+# everywhere.
+_ASR_SCRIPTS: dict[str, frozenset[str]] = {
+    "zh": frozenset({"han", "latin"}),
+    "ja": frozenset({"han", "kana", "latin"}),
+    "ko": frozenset({"hangul", "han", "latin"}),
+    "ru": frozenset({"cyrillic", "latin"}),
+    "uk": frozenset({"cyrillic", "latin"}),
+}
+_DEFAULT_ASR_SCRIPTS = frozenset({"latin"})
+
+
+def asr_scripts(source_language: str | None) -> frozenset[str] | None:
+    """Scripts allowed in the ASR prompt for ``source_language``.
+
+    ``None`` (no filtering) when the language is unknown or ``auto``.
+    """
+    code = (source_language or "").strip().lower().replace("_", "-").split("-")[0]
+    if not code or code == "auto":
+        return None
+    return _ASR_SCRIPTS.get(code, _DEFAULT_ASR_SCRIPTS)
+
+
+def _letter_script(char: str) -> str | None:
+    script = _script(char)
+    if script == "other" and ("Ａ" <= char <= "Ｚ" or "ａ" <= char <= "ｚ"):
+        return "latin"  # full-width Latin, common in Japanese and Chinese text
+    return script
+
+
+def _fits_scripts(text: str, allowed: frozenset[str]) -> bool:
+    """True when ``text`` has no letters or at least half are in ``allowed``."""
+    letters = fitting = 0
+    for char in text:
+        script = _letter_script(char)
+        if script is None:
+            continue
+        letters += 1
+        fitting += script in allowed
+    return 2 * fitting >= letters
 
 
 def word_count(text: str) -> int:
@@ -443,8 +509,18 @@ def build_asr_prompt(topic: str, terms: tuple[str, ...] | list[str]) -> str:
     return prompt[:ASR_PROMPT_MAX_CHARS]
 
 
-def parse_session_context(session_context: str, glossary: str = "") -> SessionContext:
-    """Parse the Live-screen context and the standing glossary (merged)."""
+def parse_session_context(
+    session_context: str,
+    glossary: str = "",
+    *,
+    source_language: str | None = None,
+) -> SessionContext:
+    """Parse the Live-screen context and the standing glossary (merged).
+
+    ``source_language`` moves topic lines and hint terms written in other
+    scripts from the ASR prompt to ``translation_domain`` (see the module
+    docstring); ``None`` keeps everything for the ASR prompt.
+    """
     acc = _Accumulator([], [], set(), [], set())
     for text, limit in (
         (session_context, SESSION_CONTEXT_MAX_CHARS),
@@ -452,11 +528,27 @@ def parse_session_context(session_context: str, glossary: str = "") -> SessionCo
     ):
         for line in _sanitize(text)[:limit].split("\n"):
             _parse_line(line, acc)
-    topic = _join_topic(acc.topic_lines)
-    hints = tuple(acc.hints)
+    topic_lines, hint_terms = acc.topic_lines, acc.hints
+    moved_lines: list[str] = []
+    moved_terms: list[str] = []
+    allowed = asr_scripts(source_language)
+    if allowed is not None:
+        topic_lines, hint_terms = [], []
+        for line in acc.topic_lines:
+            (topic_lines if _fits_scripts(line, allowed) else moved_lines).append(line)
+        for term in acc.hints:
+            if _fits_scripts(term, allowed):
+                hint_terms.append(term)
+            elif term.casefold() not in acc.pair_keys:
+                # A glossary source already reaches translation as a pair.
+                moved_terms.append(term)
+    topic = _join_topic(topic_lines)
+    hints = tuple(hint_terms)
+    moved = " ".join(part for part in (_join_topic(moved_lines), ", ".join(moved_terms)) if part)
     return SessionContext(
         topic=topic,
         hint_terms=hints,
         glossary=tuple(acc.pairs),
         asr_prompt=build_asr_prompt(topic, hints),
+        translation_domain=clip_text(moved, TOPIC_PROMPT_MAX_CHARS),
     )
