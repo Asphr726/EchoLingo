@@ -36,10 +36,10 @@ use transcript_store::{
 };
 
 mod assistant;
+mod updater;
 
 const UI_EVENT_CHANNEL: &str = "echolingo://ui-event";
 const MODEL_PROGRESS_CHANNEL: &str = "echolingo://model-progress";
-const KEYCHAIN_SERVICE: &str = "app.echolingo.desktop";
 const DESKTOP_LOG_FILE: &str = "desktop.log";
 /// Forced alignment runs after a session finished and reports no end; it
 /// counts as running until no alignment update arrived for this long.
@@ -55,7 +55,19 @@ type ProviderSettings = HashMap<String, HashMap<String, String>>;
 /// this code. Secret values are never logged, never returned to the webview
 /// and never included in error messages.
 #[derive(Default)]
-struct CredentialStore;
+struct CredentialStore {
+    /// The secure-store service name, set in `setup` from the bundle
+    /// identifier (see [`keychain_service`]). Until then every lookup fails.
+    service: std::sync::OnceLock<String>,
+}
+
+/// The secure-store service name for a bundle identifier: the identifier
+/// itself. The production app (`app.echolingo.desktop`) therefore keeps the
+/// service every earlier version saved keys under, and a differently
+/// identified build (the `.updatetest` smoke-test app) can never read them.
+fn keychain_service(identifier: &str) -> String {
+    identifier.to_string()
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct CredentialFieldStatus {
@@ -90,36 +102,45 @@ impl CredentialGroupStatus {
 }
 
 impl CredentialStore {
-    fn entry(account: &str) -> Result<keyring::Entry, String> {
-        keyring::Entry::new(KEYCHAIN_SERVICE, account).map_err(|error| error.to_string())
+    /// Use `service` from now on; a service that is already set stays.
+    fn set_service(&self, service: String) {
+        let _ = self.service.set(service);
     }
 
-    fn get(account: &str) -> Result<Option<String>, String> {
+    fn entry(&self, account: &str) -> Result<keyring::Entry, String> {
+        let service = self
+            .service
+            .get()
+            .ok_or_else(|| "the secure store is not initialized".to_string())?;
+        keyring::Entry::new(service, account).map_err(|error| error.to_string())
+    }
+
+    fn get(&self, account: &str) -> Result<Option<String>, String> {
         // Unit tests never read (or prompt for) the developer's secure store.
         if cfg!(test) {
             return Ok(None);
         }
-        match Self::entry(account)?.get_password() {
+        match self.entry(account)?.get_password() {
             Ok(value) => Ok(Some(value)),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(error) => Err(error.to_string()),
         }
     }
 
-    fn set(account: &str, value: &str) -> Result<(), String> {
+    fn set(&self, account: &str, value: &str) -> Result<(), String> {
         if cfg!(test) {
             return Err("the secure store is not available in unit tests".into());
         }
-        Self::entry(account)?
+        self.entry(account)?
             .set_password(value)
             .map_err(|error| error.to_string())
     }
 
-    fn delete(account: &str) -> Result<(), String> {
+    fn delete(&self, account: &str) -> Result<(), String> {
         if cfg!(test) {
             return Ok(());
         }
-        match Self::entry(account)?.delete_credential() {
+        match self.entry(account)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(error) => Err(error.to_string()),
         }
@@ -128,9 +149,10 @@ impl CredentialStore {
     /// A keychain lookup that records the first failure instead of aborting,
     /// so the composition helpers stay pure functions of the catalog.
     fn lookup_recording<'a>(
+        &'a self,
         failure: &'a std::cell::RefCell<Option<String>>,
     ) -> impl Fn(&str) -> Option<String> + 'a {
-        move |account| match Self::get(account) {
+        move |account| match self.get(account) {
             Ok(value) => value,
             Err(error) => {
                 failure.borrow_mut().get_or_insert(error);
@@ -149,7 +171,7 @@ impl CredentialStore {
             .map(|group| {
                 group_status(
                     group,
-                    Self::lookup_recording(&failure),
+                    self.lookup_recording(&failure),
                     process_env,
                     providers,
                 )
@@ -172,7 +194,7 @@ impl CredentialStore {
         let failure = std::cell::RefCell::new(None);
         let status = group_status(
             group,
-            Self::lookup_recording(&failure),
+            self.lookup_recording(&failure),
             process_env,
             providers,
         );
@@ -188,7 +210,7 @@ impl CredentialStore {
         let failure = std::cell::RefCell::new(None);
         let values = compose_sidecar_environment(
             catalog(),
-            Self::lookup_recording(&failure),
+            self.lookup_recording(&failure),
             process_env,
             providers,
         );
@@ -571,6 +593,13 @@ struct RuntimeState {
     /// restart can never slip between an assistant job's launch and its
     /// request, and two callers never launch two sidecars.
     sidecar_lifecycle: tokio::sync::Mutex<()>,
+    /// An update is being downloaded or installed; sessions, model and GPU
+    /// pack changes and sidecar launches are refused until it ends (it
+    /// normally ends with a restart). Set under the `core` lock, see
+    /// `updater::claim_install`.
+    updating: std::sync::atomic::AtomicBool,
+    /// The last update check and the download in progress.
+    updater: updater::UpdateRegistry,
 }
 
 fn project_root() -> PathBuf {
@@ -635,7 +664,7 @@ impl Default for RuntimeState {
             store: tokio::sync::OnceCell::new(),
             preferences_path: std::sync::OnceLock::new(),
             logs_directory: std::sync::OnceLock::new(),
-            credentials: CredentialStore,
+            credentials: CredentialStore::default(),
             sidecar_environment_stale: std::sync::atomic::AtomicBool::new(false),
             catalog_mismatch_reported: std::sync::atomic::AtomicBool::new(false),
             models: std::sync::OnceLock::new(),
@@ -650,6 +679,8 @@ impl Default for RuntimeState {
             warmup_in_progress: std::sync::atomic::AtomicBool::new(false),
             assistant: assistant::AssistantRegistry::default(),
             sidecar_lifecycle: tokio::sync::Mutex::new(()),
+            updating: std::sync::atomic::AtomicBool::new(false),
+            updater: updater::UpdateRegistry::default(),
         }
     }
 }
@@ -767,6 +798,11 @@ impl RuntimeState {
         app: Option<&AppHandle>,
         user: SidecarUser,
     ) -> Result<(), String> {
+        // The update shuts the sidecar down and replaces its files; nothing
+        // may bring it back meanwhile.
+        if self.updating.load(Ordering::Acquire) {
+            return Err(updater::UPDATE_IN_PROGRESS.into());
+        }
         if self.sidecar_environment_stale.load(Ordering::Acquire) {
             if self.assistant.any_in_flight() {
                 self.log_desktop_event("sidecar_restart_deferred reason=assistant_job_running");
@@ -1042,6 +1078,12 @@ impl RuntimeState {
             .is_ok_and(|preferences| preferences.gpu_acceleration)
     }
 
+    fn check_updates_at_launch(&self) -> bool {
+        self.runtime_preferences
+            .lock()
+            .is_ok_and(|preferences| preferences.check_updates_at_launch)
+    }
+
     /// The pack runtime when the user wants it and the installed pack has a
     /// usable CUDA device; `None` selects the bundled CPU runtime.
     fn desired_gpu_runtime(&self) -> Option<GpuRuntimeLayout> {
@@ -1116,6 +1158,9 @@ struct RuntimePreferences {
     /// Run the local models on the NVIDIA acceleration pack when it is
     /// installed and usable. Changed only through `set_gpu_acceleration`.
     gpu_acceleration: bool,
+    /// Ask the update server for a newer version shortly after launch.
+    /// Files written before updates existed load with it on.
+    check_updates_at_launch: bool,
 }
 
 impl Default for RuntimePreferences {
@@ -1125,6 +1170,7 @@ impl Default for RuntimePreferences {
             providers: ProviderSettings::new(),
             assistant: AssistantPreferences::default(),
             gpu_acceleration: true,
+            check_updates_at_launch: true,
         }
     }
 }
@@ -1451,12 +1497,15 @@ fn list_providers() -> Result<Value, String> {
 /// Keychain reads can block (or prompt), so they run off the async runtime.
 #[tauri::command]
 async fn credential_status(
+    app: AppHandle,
     state: State<'_, RuntimeState>,
 ) -> Result<Vec<CredentialGroupStatus>, String> {
     let providers = state.provider_settings()?;
-    tauri::async_runtime::spawn_blocking(move || CredentialStore.status(&providers))
-        .await
-        .map_err(|error| error.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<RuntimeState>().credentials.status(&providers)
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1482,7 +1531,7 @@ async fn set_credentials(
     for field in &group.fields {
         stored.insert(
             field.keychain_account.as_str(),
-            CredentialStore::get(&field.keychain_account)?.is_some(),
+            state.credentials.get(&field.keychain_account)?.is_some(),
         );
     }
     let writes = plan_credential_update(group, &fields, |account| {
@@ -1492,13 +1541,13 @@ async fn set_credentials(
     let mut created = Vec::new();
     for write in &writes {
         let result = match write {
-            CredentialWrite::Set { account, value } => CredentialStore::set(account, value),
-            CredentialWrite::Delete { account } => CredentialStore::delete(account),
+            CredentialWrite::Set { account, value } => state.credentials.set(account, value),
+            CredentialWrite::Delete { account } => state.credentials.delete(account),
         };
         if let Err(error) = result {
             // Never leave a group half-saved: undo entries this call created.
             for account in created {
-                let _ = CredentialStore::delete(account);
+                let _ = state.credentials.delete(account);
             }
             return Err(error);
         }
@@ -1521,7 +1570,7 @@ async fn clear_credentials(
 ) -> Result<CredentialGroupStatus, String> {
     let group = credential_group(&group_id)?;
     for field in &group.fields {
-        CredentialStore::delete(&field.keychain_account)?;
+        state.credentials.delete(&field.keychain_account)?;
     }
     state.invalidate_sidecar_environment().await;
     state
@@ -1746,6 +1795,11 @@ async fn begin_model_change<'a>(
         state,
         model_id: model_id.to_string(),
     };
+    // Checked after registering the change: an update that starts in
+    // between sees the registration and refuses instead.
+    if state.updating.load(Ordering::Acquire) {
+        return Err(updater::UPDATE_IN_PROGRESS.into());
+    }
     if status.role == runtime_manager::ModelRole::Alignment {
         if state.assistant.any_running() {
             return Err(assistant::ASSISTANT_BUSY.into());
@@ -1831,6 +1885,9 @@ async fn install_gpu_pack(
 ) -> Result<GpuAccelerationStatus, String> {
     if !state.is_idle() {
         return Err(GPU_SESSION_BUSY.into());
+    }
+    if state.updating.load(Ordering::Acquire) {
+        return Err(updater::UPDATE_IN_PROGRESS.into());
     }
     let status = state.gpu_status().await?;
     if !status.supported_platform || !status.eligible {
@@ -2872,7 +2929,10 @@ fn warm_local_runtimes(app: AppHandle) {
                 .lock()
                 .map_err(|_| "runtime preferences lock poisoned".to_string())?
                 .preload_local_models;
-            if !enabled || !state.onboarding_complete.load(Ordering::Acquire) {
+            if !enabled
+                || !state.onboarding_complete.load(Ordering::Acquire)
+                || state.updating.load(Ordering::Acquire)
+            {
                 return Ok(Vec::new());
             }
             if state.snapshot()?.phase != SessionPhase::Idle {
@@ -2926,12 +2986,18 @@ async fn start_session(
     state: State<'_, RuntimeState>,
     request: StartSessionRequest,
 ) -> Result<SessionSnapshot, String> {
-    let starting = state
-        .core
-        .lock()
-        .map_err(|_| "app core lock poisoned".to_string())?
-        .start(request)
-        .map_err(|error| error.to_string())?;
+    let starting = {
+        let mut core = state
+            .core
+            .lock()
+            .map_err(|_| "app core lock poisoned".to_string())?;
+        // An update sets `updating` under this lock, so no session can
+        // start once it has checked that none runs.
+        if state.updating.load(Ordering::Acquire) {
+            return Err(updater::UPDATE_IN_PROGRESS.into());
+        }
+        core.start(request).map_err(|error| error.to_string())?
+    };
     state.emit_snapshot(&app, &starting)?;
     let result = async {
         let session_config = starting
@@ -3308,6 +3374,9 @@ pub fn run() {
     }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        // Driven from Rust only (see `updater`); the webview has no updater
+        // permission.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(RuntimeState::default())
         .invoke_handler(tauri::generate_handler![
             get_app_snapshot,
@@ -3358,9 +3427,17 @@ pub fn run() {
             assistant::cancel_session_notes,
             assistant::generate_session_title,
             assistant::import_context_files,
+            updater::get_update_status,
+            updater::check_for_update,
+            updater::install_update,
         ])
         .setup(|app| {
             let state = app.state::<RuntimeState>();
+            // Before anything reads the secure store (the desktop log's
+            // redaction does).
+            state
+                .credentials
+                .set_service(keychain_service(&app.config().identifier));
             // Local (not roaming) data: models and runtimes are gigabytes.
             // Identical to the app data directory on macOS and Linux.
             let app_data_directory = app.path().app_local_data_dir()?;
@@ -3463,6 +3540,7 @@ pub fn run() {
             if std::env::var("ECHOLINGO_PRELOAD_LOCAL_MODELS").as_deref() != Ok("0") {
                 warm_local_runtimes(app.handle().clone());
             }
+            updater::schedule_launch_check(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -4074,6 +4152,46 @@ mod tests {
     }
 
     #[test]
+    fn update_checks_at_launch_default_on_and_survive_older_files() {
+        let legacy: RuntimePreferences =
+            serde_json::from_str(r#"{"preload_local_models": false, "gpu_acceleration": false}"#)
+                .unwrap();
+        assert!(legacy.check_updates_at_launch);
+        let off: RuntimePreferences =
+            serde_json::from_str(r#"{"check_updates_at_launch": false}"#).unwrap();
+        assert!(!off.check_updates_at_launch && off.preload_local_models);
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preferences.json");
+        let mut preferences = DesktopPreferences::default();
+        preferences.runtime.check_updates_at_launch = false;
+        save_preferences(&path, &preferences).unwrap();
+        assert!(!load_preferences(&path).runtime.check_updates_at_launch);
+    }
+
+    #[test]
+    fn keychain_service_keeps_the_production_name_and_isolates_test_builds() {
+        // Every earlier release stored keys under this service name.
+        const PRODUCTION_SERVICE: &str = "app.echolingo.desktop";
+        let config: Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let identifier = config["identifier"].as_str().unwrap();
+        assert_eq!(keychain_service(identifier), PRODUCTION_SERVICE);
+        let test_build = format!("{identifier}{}", updater::UPDATE_TEST_IDENTIFIER_SUFFIX);
+        assert_ne!(keychain_service(&test_build), PRODUCTION_SERVICE);
+        assert_eq!(
+            keychain_service(&test_build),
+            "app.echolingo.desktop.updatetest"
+        );
+
+        // Nothing reaches a secure store before `setup` names the service.
+        let store = CredentialStore::default();
+        assert!(store.entry("dashscope_api_key").is_err());
+        store.set_service(keychain_service(identifier));
+        store.set_service("another".into());
+        assert_eq!(store.service.get().map(String::as_str), Some(PRODUCTION_SERVICE));
+    }
+
+    #[test]
     fn model_changes_stop_the_services_that_hold_their_files() {
         assert_eq!(services_using_model("qwen3-asr-0.6b"), ["qwen_asr"]);
         assert_eq!(services_using_model("hymt2-1.8b"), ["hymt"]);
@@ -4137,6 +4255,16 @@ mod tests {
         let change = begin_model_change(&state, aligner).await.unwrap();
         assert!(state.model_changing(aligner));
         drop(change);
+
+        // An update in progress refuses model changes and leaves none
+        // registered.
+        state.updating.store(true, Ordering::Release);
+        assert_eq!(
+            begin_model_change(&state, "hymt2-1.8b").await.err().unwrap(),
+            updater::UPDATE_IN_PROGRESS
+        );
+        assert!(!state.model_changing("hymt2-1.8b"));
+        state.updating.store(false, Ordering::Release);
 
         state
             .core

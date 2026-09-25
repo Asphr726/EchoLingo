@@ -25,6 +25,12 @@ serde_json.workspace = true
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2.4"
 raw-window-handle = "0.6"
+# TLS for the updater's HTTP client: the rustls + aws-lc-rs stack hf-hub and
+# the GPU pack already use. The plugin's own `rustls-tls` feature is left
+# off because it would compile ring and install it as the process-wide
+# rustls provider.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+tauri-plugin-updater = { version = "2.12", default-features = false, features = ["system-proxy", "zip"] }
 tokio.workspace = true
 uuid.workspace = true
 
