@@ -618,6 +618,35 @@ def test_without_a_usable_vad_the_context_stays_on() -> None:
     assert rig.decode("")[0] == CONTEXT_PROMPT and rig.streamer.context_latches == 1
 
 
+def test_a_vad_failure_never_flips_the_prompt_of_a_committed_or_latched_segment() -> None:
+    words = "so the gradient flows back through every layer"
+    vad = LoudnessVad()
+    rig = GateRig(timeline=SpeechTimeline(vad), echolingo_silence_roll_ms=0)
+    for _ in range(2):  # text committed on the plain prompt
+        rig.audio(1.0, speech=False)
+        assert rig.decode(words)[0] == PLAIN_PROMPT
+    assert rig.streamer.last_committed_text
+    vad.fail = True
+    for _ in range(2):
+        rig.audio(1.0, speech=False)
+        assert rig.decode(words + " and")[0] == PLAIN_PROMPT
+    assert rig.streamer.context_latches == 0 and rig.streamer.context_latches_deferred == 1
+    # After the roll the VAD is gone: the context is on from the first decode.
+    rig.streamer.roll_segment()
+    rig.audio(1.0, speech=False)
+    assert rig.decode("")[0] == CONTEXT_PROMPT
+
+    vad = LoudnessVad()
+    rig = GateRig(timeline=SpeechTimeline(vad), echolingo_silence_roll_ms=0)
+    rig.audio(1.0, speech=True)
+    assert rig.decode("Okay so")[0] == CONTEXT_PROMPT
+    vad.fail = True
+    for _ in range(3):
+        rig.audio(1.0, speech=False)
+        assert rig.decode("Okay so")[0] == CONTEXT_PROMPT
+    assert rig.streamer.context_latches == 1
+
+
 def _latched_goodbye(**overrides) -> GateRig:
     # A pause roll needs 400 steps here, so only the silence roll can fire.
     rig = GateRig(echolingo_pause_roll_min_steps=400, **overrides)

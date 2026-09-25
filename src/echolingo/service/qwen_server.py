@@ -563,7 +563,10 @@ def make_online_processor_class(base: type) -> type:
             self._attach_speech_timeline()
 
         def insert_audio_chunk(self, audio: Any, audio_stream_end_time: float) -> Any:
-            # The timeline and the mel extractor count the same samples.
+            # The timeline and the mel extractor count the same samples. This
+            # runs on the event loop and the decodes in a worker thread, but
+            # WhisperLiveKit awaits each process_iter/start_silence/finish
+            # before it inserts the next chunk, so they never overlap.
             timeline = self._speech_timeline
             if timeline is not None:
                 timeline.feed(audio)
@@ -573,7 +576,8 @@ def make_online_processor_class(base: type) -> type:
             finished = getattr(self, "streamer", None)
             result = super().start_silence()
             log_context_gate_counters(finished)
-            # The streamer and the mel extractor were rebuilt from sample 0.
+            # The streamer was rebuilt and the mel extractor reset: both count
+            # from sample 0 again.
             if self._speech_timeline is not None:
                 self._speech_timeline.reset()
             self._attach_speech_timeline()
