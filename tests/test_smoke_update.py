@@ -137,13 +137,18 @@ def test_archive_version_reads_the_bundled_info_plist(tmp_path) -> None:
 
 def test_recording_server_records_finished_downloads_and_misses(tmp_path) -> None:
     (tmp_path / "latest.json").write_text('{"version": "0.3.1"}')
+    # The server records a path after the response is sent, so the client can
+    # see the answer a moment before the record exists.
+    def recorded(name: str) -> bool:
+        return smoke.wait_for(lambda: server.served(name), 5, 0.01)
+
     with smoke.RecordingServer(tmp_path, 0) as server:
         with urllib.request.urlopen(server.url("latest.json"), timeout=10) as response:
             assert json.loads(response.read()) == {"version": "0.3.1"}
-        assert server.served("latest.json") and not server.served("B.app.tar.gz")
+        assert recorded("latest.json") and not server.served("B.app.tar.gz")
         with pytest.raises(urllib.error.HTTPError):
             urllib.request.urlopen(server.url("B.app.tar.gz"), timeout=10)
-        assert server.served("B.app.tar.gz")
+        assert recorded("B.app.tar.gz")
         server.clear()
         assert not server.served("latest.json")
 
