@@ -9,6 +9,16 @@
 //! event, whose payload is the whole [`UpdateStatus`] (download progress
 //! included, at most about ten events a second).
 //!
+//! Only the download is signed, not `latest.json`, and the plugin's own
+//! "newer than the running version" test reads the manifest's `version`.
+//! `plugins.updater.requireSignedVersion` therefore stays on: the plugin
+//! then also refuses a download whose signature (its minisign trusted
+//! comment) does not name that same version, so a tampered manifest cannot
+//! pair a higher version number with an older, genuinely signed release to
+//! force a downgrade. The Tauri CLI writes the version into the signature
+//! from 2.11.5 on; `scripts/update_manifest.py` refuses to publish a
+//! manifest whose signatures lack it.
+//!
 //! `desktop.log` records one `update check result=...` line per check and
 //! `update install state=...` lines for every install step. URLs in those
 //! lines and in error messages lose their query strings, which carry the
@@ -999,6 +1009,26 @@ mod tests {
             assert_eq!(serde_json::to_value(state).unwrap(), name);
         }
         assert_eq!(release_url("v0.3.2"), release_url("0.3.2"));
+    }
+
+    #[test]
+    fn the_shipped_config_requires_the_signed_version() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        // Parsed as the plugin parses it, so a misspelt key cannot pass.
+        let updater: tauri_plugin_updater::Config =
+            serde_json::from_value(config["plugins"]["updater"].clone()).unwrap();
+        assert!(updater.require_signed_version);
+        assert!(!updater.allow_downgrades);
+        assert!(!updater.dangerous_insecure_transport_protocol);
+        assert_eq!(
+            updater
+                .endpoints
+                .iter()
+                .map(|url| url.as_str())
+                .collect::<Vec<_>>(),
+            ["https://github.com/Asphr726/EchoLingo/releases/download/updater/latest.json"]
+        );
     }
 
     #[test]

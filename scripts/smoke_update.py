@@ -55,7 +55,12 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from update_manifest import format_key_id, public_key_id, signature_key_id  # noqa: E402
+from update_manifest import (  # noqa: E402
+    check_signed_version,
+    format_key_id,
+    public_key_id,
+    signature_key_id,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,6 +70,9 @@ DEFAULT_PORT = 18473
 CASES = ("equal", "tampered", "update")
 INSTALLED_PATTERN = r"(?i)\bupdate\b.*\binstalled\b.*\b{version}\b"
 REJECTED_PATTERN = r"(?i)\bupdate\b.*(fail|error|invalid|signature|reject)"
+# The first Tauri CLI that writes the app version into updater signatures, which
+# the app requires (plugins.updater.requireSignedVersion).
+MIN_TAURI_CLI = (2, 11, 5)
 SIDECAR = Path("apps/desktop/src-tauri/binaries/echolingo-sidecar-aarch64-apple-darwin")
 LLAMA_SERVER = Path("apps/desktop/src-tauri/runtimes/llama.cpp/llama-server")
 
@@ -323,6 +331,14 @@ def ensure_key(repo: Path, key: Path) -> str:
     return pubkey
 
 
+def installed_cli_version(repo: Path) -> tuple[int, ...] | None:
+    try:
+        manifest = json.loads((repo / "node_modules/@tauri-apps/cli/package.json").read_text("utf-8"))
+        return parse_version(str(manifest["version"]))
+    except (OSError, ValueError, KeyError):
+        return None
+
+
 def check_build_inputs(repo: Path) -> None:
     missing = [
         str(path)
@@ -335,6 +351,14 @@ def check_build_inputs(repo: Path) -> None:
         raise RuntimeError(
             "cannot build the test apps; missing " + ", ".join(missing)
             + " (npm install, scripts/build_sidecar.py, scripts/fetch_llama_runtime.py)"
+        )
+    cli = installed_cli_version(repo)
+    if cli is None or cli < MIN_TAURI_CLI:
+        found = ".".join(map(str, cli)) if cli else "unknown"
+        required = ".".join(map(str, MIN_TAURI_CLI))
+        raise RuntimeError(
+            f"node_modules has Tauri CLI {found}; {required} or later signs the version the app "
+            "requires (run npm ci)"
         )
 
 
@@ -394,6 +418,8 @@ def build_apps(args: argparse.Namespace, work: Path) -> Apps:
         raise RuntimeError(f"B ({apps.version_b}) must be newer than A ({apps.version_a})")
     print(f"A {apps.version_a}: {apps.app_a}\nB {apps.version_b}: {apps.archive_b}")
     print(f"B is signed by key {format_key_id(signature_key_id(apps.signature_b, apps.archive_b.name))}")
+    # A would reject B as tampered, and the update case would fail for the wrong reason.
+    check_signed_version(apps.signature_b, f"{apps.archive_b.name}.sig", apps.version_b)
     return apps
 
 

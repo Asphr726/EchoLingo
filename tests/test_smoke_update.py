@@ -188,3 +188,17 @@ def test_dry_run_prints_the_plan_and_touches_nothing(tmp_path, capsys) -> None:
 def test_unknown_cases_are_rejected() -> None:
     with pytest.raises(SystemExit):
         smoke.parse_args(["--cases", "equal,downgrade"])
+
+
+def test_builds_need_a_tauri_cli_that_signs_the_version(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(smoke.shutil, "which", lambda name: f"/usr/bin/{name}")
+    for path in ("node_modules/.bin/tauri", smoke.SIDECAR, smoke.LLAMA_SERVER):
+        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / path).write_text("")
+    cli = tmp_path / "node_modules/@tauri-apps/cli/package.json"
+    cli.parent.mkdir(parents=True)
+    cli.write_text('{"version": "2.11.4"}')
+    with pytest.raises(RuntimeError, match="Tauri CLI 2.11.4; 2.11.5 or later"):
+        smoke.check_build_inputs(tmp_path)
+    cli.write_text('{"version": "2.11.5"}')
+    smoke.check_build_inputs(tmp_path)

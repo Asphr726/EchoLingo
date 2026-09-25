@@ -391,8 +391,14 @@ def test_updater_plugin_uses_the_production_key_and_manifest() -> None:
     assert config["plugins"]["updater"] == {
         "pubkey": UPDATER_PUBKEY,
         "endpoints": ["https://github.com/Asphr726/EchoLingo/releases/download/updater/latest.json"],
+        # A download must be signed for the version latest.json announces.
+        "requireSignedVersion": True,
         "windows": {"installMode": "passive"},
     }
+    # Only the Tauri CLI from 2.11.5 on writes that version into the signature.
+    cli = _json(ROOT / "package-lock.json")["packages"]["node_modules/@tauri-apps/cli"]["version"]
+    assert tuple(int(part) for part in cli.split(".")) >= (2, 11, 5)
+    assert _json(ROOT / "apps/desktop/package.json")["devDependencies"]["@tauri-apps/cli"] == "^2.11.5"
     manifest = load_script("update_manifest")
     assert manifest.format_key_id(manifest.public_key_id(UPDATER_PUBKEY)) == "73D4256EED3D1630"
 
@@ -438,13 +444,30 @@ def test_production_configs_have_no_dangerous_keys() -> None:
     assert results.failures == []
 
 
+def test_release_config_check_requires_signed_versions(tmp_path) -> None:
+    smoke = load_script("smoke_packaged")
+    for name in ("tauri.conf.json", "tauri.updater.conf.json"):
+        (tmp_path / name).write_text((TAURI / name).read_text(encoding="utf-8"), encoding="utf-8")
+    config = _json(tmp_path / "tauri.conf.json")
+    del config["plugins"]["updater"]["requireSignedVersion"]
+    config["plugins"]["updater"]["allowDowngrades"] = True
+    (tmp_path / "tauri.conf.json").write_text(json.dumps(config), encoding="utf-8")
+    results = smoke.Results()
+    smoke.check_configs(tmp_path, results)
+    assert results.failures == [
+        "plugins.updater.requireSignedVersion must be true",
+        "plugins.updater.allowDowngrades must not ship",
+    ]
+
+
 def _minisign(comment: str, payload: bytes, trailer: str = "") -> str:
     text = f"untrusted comment: {comment}\n{base64.b64encode(payload).decode()}\n{trailer}"
     return base64.b64encode(text.encode()).decode()
 
 
-def _signature(key_id: bytes) -> str:
-    trailer = "trusted comment: timestamp:1\tfile:x\n" + base64.b64encode(bytes(64)).decode() + "\n"
+def _signature(key_id: bytes, version: str | None = "0.3.0") -> str:
+    comment = "timestamp:1\tfile:x" + (f"\tversion:{version}" if version else "")
+    trailer = f"trusted comment: {comment}\n" + base64.b64encode(bytes(64)).decode() + "\n"
     return _minisign("signature from tauri secret key", b"ED" + key_id + bytes(64), trailer)
 
 
@@ -454,17 +477,23 @@ def test_packaged_smoke_checks_updater_signature_key_ids(tmp_path) -> None:
     setup = tmp_path / "EchoLingo_0.3.0_x64-setup.exe"
     setup.write_bytes(b"MZ")
     results = smoke.Results()
-    smoke.check_signature(setup, key_id, results)
+    smoke.check_signature(setup, key_id, results, "0.3.0")
     assert results.failures == ["EchoLingo_0.3.0_x64-setup.exe: no updater signature "
                                 "EchoLingo_0.3.0_x64-setup.exe.sig"]
     (tmp_path / f"{setup.name}.sig").write_text(_signature(key_id))
     results = smoke.Results()
-    smoke.check_signature(setup, key_id, results)
-    assert results.failures == [] and "73D4256EED3D1630" in results.lines[0]
+    smoke.check_signature(setup, key_id, results, "0.3.0")
+    assert results.failures == [] and "73D4256EED3D1630 for version 0.3.0" in results.lines[0]
     (tmp_path / f"{setup.name}.sig").write_text(_signature(bytes(8)))
     results = smoke.Results()
-    smoke.check_signature(setup, key_id, results)
+    smoke.check_signature(setup, key_id, results, "0.3.0")
     assert "signed by key 0000000000000000" in results.failures[0]
+    # The app refuses a signature without the version or for another version.
+    for version, message in ((None, "does not name the version"), ("0.2.9", "signed for version 0.2.9")):
+        (tmp_path / f"{setup.name}.sig").write_text(_signature(key_id, version))
+        results = smoke.Results()
+        smoke.check_signature(setup, key_id, results, "0.3.0")
+        assert len(results.failures) == 1 and message in results.failures[0]
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="needs tar and codesign on macOS")
@@ -494,7 +523,9 @@ def test_packaged_smoke_checks_the_macos_updater_archive(tmp_path) -> None:
     results = smoke.Results()
     smoke.check_macos_updater(bundle, "0.3.1", key_id, results, required=True)
     assert results.failures == [
-        "EchoLingo_0.3.0_aarch64.app.tar.gz: CFBundleShortVersionString '0.3.0' != '0.3.1'"
+        "EchoLingo_0.3.0_aarch64.app.tar.gz.sig was signed for version 0.3.0, not 0.3.1; "
+        "installed copies would reject this update",
+        "EchoLingo_0.3.0_aarch64.app.tar.gz: CFBundleShortVersionString '0.3.0' != '0.3.1'",
     ]
 
     # Editing the signed bundle breaks its seal.
@@ -502,6 +533,7 @@ def test_packaged_smoke_checks_the_macos_updater_archive(tmp_path) -> None:
     with (app / "Contents/Info.plist").open("wb") as handle:
         plistlib.dump(info, handle)
     subprocess.run(["tar", "-czf", str(archive), "-C", str(app.parent), app.name], check=True)
+    Path(f"{archive}.sig").write_text(_signature(key_id, "0.3.1"))
     results = smoke.Results()
     smoke.check_macos_updater(bundle, "0.3.1", key_id, results, required=True)
     assert len(results.failures) == 1 and "codesign" in results.failures[0]

@@ -49,8 +49,9 @@ def public_key(key_id: bytes = KEY_ID) -> str:
     return minisign(f"minisign public key: {key_id[::-1].hex().upper()}", b"Ed" + key_id + bytes(32))
 
 
-def signature(key_id: bytes = KEY_ID, name: str = MACOS) -> str:
-    trailer = f"trusted comment: timestamp:1790000000\tfile:{name}\n{base64.b64encode(bytes(64)).decode()}\n"
+def signature(key_id: bytes = KEY_ID, name: str = MACOS, version: str | None = "0.3.0") -> str:
+    comment = f"timestamp:1790000000\tfile:{name}" + (f"\tversion:{version}" if version else "")
+    trailer = f"trusted comment: {comment}\n{base64.b64encode(bytes(64)).decode()}\n"
     return minisign("signature from tauri secret key", b"ED" + key_id + bytes(64), trailer)
 
 
@@ -142,8 +143,14 @@ class FakeOpener:
         return FakeResponse(200)
 
 
-def gh_for(*names: str, draft: bool = False, key_id: bytes = KEY_ID) -> FakeGh:
-    signatures = {f"{name}.sig": signature(key_id, name) for name in names if not name.endswith(".sig")}
+def gh_for(
+    *names: str, draft: bool = False, key_id: bytes = KEY_ID, signed_version: str | None = "0.3.0"
+) -> FakeGh:
+    signatures = {
+        f"{name}.sig": signature(key_id, name, signed_version)
+        for name in names
+        if not name.endswith(".sig")
+    }
     return FakeGh({"v0.3.0": release(*names, draft=draft)}, signatures)
 
 
@@ -235,6 +242,25 @@ def test_a_signature_from_another_key_is_refused(tmp_path, capsys) -> None:
     error = capsys.readouterr().err
     assert "signed by key 1817161514131211" in error
     assert "trusts 0807060504030201" in error
+
+
+def test_the_signature_must_name_the_manifest_version(tmp_path, capsys) -> None:
+    assert um.signed_version(signature(), "x.sig") == "0.3.0"
+    assert um.signed_version(signature(version=None), "x.sig") is None
+    with pytest.raises(um.ManifestError, match="has no trusted comment"):
+        um.signed_version(public_key(), "x.sig")
+    um.check_signed_version(signature(version="v0.3.0"), "x.sig", "0.3.0")
+
+    # Signed by a CLI that does not record the version: the app would refuse it.
+    gh = gh_for(MACOS, f"{MACOS}.sig", signed_version=None)
+    assert run(tmp_path, gh, "--dry-run") == 1
+    assert f"{MACOS}.sig does not name the version it was signed for" in capsys.readouterr().err
+
+    # An older release's signature under a newer manifest version.
+    gh = gh_for(MACOS, f"{MACOS}.sig", signed_version="0.2.9")
+    assert run(tmp_path / "older", gh, "--publish") == 1
+    assert f"{MACOS}.sig was signed for version 0.2.9, not 0.3.0" in capsys.readouterr().err
+    assert ("release", "upload") not in gh.commands()
 
 
 def test_the_tag_must_match_the_app_version(tmp_path, capsys) -> None:

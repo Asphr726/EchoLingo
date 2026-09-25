@@ -11,8 +11,9 @@ After a version's macOS pre-release has been published::
     python scripts/update_manifest.py --tag v0.3.0 --publish
 
 reads that release with the ``gh`` CLI, copies the signature of each signed
-updater asset verbatim from its ``.sig`` file, checks the release version and
-the signing key against apps/desktop/src-tauri/tauri.conf.json, confirms that
+updater asset verbatim from its ``.sig`` file, checks the release version, the
+signing key and the version each signature was made for against
+apps/desktop/src-tauri/tauri.conf.json, confirms that
 every download answers without credentials and replaces latest.json on the
 ``updater`` release (creating it on the default branch the first time).
 ``--allow-draft --out FILE`` writes the manifest of a draft for review and
@@ -170,6 +171,43 @@ def check_signing_key(signatures: dict[str, str], pubkey: str) -> None:
                 f"{asset}.sig was signed by key {format_key_id(actual)}, but tauri.conf.json "
                 f"trusts {format_key_id(expected)}; installed copies would reject this update"
             )
+
+
+def signed_version(signature: str, what: str) -> str | None:
+    """The ``version:`` field of a .sig file's trusted comment, or None without one.
+
+    The Tauri CLI (2.11.5 and later) signs ``timestamp:...<TAB>file:...<TAB>version:X``
+    as the trusted comment, which minisign's global signature covers. With
+    ``plugins.updater.requireSignedVersion`` the app refuses a download whose signed
+    version is missing or differs from the manifest's ``version``, so a tampered
+    manifest cannot pair a new version number with an older release.
+    """
+    try:
+        lines = base64.b64decode(signature, validate=True).decode("utf-8").splitlines()
+    except ValueError as error:
+        raise ManifestError(f"{what} is not a minisign signature ({error})") from error
+    prefix = "trusted comment: "
+    comment = next((line[len(prefix):] for line in lines if line.startswith(prefix)), None)
+    if comment is None:
+        raise ManifestError(f"{what} has no trusted comment")
+    return next(
+        (field[len("version:"):] for field in comment.split("\t") if field.startswith("version:")),
+        None,
+    )
+
+
+def check_signed_version(signature: str, what: str, version: str) -> None:
+    signed = signed_version(signature, what)
+    if signed is None:
+        raise ManifestError(
+            f"{what} does not name the version it was signed for (signed by a Tauri CLI older "
+            "than 2.11.5?); installed copies require it"
+        )
+    if signed.removeprefix("v") != version:
+        raise ManifestError(
+            f"{what} was signed for version {signed}, not {version}; installed copies would "
+            "reject this update"
+        )
 
 
 # --- release contents ----------------------------------------------------------------
@@ -382,6 +420,8 @@ def create_manifest(
     with tempfile.TemporaryDirectory() as scratch:
         signatures = download_signatures(args.tag, args.repo, assets.values(), runner, Path(scratch))
     check_signing_key(signatures, pubkey)
+    for asset, signature in signatures.items():
+        check_signed_version(signature, f"{asset}.sig", version)
     if args.notes_file is not None:
         notes = args.notes_file.read_text(encoding="utf-8").strip()
     else:

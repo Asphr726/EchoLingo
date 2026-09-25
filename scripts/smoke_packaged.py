@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from update_manifest import (  # noqa: E402
     ManifestError,
+    check_signed_version,
     format_key_id,
     public_key_id,
     signature_key_id,
@@ -232,6 +233,11 @@ def check_configs(tauri_dir: Path, results: Results) -> None:
         results.ok(f"updater public key {format_key_id(public_key_id(str(updater.get('pubkey', ''))))}")
     except ManifestError as error:
         results.fail(str(error))
+    # Without these, a tampered latest.json could offer an older signed release.
+    if updater.get("requireSignedVersion") is not True:
+        results.fail("plugins.updater.requireSignedVersion must be true")
+    if updater.get("allowDowngrades"):
+        results.fail("plugins.updater.allowDowngrades must not ship")
     endpoints = updater.get("endpoints") or []
     if not endpoints or not all(str(url).startswith("https://") for url in endpoints):
         results.fail(f"updater endpoints must all be https: {endpoints}")
@@ -239,7 +245,7 @@ def check_configs(tauri_dir: Path, results: Results) -> None:
         results.ok(f"updater endpoints {', '.join(endpoints)}")
 
 
-def check_signature(signed: Path, key_id: bytes | None, results: Results) -> None:
+def check_signature(signed: Path, key_id: bytes | None, results: Results, version: str) -> None:
     signature = signed.with_name(signed.name + ".sig")
     if not signature.is_file():
         results.fail(f"{signed.name}: no updater signature {signature.name}")
@@ -247,8 +253,9 @@ def check_signature(signed: Path, key_id: bytes | None, results: Results) -> Non
     if key_id is None:
         results.fail(f"{signature.name}: tauri.conf.json has no valid plugins.updater.pubkey")
         return
+    text = signature.read_text(encoding="utf-8")
     try:
-        actual = signature_key_id(signature.read_text(encoding="utf-8"), signature.name)
+        actual = signature_key_id(text, signature.name)
     except ManifestError as error:
         results.fail(str(error))
         return
@@ -257,8 +264,14 @@ def check_signature(signed: Path, key_id: bytes | None, results: Results) -> Non
             f"{signature.name}: signed by key {format_key_id(actual)}, "
             f"but the app trusts {format_key_id(key_id)}"
         )
-    else:
-        results.ok(f"{signature.name}: signed by key {format_key_id(actual)}")
+        return
+    try:
+        # The app requires the signed version to match latest.json's.
+        check_signed_version(text, signature.name, version)
+    except ManifestError as error:
+        results.fail(str(error))
+        return
+    results.ok(f"{signature.name}: signed by key {format_key_id(actual)} for version {version}")
 
 
 def check_app_bundle(app: Path, version: str, results: Results, label: str) -> None:
@@ -292,7 +305,7 @@ def check_macos_updater(
         return
     for archive in archives:
         check_size(archive, results)
-        check_signature(archive, key_id, results)
+        check_signature(archive, key_id, results, version)
         # The updater replaces the installed app with exactly this tree.
         with tempfile.TemporaryDirectory() as scratch:
             extracted = subprocess.run(
@@ -388,7 +401,7 @@ def bundle_windows(
     check_size(installer, results)
     # The updater downloads and runs this same installer.
     if updater or installer.with_name(installer.name + ".sig").exists():
-        check_signature(installer, key_id, results)
+        check_signature(installer, key_id, results, version)
     if install_dir is None:
         return
     completed = install_nsis(installer, install_dir)
