@@ -134,6 +134,20 @@ def test_mixed_lines_follow_the_majority_of_their_letters() -> None:
     assert parsed.domain == f"{TITLE} {parsed.translation_domain}"
 
 
+def test_cyrillic_and_cantonese_sessions_keep_their_scripts() -> None:
+    for code in ("bg", "sr-Cyrl", "kk", "ru"):
+        parsed = parse_session_context("Машинно обучение\n机器学习", source_language=code)
+        assert parsed.hint_terms == ("Машинно обучение",), code
+        assert parsed.translation_domain == "机器学习"
+    cantonese = parse_session_context("機器學習\nМашинно обучение", source_language="yue")
+    assert cantonese.hint_terms == ("機器學習",)
+    assert cantonese.translation_domain == "Машинно обучение"
+    # Greek (like every alphabet below U+2000) counts as Latin: kept anywhere.
+    assert parse_session_context("Μηχανική μάθηση", source_language="el").hint_terms == (
+        "Μηχανική μάθηση",
+    )
+
+
 def test_a_topic_label_does_not_decide_the_script_of_its_line() -> None:
     from echolingo.assistant.terms import compose_context
 

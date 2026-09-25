@@ -152,13 +152,18 @@ def _is_cjk(char: str) -> bool:
 
 # Scripts a recognizer can use in its prompt, per source language. Latin is
 # always allowed: technical terms, names and acronyms are written in it
-# everywhere.
+# everywhere. Other languages get Latin only; ``_script`` reports every other
+# alphabet below U+2000 (Greek, Arabic, Devanagari, ...) as Latin, so only
+# Cyrillic and the CJK scripts need listing.
 _ASR_SCRIPTS: dict[str, frozenset[str]] = {
     "zh": frozenset({"han", "latin"}),
+    "yue": frozenset({"han", "latin"}),
     "ja": frozenset({"han", "kana", "latin"}),
     "ko": frozenset({"hangul", "han", "latin"}),
-    "ru": frozenset({"cyrillic", "latin"}),
-    "uk": frozenset({"cyrillic", "latin"}),
+    **{
+        code: frozenset({"cyrillic", "latin"})
+        for code in ("be", "bg", "kk", "ky", "mk", "mn", "ru", "sr", "tg", "uk")
+    },
 }
 _DEFAULT_ASR_SCRIPTS = frozenset({"latin"})
 
