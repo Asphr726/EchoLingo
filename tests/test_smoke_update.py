@@ -76,9 +76,17 @@ def test_log_patterns_are_tolerant_but_pin_the_version() -> None:
     assert installed.search("Update installed: EchoLingo 0.3.1, restarting")
     assert not installed.search("update install state=downloading version=0.3.1")
     assert not installed.search("update install state=installed version=0.3.10")
+    # The lines updater.rs writes.
     rejected = smoke.version_pattern(smoke.REJECTED_PATTERN, "0.3.1")
-    assert rejected.search("update install state=failed error=signature verification failed")
-    assert not rejected.search("update check state=available version=0.3.1")
+    assert rejected.search(
+        "2026-09-30T10:00:00Z update install state=failed version=0.3.1 stage=verify error=signature"
+    )
+    assert not rejected.search("update install state=failed version=0.3.1 stage=download error=reset")
+    assert not rejected.search("update check result=error current=0.3.0 trigger=test error=offline")
+    relaunched = smoke.version_pattern(smoke.RELAUNCHED_PATTERN, "0.3.1")
+    assert relaunched.search("update check result=up_to_date version=0.3.1 current=0.3.1 trigger=test")
+    assert not relaunched.search("update check result=up_to_date version=0.3.0 current=0.3.0 trigger=test")
+    assert not relaunched.search("update check result=up_to_date version=0.3.1 current=0.3.1 trigger=launch")
     custom = smoke.version_pattern(r"installed v{version}$", "1.2.3")
     assert custom.search("installed v1.2.3") and not custom.search("installed v1x2x3")
 

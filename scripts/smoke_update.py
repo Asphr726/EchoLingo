@@ -20,7 +20,8 @@ ECHOLINGO_UPDATE_INSTALL_ON_LAUNCH=1 and ECHOLINGO_PRELOAD_LOCAL_MODELS=0:
     must reject it and stay unchanged and validly signed.
 ``update``
     B's archive: A must become B in place (Info.plist version and
-    ``codesign --verify --deep --strict``), start again and log the install.
+    ``codesign --verify --deep --strict``), log the install, start again and,
+    as B, find itself up to date.
 
 Builds are kept in ``<work-dir>/builds``; ``--app-a`` and ``--app-b-dir`` reuse
 them instead of rebuilding. macOS may ask whether the test app may read
@@ -69,7 +70,10 @@ TEST_PRODUCT = "EchoLingo UpdateTest"
 DEFAULT_PORT = 18473
 CASES = ("equal", "tampered", "update")
 INSTALLED_PATTERN = r"(?i)\bupdate\b.*\binstalled\b.*\b{version}\b"
-REJECTED_PATTERN = r"(?i)\bupdate\b.*(fail|error|invalid|signature|reject)"
+# desktop.log when the signature check refuses a download.
+REJECTED_PATTERN = r"\bupdate install state=failed version={version} stage=verify\b"
+# The restarted app runs the test hook again and finds itself up to date.
+RELAUNCHED_PATTERN = r"\bupdate check result=up_to_date version={version} current={version} trigger=test\b"
 # The first Tauri CLI that writes the app version into updater signatures, which
 # the app requires (plugins.updater.requireSignedVersion).
 MIN_TAURI_CLI = (2, 11, 5)
@@ -538,7 +542,7 @@ def case_tampered(context: Context) -> None:
         if context.report.check(fetched, "tampered: the app downloaded the archive"):
             wait_for(lambda: watcher.search(rejected) is not None, context.args.grace)
         line = watcher.search(rejected)
-        context.report.note(f"tampered: rejection logged: {line.strip() if line else 'no matching line'}")
+        context.report.check(bool(line), f"tampered: rejection logged: {line.strip() if line else 'no matching line'}")
         check_unchanged(context, "tampered")
         context.report.check(process.poll() is None, "tampered: the app kept running")
     finally:
@@ -551,6 +555,7 @@ def case_update(context: Context) -> None:
     manifest = manifest_for(context.apps.version_b, context.server.url(archive), context.apps.signature_b)
     process, watcher = start_case(context, "update", manifest)
     installed = version_pattern(context.args.installed_log_pattern, context.apps.version_b)
+    relaunched_log = version_pattern(RELAUNCHED_PATTERN, context.apps.version_b)
     state: dict[str, Any] = {}
 
     def updated() -> bool:
@@ -559,7 +564,13 @@ def case_update(context: Context) -> None:
         main_binary = context.app / "Contents/MacOS" / str(info.get("CFBundleExecutable", ""))
         state["relaunched"] = [pid for pid, _ in running_under(str(main_binary)) if pid != process.pid]
         state["log"] = watcher.search(installed)
-        if state["version"] != context.apps.version_b or not state["relaunched"] or not state["log"]:
+        state["relaunch_log"] = watcher.search(relaunched_log)
+        if (
+            state["version"] != context.apps.version_b
+            or not state["relaunched"]
+            or not state["log"]
+            or not state["relaunch_log"]
+        ):
             return False
         state["codesign"] = codesign_verify(context.app)
         return state["codesign"][0]
@@ -578,6 +589,9 @@ def case_update(context: Context) -> None:
         line = state.get("log")
         logged = line.strip() if line else "no matching line"
         context.report.check(bool(line), f"update: install logged: {logged}")
+        line = state.get("relaunch_log")
+        logged = line.strip() if line else "no matching line"
+        context.report.check(bool(line), f"update: the new version checked again: {logged}")
         if not done:
             tail = watcher.text()[-2000:]
             context.report.note(f"update: gave up after {context.args.timeout:.0f} s; log tail:\n{tail}")
