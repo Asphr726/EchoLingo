@@ -16,16 +16,21 @@ transcript-upload flag is set.
 
 from __future__ import annotations
 
+import json
+import logging
 import re
+from collections.abc import AsyncIterator
 from urllib.parse import urlsplit
 
 import httpx
 
 from ...errors import AuthenticationError, ConfigurationError, PolicyDeniedError
-from ...models import BackendDescriptor, TranslationRequest
+from ...models import BackendDescriptor, CanonicalTranslationEvent, TranslationRequest
 from ...translation.policy import TranslationRequestError
 from ._text import LANGUAGE_NAMES, strip_instruction_echo, strip_wrapping_quotes
 from .chat_base import COMMIT_TIMEOUT_S, OpenAiCompatibleChatTranslation
+
+logger = logging.getLogger(__name__)
 
 CUSTOM_PROVIDER = "custom_chat"
 
@@ -48,7 +53,8 @@ STREAM_USAGE_PROVIDERS: frozenset[str] = frozenset(
 
 # Presets whose models reason ("think") before answering unless the request
 # turns it off, with the field that does. Reasoning would spend the small
-# caption budget before any translation is written.
+# caption budget before any translation is written. An endpoint that rejects
+# the field (HTTP 400/422 naming it) gets requests without it from then on.
 THINKING_OFF_FIELDS: dict[str, tuple[str, object]] = {
     "deepseek_chat": ("thinking", {"type": "disabled"}),
 }
@@ -68,6 +74,11 @@ _LABEL_PREFIX = re.compile(
     r"\s*\**\s*[:：]\s*\**\s*",
     re.IGNORECASE,
 )
+
+
+class _ThinkingFieldRejected(TranslationRequestError):
+    """The endpoint refused the thinking-off field the request carried; the
+    request is sent once more without it."""
 
 
 def language_label(code: str) -> str:
@@ -102,6 +113,9 @@ class OpenAiChatTranslation(OpenAiCompatibleChatTranslation):
         self.provider = provider
         self.provider_id = provider
         self.display_name = DISPLAY_NAMES.get(provider, provider)
+        # Dropped for the rest of this backend's life once the endpoint
+        # rejects it.
+        self._thinking_off = THINKING_OFF_FIELDS.get(provider)
         self.temperature = float(temperature)
         self.max_output_tokens = int(max_output_tokens)
         self.background_spans = int(background_spans)
@@ -228,10 +242,41 @@ class OpenAiChatTranslation(OpenAiCompatibleChatTranslation):
         }
         if stream and self.provider in STREAM_USAGE_PROVIDERS:
             payload["stream_options"] = {"include_usage": True}
-        thinking_off = THINKING_OFF_FIELDS.get(self.provider)
-        if thinking_off is not None:
-            payload[thinking_off[0]] = thinking_off[1]
+        if self._thinking_off is not None:
+            name, value = self._thinking_off
+            payload[name] = value
         return payload
+
+    # ------------------------------------------------------------- requests
+
+    def translate_incremental(
+        self, request: TranslationRequest
+    ) -> AsyncIterator[CanonicalTranslationEvent]:
+        start = super().translate_incremental
+
+        async def generate():
+            events = start(request)
+            try:
+                # The status is checked before the first event, so a request
+                # whose thinking field was rejected has emitted nothing yet.
+                try:
+                    first = await anext(events)
+                except _ThinkingFieldRejected:
+                    events = start(request)
+                    first = await anext(events)
+                yield first
+                async for event in events:
+                    yield event
+            finally:
+                await events.aclose()
+
+        return generate()
+
+    async def retranslate_window(self, request: TranslationRequest) -> CanonicalTranslationEvent:
+        try:
+            return await super().retranslate_window(request)
+        except _ThinkingFieldRejected:
+            return await super().retranslate_window(request)
 
     # --------------------------------------------------------------- answers
 
@@ -245,13 +290,39 @@ class OpenAiChatTranslation(OpenAiCompatibleChatTranslation):
             return text.lstrip()
         return cleaned
 
+    def _thinking_rejected(self, response: httpx.Response, body: str) -> bool:
+        """Whether an HTTP 400/422 names the thinking-off field that the
+        rejected request carried. The field is then left out of every later
+        request."""
+        field = THINKING_OFF_FIELDS.get(self.provider)
+        if field is None or field[0] not in body.lower():
+            return False
+        if not _request_has_field(response, field[0]):
+            return False
+        if self._thinking_off is not None:
+            self._thinking_off = None
+            logger.info(
+                "%s rejected the %r request field (HTTP %d); sending requests without it",
+                self.display_name,
+                field[0],
+                response.status_code,
+            )
+        return True
+
     async def raise_status(self, response: httpx.Response, request: TranslationRequest) -> None:
-        if response.status_code == 400:
+        if response.status_code in (400, 422):
             body = ""
             try:
                 body = (await response.aread()).decode("utf-8", "replace")[:300]
             except Exception:  # pragma: no cover - diagnostics only
                 body = ""
+            if self._thinking_rejected(response, body):
+                raise _ThinkingFieldRejected(
+                    "bad_request",
+                    f"{self.display_name} rejected the request (HTTP {response.status_code})",
+                    retry_without_context=False,
+                )
+        if response.status_code == 400:
             lowered = body.lower()
             if "api key" in lowered and ("valid" in lowered or "invalid" in lowered):
                 # Gemini's OpenAI endpoint answers 400 (not 401) for a bad key.
@@ -274,6 +345,15 @@ class OpenAiChatTranslation(OpenAiCompatibleChatTranslation):
         await super().raise_status(response, request)
 
 
+def _request_has_field(response: httpx.Response, name: str) -> bool:
+    """Whether the request that got ``response`` had a top-level ``name``."""
+    try:
+        payload = json.loads(response.request.content)
+    except (RuntimeError, ValueError):
+        return False
+    return isinstance(payload, dict) and name in payload
+
+
 def _is_loopback(base_url: str) -> bool:
     try:
         host = (urlsplit(base_url).hostname or "").lower()
@@ -287,5 +367,6 @@ __all__ = [
     "OPENROUTER_HEADERS",
     "OpenAiChatTranslation",
     "STREAM_USAGE_PROVIDERS",
+    "THINKING_OFF_FIELDS",
     "language_label",
 ]

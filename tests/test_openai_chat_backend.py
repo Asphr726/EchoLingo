@@ -152,6 +152,68 @@ def test_deepseek_requests_turn_thinking_off() -> None:
         assert "thinking" not in other.build_payload(request(), model="m", stream=True)
 
 
+async def test_rejected_thinking_field_is_dropped_and_the_request_retried_once(caplog) -> None:
+    seen: list[dict] = []
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        payload = json.loads(http_request.content)
+        seen.append(payload)
+        if "thinking" in payload:
+            status = 400 if payload["stream"] else 422
+            return httpx.Response(status, json={"error": {"message": "Unknown parameter: 'thinking'"}})
+        if payload["stream"]:
+            return httpx.Response(200, text=sse("你好", finish="stop"))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "你好"}, "finish_reason": "stop"}]})
+
+    adapter = backend("deepseek_chat", handler)
+    with caplog.at_level(logging.INFO):
+        events = [event async for event in adapter.translate_incremental(contextual_request())]
+    assert [event.kind for event in events] == [TranslationKind.PARTIAL, TranslationKind.FINAL]
+    assert events[-1].text == "你好"
+    assert ["thinking" in payload for payload in seen] == [True, False]
+    assert seen[1]["messages"] == seen[0]["messages"]
+    # Later requests leave the field out without another rejection.
+    assert (await adapter.retranslate_window(request())).text == "你好"
+    [event async for event in adapter.translate_incremental(request())]
+    assert ["thinking" in payload for payload in seen] == [True, False, False, False]
+    await adapter.close()
+    assert "DeepSeek rejected the 'thinking' request field (HTTP 400)" in caplog.text
+    assert KEY not in caplog.text and "Unknown parameter" not in caplog.text and "hello" not in caplog.text
+
+    # A window retranslation (HTTP 422) recovers the same way.
+    seen.clear()
+    adapter = backend("deepseek_chat", handler)
+    assert (await adapter.retranslate_window(request())).text == "你好"
+    assert ["thinking" in payload for payload in seen] == [True, False]
+    await adapter.close()
+
+
+async def test_rejections_naming_thinking_are_not_retried_without_the_field() -> None:
+    calls = 0
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(400, json={"error": {"message": "thinking budget exceeded"}})
+
+    # The field was not sent, so there is nothing to drop: the usual error.
+    adapter = backend("openai_chat", handler)
+    with pytest.raises(TranslationRequestError) as failure:
+        [event async for event in adapter.translate_incremental(contextual_request())]
+    assert failure.value.error_code == "http_400" and failure.value.retry_without_context is True
+    assert calls == 1
+    await adapter.close()
+
+    # The field was sent and the retry without it fails too: reported once.
+    calls = 0
+    adapter = backend("deepseek_chat", handler)
+    with pytest.raises(TranslationRequestError) as failure:
+        await adapter.retranslate_window(contextual_request())
+    assert failure.value.error_code == "http_400"
+    assert calls == 2
+    await adapter.close()
+
+
 def test_display_names_cover_every_registered_preset() -> None:
     assert set(DISPLAY_NAMES) == set(CHAT_PRESETS)
     assert DISPLAY_NAMES["custom_chat"] == "Custom endpoint"

@@ -136,7 +136,9 @@ The user message is the source text alone. `max_tokens` is
 `min(max_output_tokens, max(24, 3 × source length + 16))`. DeepSeek requests
 also carry `"thinking": {"type": "disabled"}`: its current models
 (`deepseek-flash`, `deepseek-v4-pro`) reason before answering by default,
-which would spend that budget before any translation is written.
+which would spend that budget before any translation is written. If the
+endpoint rejects the field (HTTP 400/422 naming `thinking`), the request is
+sent once more without it and later requests leave it out.
 
 Answers are cleaned of a leading "Translation:" / "译文：" label, "Here is the
 translation:" preambles and wrapping quotes. A stream that repeats the same
