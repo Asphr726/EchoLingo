@@ -79,9 +79,10 @@ _THINKING_OFF: dict[str, tuple[str, Any]] = {
 # short tasks that ask for it (titles, the probe, term lists).
 _THINKING_OFF_ALWAYS = frozenset({"dashscope"})
 
-_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
-_THINK_OPEN = "<think>"
-_THINK_CLOSE = "</think>"
+_THINK_OPEN = re.compile(r"<think>", re.IGNORECASE)
+_THINK_CLOSE = re.compile(r"</think>", re.IGNORECASE)
+_LEADING_THINK_BLOCK = re.compile(r"\s*<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_LEADING_THINK_OPEN = re.compile(r"\s*<think>", re.IGNORECASE)
 
 
 class AssistantError(BackendError):
@@ -197,21 +198,23 @@ def add_usage(total: dict[str, int], usage: Mapping[str, int] | None) -> None:
 
 def strip_reasoning(text: str) -> str:
     """Drop the ``<think>…</think>`` reasoning that self-hosted reasoning
-    models (Ollama and similar) put in the answer text.
+    models (Ollama and similar) put before the answer text.
 
-    A reply cut off inside a leading, unterminated block has no answer and
-    becomes empty; a stray closing tag (chat templates that open the block in
-    the prompt) drops everything before it.
+    Only reasoning ahead of the answer is removed: leading blocks, and
+    everything before a first closing tag that has no opening tag before it
+    (chat templates that open the block in the prompt). A reply cut off
+    inside a leading, unterminated block has no answer and becomes empty.
+    Tags inside the answer are kept as written.
     """
-    lowered = text.lower()
-    if _THINK_OPEN not in lowered and _THINK_CLOSE not in lowered:
+    opened = _THINK_OPEN.search(text)
+    close = _THINK_CLOSE.search(text)
+    if opened is None and close is None:
         return text
-    text = _THINK_BLOCK.sub("", text)
-    lowered = text.lower()
-    close = lowered.rfind(_THINK_CLOSE)
-    if close >= 0:
-        text = text[close + len(_THINK_CLOSE) :]
-    elif lowered.lstrip().startswith(_THINK_OPEN):
+    if close is not None and (opened is None or close.start() < opened.start()):
+        text = text[close.end() :]
+    while (block := _LEADING_THINK_BLOCK.match(text)) is not None:
+        text = text[block.end() :]
+    if _LEADING_THINK_OPEN.match(text):
         return ""
     return text.lstrip()
 

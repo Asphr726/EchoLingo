@@ -539,7 +539,12 @@ async def test_dashscope_rejecting_enable_thinking_drops_it() -> None:
         ("  \n<think>\nunterminated", ""),
         ("reasoning opened by the chat template</think>\nSaccades", "Saccades"),
         ("Plain answer", "Plain answer"),
-        ("Title <think>aside</think>", "Title "),
+        # Tags inside the answer are content (a lecture on reasoning models).
+        ("Title <think>aside</think>", "Title <think>aside</think>"),
+        ("<think>a</think>Use </think> to end a block", "Use </think> to end a block"),
+        # Case folding that changes the length does not shift the cut.
+        ("İstanbul reasoning</think>Answer", "Answer"),
+        ("<think>İİ</think>Answer", "Answer"),
     ],
 )
 def test_strip_reasoning(raw, text) -> None:
