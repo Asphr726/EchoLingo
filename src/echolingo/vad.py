@@ -50,25 +50,42 @@ class SileroOnnxVad:
     """Stateful Silero VAD v5/v6 ONNX adapter for 16 kHz streams."""
 
     name = "silero_vad_onnx"
+    FRAME_SAMPLES = 512
 
-    def __init__(self, model_path: Path) -> None:
+    def __init__(self, model_path: Path, *, threads: int | None = 1) -> None:
+        """``threads`` bounds onnxruntime's intra/inter-op pools (``None``: its
+        defaults). One thread is plenty for a 32 ms frame and keeps the VAD
+        from competing with a model runtime in the same process."""
         try:
             import onnxruntime as ort
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("Silero ONNX VAD requires the 'audio' extra") from exc
-        self._session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+        options = None
+        if threads is not None:
+            options = ort.SessionOptions()
+            options.intra_op_num_threads = int(threads)
+            options.inter_op_num_threads = int(threads)
+        self._session = ort.InferenceSession(
+            str(model_path), sess_options=options, providers=["CPUExecutionProvider"]
+        )
         self._input_names = {value.name for value in self._session.get_inputs()}
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
         self._context = np.zeros((64,), dtype=np.float32)
         self._pending = np.empty((0,), dtype=np.float32)
         self._last_probability = 0.0
 
-    def probability(self, mono_16khz: FloatAudio) -> float:
+    def frame_probabilities(self, mono_16khz: FloatAudio) -> np.ndarray:
+        """Speech probability of every complete 512-sample frame, in order.
+
+        A trailing partial frame is kept and completed by the next call, so
+        frame ``i`` of the stream always covers samples ``[512 i, 512 (i + 1))``.
+        """
+        frame = self.FRAME_SAMPLES
         audio = np.concatenate((self._pending, np.asarray(mono_16khz, dtype=np.float32).reshape(-1)))
-        offset = 0
-        while offset + 512 <= audio.size:
-            chunk = audio[offset : offset + 512]
-            offset += 512
+        count = audio.size // frame
+        probabilities = np.empty((count,), dtype=np.float32)
+        for index in range(count):
+            chunk = audio[index * frame : (index + 1) * frame]
             inputs: dict[str, np.ndarray] = {}
             if "input" in self._input_names:
                 inputs["input"] = np.concatenate((self._context, chunk))[None, :]
@@ -79,11 +96,17 @@ class SileroOnnxVad:
             if "sr" in self._input_names:
                 inputs["sr"] = np.array(16_000, dtype=np.int64)
             outputs = self._session.run(None, inputs)
-            self._last_probability = float(np.asarray(outputs[0]).reshape(-1)[0])
+            probabilities[index] = float(np.asarray(outputs[0]).reshape(-1)[0])
             if len(outputs) > 1 and np.asarray(outputs[1]).shape == self._state.shape:
                 self._state = np.asarray(outputs[1], dtype=np.float32)
             self._context = chunk[-64:].copy()
-        self._pending = audio[offset:].copy()
+        self._pending = audio[count * frame :].copy()
+        if count:
+            self._last_probability = float(probabilities[-1])
+        return probabilities
+
+    def probability(self, mono_16khz: FloatAudio) -> float:
+        self.frame_probabilities(mono_16khz)
         return self._last_probability
 
     def reset(self) -> None:

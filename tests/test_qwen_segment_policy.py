@@ -1,12 +1,21 @@
+import sys
+import types
+from pathlib import Path
+
+import numpy as np
+import pytest
+
 from echolingo.service.qwen_segment_policy import (
     ASR_CONTEXT_MAX_CHARS,
     PauseRollTracker,
+    SpeechTimeline,
     decode_asr_context,
     encode_asr_context,
     ends_with_sentence_mark,
     sanitize_asr_context,
     strip_edge_punct,
 )
+from echolingo.vad import SileroOnnxVad
 
 
 def test_strip_edge_punct_removes_invented_marks_but_keeps_words() -> None:
@@ -74,3 +83,161 @@ def test_delayed_punctuation_roll_keeps_segments_short() -> None:
     # An unchanged hypothesis is a pause, not a punctuation roll.
     tracker.observe("That is the whole idea.", new_steps=12, cached_steps=110)
     assert tracker.observe("That is the whole idea.", new_steps=12, cached_steps=122) == "pause"
+
+
+# ---------------------------------------------------------------------------
+# Speech timeline
+# ---------------------------------------------------------------------------
+
+
+class LoudnessVad:
+    """Silero stand-in: 512-sample frames, probability 0.9 when loud, else 0."""
+
+    def __init__(self) -> None:
+        self.pending = np.zeros(0, dtype=np.float32)
+        self.resets = 0
+
+    def frame_probabilities(self, audio) -> np.ndarray:
+        audio = np.concatenate((self.pending, np.asarray(audio, dtype=np.float32)))
+        count = audio.size // 512
+        frames = audio[: count * 512].reshape(count, 512)
+        self.pending = audio[count * 512 :]
+        return np.where(np.abs(frames).mean(axis=1) > 0.1, 0.9, 0.0).astype(np.float32)
+
+    def reset(self) -> None:
+        self.pending = np.zeros(0, dtype=np.float32)
+        self.resets += 1
+
+
+def _stream(speech_frames: set[int], frames: int, tail: int = 0) -> np.ndarray:
+    audio = np.zeros(frames * 512 + tail, dtype=np.float32)
+    for index in speech_frames:
+        audio[index * 512 : (index + 1) * 512] = 0.5
+    return audio
+
+
+def test_speech_timeline_keeps_frame_boundaries_across_odd_chunk_sizes() -> None:
+    timeline = SpeechTimeline(LoudnessVad())
+    audio = _stream({3, 4, 5}, 10, tail=300)
+    offset = 0
+    for size in (100, 700, 1, 1234, 999, 17):
+        timeline.feed(audio[offset : offset + size])
+        offset += size
+    timeline.feed(audio[offset:])
+    assert timeline.available and timeline.frames == 10  # the 300-sample tail is pending
+    assert timeline.speech_samples(0, 10 * 512) == 3 * 512
+    assert timeline.speech_samples(0, 3 * 512) == 0
+    assert timeline.speech_samples(1600, 2000) == 400  # partial frame overlap
+    assert timeline.speech_samples(2000, 1600) == 0
+    assert timeline.speech_samples(0, 10**9) == 3 * 512  # beyond the classified frames
+    assert timeline.last_speech_end(0, 10 * 512) == 6 * 512
+    assert timeline.last_speech_end(0, 2000) == 2000  # clipped to the query
+    assert timeline.last_speech_end(6 * 512, 10 * 512) is None
+    # The pending (silent) tail and a loud continuation make one speech frame.
+    timeline.feed(np.full(212, 1.0, dtype=np.float32))
+    assert timeline.frames == 11 and timeline.speech_samples(10 * 512, 11 * 512) == 512
+
+
+def test_speech_timeline_threshold_is_inclusive() -> None:
+    class Scripted:
+        def frame_probabilities(self, audio):
+            return np.asarray([0.2, 0.25, 0.3], dtype=np.float32)
+
+        def reset(self) -> None:
+            pass
+
+    timeline = SpeechTimeline(Scripted(), threshold=0.25)
+    timeline.feed(np.zeros(3 * 512, dtype=np.float32))
+    assert timeline.speech_samples(0, 3 * 512) == 2 * 512
+    assert timeline.last_speech_end(0, 512) is None
+
+
+def test_speech_timeline_reset_and_trim() -> None:
+    vad = LoudnessVad()
+    timeline = SpeechTimeline(vad, keep_seconds=4 * 512 / 16_000)  # keeps 4 frames
+    timeline.feed(_stream({1, 8}, 10))
+    assert timeline.frames == 10
+    # Frame 1 was trimmed away and reads as non-speech; frame 8 is kept.
+    assert timeline.speech_samples(0, 2 * 512) == 0
+    assert timeline.speech_samples(0, 10 * 512) == 512
+    assert timeline.last_speech_end(0, 10 * 512) == 9 * 512
+    timeline.feed(np.full(100, 0.5, dtype=np.float32))
+    timeline.reset()
+    assert vad.resets == 1 and vad.pending.size == 0
+    assert timeline.frames == 0 and timeline.speech_samples(0, 10**6) == 0
+    timeline.feed(_stream({0}, 1))
+    assert timeline.last_speech_end(0, 512) == 512
+
+
+def test_speech_timeline_without_a_working_vad_is_unavailable() -> None:
+    timeline = SpeechTimeline(None)
+    timeline.feed(np.ones(2048, dtype=np.float32))
+    assert not timeline.available
+    assert timeline.speech_samples(0, 2048) == 0 and timeline.last_speech_end(0, 2048) is None
+
+    class Broken:
+        def frame_probabilities(self, audio):
+            raise RuntimeError("onnxruntime failed")
+
+        def reset(self) -> None:
+            pass
+
+    timeline = SpeechTimeline(Broken())
+    assert timeline.available
+    timeline.feed(np.ones(2048, dtype=np.float32))
+    assert not timeline.available and timeline.frames == 0
+
+
+def test_silero_frame_probabilities_keep_the_partial_frame(monkeypatch) -> None:
+    sessions: list = []
+    runs: list = []
+
+    class Input:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    class Options:
+        intra_op_num_threads = 0
+        inter_op_num_threads = 0
+
+    class Session:
+        def __init__(self, path, sess_options=None, providers=None) -> None:
+            self.options = sess_options
+            self.providers = providers
+            sessions.append(self)
+
+        def get_inputs(self):
+            return [Input("input"), Input("state"), Input("sr")]
+
+        def run(self, _names, inputs):
+            window = inputs["input"]
+            runs.append(window.shape)
+            probability = float(np.abs(window[0, 64:]).mean())
+            return [np.array([[probability]], dtype=np.float32), inputs["state"] + 1.0]
+
+    fake = types.ModuleType("onnxruntime")
+    fake.InferenceSession = Session
+    fake.SessionOptions = Options
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake)
+
+    vad = SileroOnnxVad(Path("silero_vad.onnx"))
+    assert sessions[-1].options.intra_op_num_threads == 1
+    assert sessions[-1].options.inter_op_num_threads == 1
+    assert sessions[-1].providers == ["CPUExecutionProvider"]
+    audio = np.concatenate(
+        (np.full(512, 0.5), np.zeros(512), np.full(300, 0.25))
+    ).astype(np.float32)
+    probabilities = vad.frame_probabilities(audio)
+    assert probabilities.shape == (2,)
+    assert probabilities[0] == pytest.approx(0.5) and probabilities[1] == 0.0
+    assert runs == [(1, 576), (1, 576)]  # 64 context samples + one frame
+    # The 300 pending samples and 212 new ones make exactly one frame.
+    assert vad.frame_probabilities(np.full(212, 0.25, dtype=np.float32)) == pytest.approx([0.25])
+    assert vad.frame_probabilities(np.zeros(100, dtype=np.float32)).shape == (0,)
+    # probability() delegates and still reports the last complete frame.
+    assert vad.probability(np.zeros(100, dtype=np.float32)) == pytest.approx(0.25)
+    assert vad.probability(np.zeros(312, dtype=np.float32)) == 0.0
+    vad.reset()
+    assert vad.frame_probabilities(np.zeros(511, dtype=np.float32)).shape == (0,)
+    SileroOnnxVad(Path("silero_vad.onnx"), threads=None)
+    assert sessions[-1].options is None  # onnxruntime defaults

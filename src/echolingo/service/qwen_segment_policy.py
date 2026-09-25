@@ -11,14 +11,23 @@ decoder without context and turns one sentence into two fragments. A segment
 now rolls on a sentence mark only once a pause confirms it — the hypothesis
 stays unchanged while more audio arrives — and a forced (step-cap) roll drops
 the invented edge mark before the text is committed.
+
+``SpeechTimeline`` records where the stream held speech so the streamer can
+keep the lecture context out of the prompt while a segment is still silent.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import logging
 import re
 import unicodedata
+from typing import Any
+
+import numpy as np
+
+logger = logging.getLogger(__name__)
 
 SENTENCE_END_CHARS = ".!?。！？…"
 CLOSING_TRAIL_CHARS = "\"'»”’)]」』）】"
@@ -130,6 +139,109 @@ class PauseRollTracker:
         else:
             self.reset()
         return None
+
+
+# ---------------------------------------------------------------------------
+# Speech timeline (gates the lecture context in the ASR prompt)
+# ---------------------------------------------------------------------------
+
+
+class SpeechTimeline:
+    """Per-frame speech flags on a session's 16 kHz sample clock.
+
+    ``vad`` is any object with ``frame_probabilities(audio) -> array`` (one
+    probability per complete frame of ``frame_samples``, the partial tail kept
+    for the next call) and ``reset()``. Frame ``i`` covers samples
+    ``[i * frame_samples, (i + 1) * frame_samples)`` counted from the last
+    ``reset``. Only about the last ``keep_seconds`` are kept; older samples
+    read as non-speech.
+
+    Without a VAD, or once it raised, the timeline is unavailable and every
+    query reports no speech; callers check ``available`` first.
+    """
+
+    def __init__(
+        self,
+        vad: Any = None,
+        *,
+        threshold: float = 0.25,
+        frame_samples: int = 512,
+        sample_rate_hz: int = 16_000,
+        keep_seconds: float = 60.0,
+    ) -> None:
+        self._vad = vad
+        self.threshold = float(threshold)
+        self.frame_samples = max(1, int(frame_samples))
+        self.sample_rate_hz = int(sample_rate_hz)
+        self._max_frames = max(1, int(keep_seconds * self.sample_rate_hz) // self.frame_samples)
+        self._available = vad is not None
+        self._flags = np.zeros((0,), dtype=bool)
+        self._first_frame = 0  # stream index of self._flags[0]
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    @property
+    def frames(self) -> int:
+        """Complete frames classified since the last reset."""
+        return self._first_frame + int(self._flags.size)
+
+    def feed(self, audio: Any) -> None:
+        if not self._available:
+            return
+        try:
+            probabilities = np.asarray(self._vad.frame_probabilities(audio), dtype=np.float32)
+        except Exception as error:  # the gate falls back to "context always on"
+            self._available = False
+            logger.warning("speech timeline disabled: VAD failed (%s)", error)
+            return
+        if not probabilities.size:
+            return
+        self._flags = np.concatenate((self._flags, probabilities.reshape(-1) >= self.threshold))
+        excess = int(self._flags.size) - self._max_frames
+        if excess > 0:
+            self._flags = self._flags[excess:]
+            self._first_frame += excess
+
+    def reset(self) -> None:
+        self._flags = np.zeros((0,), dtype=bool)
+        self._first_frame = 0
+        if self._available:
+            try:
+                self._vad.reset()
+            except Exception as error:
+                self._available = False
+                logger.warning("speech timeline disabled: VAD reset failed (%s)", error)
+
+    def _speech_frames(self, start: int, end: int) -> np.ndarray:
+        """Stream indices of speech frames overlapping samples ``[start, end)``."""
+        if end <= start or not self._flags.size:
+            return np.zeros((0,), dtype=np.int64)
+        size = self.frame_samples
+        first = max(int(start) // size, self._first_frame)
+        last = min(-(-int(end) // size), self.frames)  # exclusive
+        if last <= first:
+            return np.zeros((0,), dtype=np.int64)
+        window = self._flags[first - self._first_frame : last - self._first_frame]
+        return np.flatnonzero(window).astype(np.int64) + first
+
+    def speech_samples(self, start: int, end: int) -> int:
+        """Samples of ``[start, end)`` inside speech frames."""
+        frames = self._speech_frames(start, end)
+        if not frames.size:
+            return 0
+        size = self.frame_samples
+        begins = np.maximum(frames * size, int(start))
+        ends = np.minimum((frames + 1) * size, int(end))
+        return int(np.sum(ends - begins))
+
+    def last_speech_end(self, start: int, end: int) -> int | None:
+        """End sample of the last speech inside ``[start, end)``, or None."""
+        frames = self._speech_frames(start, end)
+        if not frames.size:
+            return None
+        return min((int(frames[-1]) + 1) * self.frame_samples, int(end))
 
 
 # ---------------------------------------------------------------------------

@@ -70,10 +70,18 @@ def test_install_streaming_policy_wraps_backend_and_warms_up(monkeypatch) -> Non
     monkeypatch.setitem(sys.modules, "whisperlivekit", fake_package)
     monkeypatch.setitem(sys.modules, "whisperlivekit.qwen3_streaming", fake_module)
 
+    def no_vad(threshold):
+        raise AssertionError("the warm-up has no session context and never loads the VAD")
+
+    monkeypatch.setattr(qwen_server, "make_speech_timeline", no_vad)
     policy = {"repetition_penalty": 1.1, "segment_punct_rollover": True, "unknown_knob": 5}
     wrapped = qwen_server.install_streaming_policy(policy, warmup_seconds=0.5)
     assert fake_module.Qwen3StreamingASR is wrapped
     assert wrapped.__name__ == "FakeAsr"
+    # WhisperLiveKit's online_factory picks the processor up from the module.
+    processor_class = fake_module.Qwen3StreamingOnlineProcessor
+    assert processor_class.__name__ == "EchoLingoQwen3StreamingOnlineProcessor"
+    assert issubclass(processor_class, FakeProcessor)
 
     asr = fake_module.Qwen3StreamingASR(qwen3_streaming_device="cpu")
     assert asr.kwargs == {"qwen3_streaming_device": "cpu"}
@@ -123,13 +131,17 @@ class WordTokenizer:
         return "".join(self.vocabulary[i] for i in ids)
 
 
-def _streamer(**overrides):
+def _streamer(*, prompt_prefix_template=None, **overrides):
     streamer_module = pytest.importorskip("qwen3_asr_causal.streamer")
     cls = qwen_server.make_segmented_streamer_class(
         streamer_module.SegmentedCachedFullHypothesisStreamer
     )
     config = streamer_module.CachedFullHypothesisConfig(
-        wait_token_id=0, word_start_token_id=1, hold_back_words=4, stable_iterations=1
+        wait_token_id=0,
+        word_start_token_id=1,
+        hold_back_words=4,
+        stable_iterations=1,
+        prompt_prefix_template=prompt_prefix_template,
     )
     values = dict(
         model=None,
@@ -147,10 +159,13 @@ def _streamer(**overrides):
     return cls(**values)
 
 
-def _feed(streamer, text: str, cached_steps: int, new_steps: int = 12) -> dict:
+def _feed(
+    streamer, text: str, cached_steps: int, new_steps: int = 12, *, is_flush: bool = False
+) -> dict:
     return streamer.update_from_hypothesis(
         streamer.tokenizer.ids(text),
         audio_sec=cached_steps * 0.08,
+        is_flush=is_flush,
         new_cached_steps=new_steps,
         cached_steps=cached_steps,
     )
@@ -280,6 +295,12 @@ def test_build_streamer_adds_the_session_context_to_the_prompt(monkeypatch) -> N
     )
     assert biased.config.prompt_prefix_template == [len(expected)]
     assert biased.segment_prompt_base_context == "Terms: Béla Julesz, saccade"
+    # The context gate gets the context-free prompt and its settings; a
+    # session without a context has nothing to gate.
+    assert plain.echolingo_plain_prompt_template is None
+    assert biased.echolingo_plain_prompt_template == [1]
+    assert biased.echolingo_context_gate is True
+    assert biased.echolingo_silence_roll_ms == 2000
 
 
 async def test_context_middleware_sets_and_resets_the_session_context() -> None:
@@ -401,3 +422,351 @@ def test_cuda_dtype_hook_wraps_the_real_upstream_resolution() -> None:
         # An explicit --qwen3-streaming-dtype always wins.
         _, dtype = qwen_server.resolve_model_device_dtype(upstream, torch, "cuda", "float16")
         assert dtype == "float16"
+
+
+# ---------------------------------------------------------------------------
+# Context gate: the lecture context is only in the prompt of segments that
+# hold speech, and a latched segment rolls after a long silence.
+# ---------------------------------------------------------------------------
+
+import logging  # noqa: E402
+
+from echolingo.service.qwen_segment_policy import SpeechTimeline  # noqa: E402
+
+CONTEXT_PROMPT = [7, 7, 7]
+PLAIN_PROMPT = [5]
+RIGHT_CONTEXT_FRAMES = 64  # the Desktop's 640 ms encoder right context
+_DEFAULT = object()
+
+
+class LoudnessVad:
+    """Silero stand-in: 512-sample frames, probability 0.9 when loud, else 0."""
+
+    def __init__(self) -> None:
+        self.pending = np.zeros(0, dtype=np.float32)
+        self.fail = False
+
+    def frame_probabilities(self, audio) -> np.ndarray:
+        if self.fail:
+            raise RuntimeError("onnxruntime failed")
+        audio = np.concatenate((self.pending, np.asarray(audio, dtype=np.float32)))
+        count = audio.size // 512
+        frames = audio[: count * 512].reshape(count, 512)
+        self.pending = audio[count * 512 :]
+        return np.where(np.abs(frames).mean(axis=1) > 0.1, 0.9, 0.0).astype(np.float32)
+
+    def reset(self) -> None:
+        self.pending = np.zeros(0, dtype=np.float32)
+
+
+class GateRig:
+    """A context-gated streamer and the sample clock the online processor keeps.
+
+    ``audio`` feeds the speech timeline and advances ``state.audio.frames_seen``
+    like the mel extractor; ``decode`` asks for the prompt the way
+    ``append_mel_chunk`` does, then applies the hypothesis.
+    """
+
+    def __init__(self, *, timeline=_DEFAULT, **overrides) -> None:
+        self.timeline = SpeechTimeline(LoudnessVad()) if timeline is _DEFAULT else timeline
+        values = dict(
+            prompt_prefix_template=CONTEXT_PROMPT,
+            echolingo_plain_prompt_template=PLAIN_PROMPT,
+            model=types.SimpleNamespace(
+                audio_encoder=types.SimpleNamespace(right_context_frames=RIGHT_CONTEXT_FRAMES),
+                config=types.SimpleNamespace(sample_rate=16_000, mel_hop_ms=10, decoder_step_ms=80),
+            ),
+            state=types.SimpleNamespace(
+                frame_hidden=None,
+                decoder="plain-prompt-kv",
+                audio=types.SimpleNamespace(frames_seen=0),
+            ),
+        )
+        values.update(overrides)
+        self.streamer = _streamer(**values)
+        self.streamer.echolingo_speech_timeline = self.timeline
+        self.samples = 0
+        self.cached_steps = 0
+
+    def audio(self, seconds: float, *, speech: bool) -> None:
+        count = int(round(seconds * 16_000))
+        if self.timeline is not None:
+            self.timeline.feed(np.full(count, 0.5 if speech else 0.0, dtype=np.float32))
+        self.samples += count
+        self.streamer.state.audio.frames_seen = self.samples // 160
+
+    def decode(self, text: str, *, steps: int = 13, is_flush: bool = False):
+        self.cached_steps += steps
+        prompt = self.streamer.prompt_template_token_ids()
+        event = _feed(self.streamer, text, self.cached_steps, steps, is_flush=is_flush)
+        if event["segment_rollover"]:
+            self.cached_steps = 0
+        return prompt, event
+
+
+def test_context_gate_keeps_a_silent_segment_on_the_plain_prompt() -> None:
+    rig = GateRig()
+    for _ in range(4):
+        rig.audio(1.0, speech=False)
+        assert rig.decode("")[0] == PLAIN_PROMPT
+    # A 100 ms blip is below the 160 ms of speech the latch needs.
+    rig.audio(0.1, speech=True)
+    rig.audio(0.9, speech=False)
+    assert rig.decode("")[0] == PLAIN_PROMPT
+    assert rig.streamer.context_latches == 0 and rig.streamer.context_latches_deferred == 0
+    assert rig.streamer.state.decoder == "plain-prompt-kv"
+
+
+def test_speech_latches_the_context_for_the_rest_of_the_segment() -> None:
+    rig = GateRig(echolingo_silence_roll_ms=0)
+    rig.audio(1.0, speech=False)
+    assert rig.decode("")[0] == PLAIN_PROMPT
+    rig.audio(1.0, speech=True)
+    assert rig.decode("Machine learning is")[0] == CONTEXT_PROMPT
+    assert rig.streamer.context_latches == 1
+    # The rolling decoder KV was built over the plain prompt head.
+    assert rig.streamer.state.decoder is None
+    rig.streamer.state.decoder = "context-prompt-kv"
+    for _ in range(5):  # a silent tail never switches the context off
+        rig.audio(1.0, speech=False)
+        prompt, event = rig.decode("Machine learning is")
+        assert prompt == CONTEXT_PROMPT and not event["segment_rollover"]
+    assert rig.streamer.context_latches == 1
+    assert rig.streamer.state.decoder == "context-prompt-kv"
+
+
+def test_a_roll_resets_the_latch_and_the_next_segment_starts_after_the_rolled_audio() -> None:
+    rig = GateRig(echolingo_silence_roll_ms=0)
+    rig.audio(1.0, speech=True)
+    assert rig.decode("That is the whole idea.", steps=60)[0] == CONTEXT_PROMPT
+    rig.audio(1.0, speech=False)
+    prompt, event = rig.decode("That is the whole idea.", steps=12)
+    assert prompt == CONTEXT_PROMPT and event["segment_rollover_reason"] == "pause"
+    # The rolled segment held audio steps up to the encoded end: 2 s of audio
+    # minus the 640 ms right context.
+    assert rig.streamer._segment_start_sample == (200 - RIGHT_CONTEXT_FRAMES) * 160
+    rig.audio(1.0, speech=False)
+    # The speech before the roll belongs to the rolled segment.
+    assert rig.decode("")[0] == PLAIN_PROMPT
+    rig.audio(0.5, speech=True)
+    assert rig.decode("Okay")[0] == CONTEXT_PROMPT
+    assert rig.streamer.context_latches == 2
+
+
+def test_latch_is_deferred_when_the_segment_already_committed_text() -> None:
+    rig = GateRig()
+    words = "so the gradient flows back through every layer"
+    for _ in range(2):  # quiet speech the VAD misses, transcribed on the plain prompt
+        rig.audio(1.0, speech=False)
+        assert rig.decode(words)[0] == PLAIN_PROMPT
+    assert rig.streamer.last_committed_text
+    for _ in range(2):
+        rig.audio(1.0, speech=True)
+        assert rig.decode(words + " and")[0] == PLAIN_PROMPT
+    assert rig.streamer.context_latches == 0
+    assert rig.streamer.context_latches_deferred == 1
+    assert rig.streamer.state.decoder == "plain-prompt-kv"
+    # The next segment starts clean and latches normally.
+    rig.audio(1.0, speech=True)
+    rig.streamer.roll_segment()
+    rig.cached_steps = 0
+    rig.audio(1.0, speech=True)
+    assert rig.decode("Next")[0] == CONTEXT_PROMPT
+    assert rig.streamer.context_latches == 1
+
+
+def test_without_a_usable_vad_the_context_stays_on() -> None:
+    rig = GateRig(timeline=SpeechTimeline(None))
+    rig.audio(2.0, speech=False)
+    assert rig.decode("")[0] == CONTEXT_PROMPT
+    assert rig.streamer.context_latches == 0
+    rig = GateRig(timeline=None)
+    assert rig.decode("")[0] == CONTEXT_PROMPT
+    rig = GateRig(echolingo_context_gate=False)
+    rig.audio(2.0, speech=False)
+    assert rig.decode("")[0] == CONTEXT_PROMPT
+    # A VAD that fails mid-segment hands over at the next decode that is safe.
+    vad = LoudnessVad()
+    rig = GateRig(timeline=SpeechTimeline(vad))
+    rig.audio(1.0, speech=False)
+    assert rig.decode("")[0] == PLAIN_PROMPT
+    vad.fail = True
+    rig.audio(1.0, speech=False)
+    assert not rig.timeline.available
+    assert rig.decode("")[0] == CONTEXT_PROMPT and rig.streamer.context_latches == 1
+
+
+def _latched_goodbye(**overrides) -> GateRig:
+    # A pause roll needs 400 steps here, so only the silence roll can fire.
+    rig = GateRig(echolingo_pause_roll_min_steps=400, **overrides)
+    rig.audio(1.0, speech=True)
+    assert rig.decode("Goodbye everyone.")[0] == CONTEXT_PROMPT
+    # Audio steps end 640 ms before the head: at 2 s and 3 s the silence
+    # after the last speech is only 0.36 s and 1.36 s long.
+    for _ in range(2):
+        rig.audio(1.0, speech=False)
+        assert not rig.decode("Goodbye everyone.")[1]["segment_rollover"]
+    return rig
+
+
+def test_silence_roll_commits_a_latched_segment_and_keeps_its_mark() -> None:
+    rig = _latched_goodbye()
+    rig.audio(1.0, speech=False)
+    prompt, event = rig.decode("Goodbye everyone.")
+    assert prompt == CONTEXT_PROMPT
+    assert event["segment_rollover"] and event["segment_rollover_reason"] == "silence"
+    assert rig.streamer.completed_text == "Goodbye everyone."
+    assert event["committed"] == "Goodbye everyone." and event["unstable"] == ""
+    assert rig.streamer.rolls_by_reason == {"silence": 1}
+    assert rig.streamer.edge_marks_stripped == 0
+    # The next segment is silent and back on the plain prompt.
+    rig.audio(1.0, speech=False)
+    assert rig.decode("")[0] == PLAIN_PROMPT
+
+
+@pytest.mark.parametrize(
+    "case", ["changed", "short", "disabled", "right_context", "flush", "few_steps", "pending"]
+)
+def test_silence_roll_needs_a_long_quiet_unchanged_latched_segment(case: str) -> None:
+    silence_roll_ms = {"short": 5000, "disabled": 0}.get(case, 2000)
+    rig = _latched_goodbye(echolingo_silence_roll_ms=silence_roll_ms)
+    text = "Goodbye everyone."
+    if case == "right_context":
+        # Speech the encoder has seen but not yet emitted as audio steps.
+        rig.audio(0.5, speech=False)
+        rig.audio(0.5, speech=True)
+    else:
+        rig.audio(1.0, speech=False)
+    if case == "changed":
+        text = "Goodbye everyone. See you"
+    if case == "few_steps":
+        rig.cached_steps = 0
+    if case == "pending":
+        # A causal encoder still holding 0.5 s of mel frames back.
+        rig.streamer.state.audio.pending_frames = 50
+    steps = 5 if case == "few_steps" else 13
+    _, event = rig.decode(text, steps=steps, is_flush=case == "flush")
+    assert not event["segment_rollover"]
+    assert rig.streamer.rolls_by_reason == {}
+
+
+def test_silence_roll_needs_a_speech_timeline() -> None:
+    rig = GateRig(timeline=None, echolingo_pause_roll_min_steps=400)
+    for _ in range(6):
+        rig.audio(1.0, speech=False)
+        prompt, event = rig.decode("Goodbye everyone.")
+        assert prompt == CONTEXT_PROMPT and not event["segment_rollover"]
+    assert rig.streamer.context_latches == 0
+
+
+def test_context_gate_settings_default_and_clamp() -> None:
+    policy = qwen_server.decode_policy_from_environment({})
+    assert policy["echolingo_context_gate"] is True
+    assert policy["echolingo_context_gate_probability"] == 0.25
+    assert policy["echolingo_silence_roll_ms"] == 2000
+
+    def resolved(name: str, raw: str):
+        key = {
+            "CONTEXT_GATE": "echolingo_context_gate",
+            "CONTEXT_GATE_PROBABILITY": "echolingo_context_gate_probability",
+            "SILENCE_ROLL_MS": "echolingo_silence_roll_ms",
+        }[name]
+        return qwen_server.decode_policy_from_environment({f"ECHOLINGO_QWEN_{name}": raw})[key]
+
+    assert resolved("CONTEXT_GATE", "0") is False
+    assert resolved("CONTEXT_GATE", "on") is True
+    assert resolved("CONTEXT_GATE_PROBABILITY", "0.4") == 0.4
+    assert resolved("CONTEXT_GATE_PROBABILITY", "0.01") == 0.05
+    assert resolved("CONTEXT_GATE_PROBABILITY", "2") == 0.9
+    assert resolved("CONTEXT_GATE_PROBABILITY", "nan") == 0.25
+    assert resolved("CONTEXT_GATE_PROBABILITY", "high") == 0.25
+    assert resolved("SILENCE_ROLL_MS", "0") == 0  # off
+    assert resolved("SILENCE_ROLL_MS", "3000") == 3000
+    assert resolved("SILENCE_ROLL_MS", "100") == 800
+    assert resolved("SILENCE_ROLL_MS", "-5") == 800
+    assert resolved("SILENCE_ROLL_MS", "60000") == 10_000
+    assert resolved("SILENCE_ROLL_MS", "1.5") == 2000  # not an integer: ignored
+
+
+class _GateStreamer:
+    def __init__(self, plain, gate: bool) -> None:
+        self.echolingo_plain_prompt_template = plain
+        self.echolingo_context_gate = gate
+        self.echolingo_speech_timeline = None
+
+
+class _GateAsr:
+    echolingo_context_gate_probability = 0.4
+
+    def __init__(self, plain, gate: bool = True) -> None:
+        self.plain = plain
+        self.gate = gate
+
+    def build_streamer(self, language=None):
+        return _GateStreamer(self.plain, self.gate)
+
+
+class _UpstreamProcessor:
+    """The upstream contract: start_silence rebuilds the streamer."""
+
+    def __init__(self, asr) -> None:
+        self.asr = asr
+        self.streamer = asr.build_streamer()
+        self.inserted = 0
+
+    def insert_audio_chunk(self, audio, audio_stream_end_time) -> None:
+        self.inserted += len(audio)
+
+    def start_silence(self):
+        self.streamer = self.asr.build_streamer()
+        return [], 0.0
+
+    def finish(self):
+        return [], 0.0
+
+
+def test_online_processor_feeds_a_speech_timeline_only_for_gated_sessions(monkeypatch) -> None:
+    made: list[SpeechTimeline] = []
+
+    def timeline_for(threshold: float) -> SpeechTimeline:
+        made.append(SpeechTimeline(LoudnessVad(), threshold=threshold))
+        return made[-1]
+
+    monkeypatch.setattr(qwen_server, "make_speech_timeline", timeline_for)
+    processor_class = qwen_server.make_online_processor_class(_UpstreamProcessor)
+
+    # No session context, or the gate turned off: the VAD is never loaded.
+    for asr in (_GateAsr(plain=None), _GateAsr(plain=[5], gate=False)):
+        session = processor_class(asr)
+        session.insert_audio_chunk(np.ones(2048, dtype=np.float32), 0.128)
+        session.start_silence()
+        session.finish()
+        assert session.inserted == 2048
+        assert session.streamer.echolingo_speech_timeline is None
+    assert made == []
+
+    session = processor_class(_GateAsr(plain=[5]))
+    timeline = session.streamer.echolingo_speech_timeline
+    assert made == [timeline] and timeline.threshold == 0.4
+    session.insert_audio_chunk(np.full(1024, 0.5, dtype=np.float32), 0.064)
+    assert timeline.frames == 2 and session.inserted == 1024
+    first = session.streamer
+    session.start_silence()
+    # The rebuilt streamer shares the reset timeline; the VAD is not reloaded.
+    assert session.streamer is not first
+    assert session.streamer.echolingo_speech_timeline is timeline
+    assert timeline.frames == 0 and len(made) == 1
+    session.insert_audio_chunk(np.zeros(512, dtype=np.float32), 0.096)
+    assert timeline.frames == 1
+
+
+def test_missing_vad_model_turns_the_gate_off_and_logs_once(tmp_path, monkeypatch, caplog) -> None:
+    monkeypatch.setenv("ECHOLINGO_RESOURCE_ROOT", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(qwen_server, "_vad_unavailable_logged", False)
+    with caplog.at_level(logging.WARNING, logger=qwen_server.logger.name):
+        first = qwen_server.make_speech_timeline(0.25)
+        second = qwen_server.make_speech_timeline(0.25)
+    assert not first.available and not second.available
+    warnings = [record for record in caplog.records if "Silero VAD unavailable" in record.getMessage()]
+    assert len(warnings) == 1
