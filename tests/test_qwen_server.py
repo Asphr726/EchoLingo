@@ -785,6 +785,7 @@ def test_online_processor_feeds_a_speech_timeline_only_for_gated_sessions(monkey
 def test_missing_vad_model_turns_the_gate_off_and_logs_once(tmp_path, monkeypatch, caplog) -> None:
     monkeypatch.setenv("ECHOLINGO_RESOURCE_ROOT", str(tmp_path))
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(qwen_server, "_source_checkout_root", lambda: tmp_path)
     monkeypatch.setattr(qwen_server, "_vad_unavailable_logged", False)
     with caplog.at_level(logging.WARNING, logger=qwen_server.logger.name):
         first = qwen_server.make_speech_timeline(0.25)
@@ -792,3 +793,23 @@ def test_missing_vad_model_turns_the_gate_off_and_logs_once(tmp_path, monkeypatc
     assert not first.available and not second.available
     warnings = [record for record in caplog.records if "Silero VAD unavailable" in record.getMessage()]
     assert len(warnings) == 1
+
+
+def test_silero_vad_path_prefers_the_bundle_then_the_source_checkout(tmp_path, monkeypatch) -> None:
+    # From a source checkout the derived root is the repository root.
+    assert (qwen_server._source_checkout_root() / "pyproject.toml").is_file()
+    bundle, checkout, elsewhere = (tmp_path / name for name in ("bundle", "checkout", "cwd"))
+    for root in (bundle, checkout):
+        (root / "models").mkdir(parents=True)
+        (root / qwen_server.SILERO_VAD_RESOURCE).write_bytes(b"onnx")
+    elsewhere.mkdir()
+    monkeypatch.setenv("ECHOLINGO_RESOURCE_ROOT", str(bundle))
+    monkeypatch.chdir(elsewhere)
+    monkeypatch.setattr(qwen_server, "_source_checkout_root", lambda: checkout)
+    assert qwen_server.silero_vad_path() == bundle / qwen_server.SILERO_VAD_RESOURCE
+    # A development Desktop runs this server from its own working directory.
+    monkeypatch.delenv("ECHOLINGO_RESOURCE_ROOT")
+    assert qwen_server.silero_vad_path() == checkout / qwen_server.SILERO_VAD_RESOURCE
+    # No model anywhere: the regular lookup's path comes back for the error.
+    (checkout / qwen_server.SILERO_VAD_RESOURCE).unlink()
+    assert qwen_server.silero_vad_path() == elsewhere / qwen_server.SILERO_VAD_RESOURCE

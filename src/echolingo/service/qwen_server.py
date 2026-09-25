@@ -36,6 +36,7 @@ import os
 import sys
 import time
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -498,14 +499,34 @@ def _join_segments(*segments: str) -> str:
 _vad_unavailable_logged = False
 
 
+def _source_checkout_root() -> Path | None:
+    """The repository root when this module runs from a source checkout."""
+    parents = Path(__file__).resolve().parents  # service, echolingo, src, root
+    return parents[3] if len(parents) > 3 else None
+
+
+def silero_vad_path() -> Path:
+    """The bundled Silero VAD model, else the one in a source checkout.
+
+    A development Desktop starts this server through Conda from its own
+    working directory, where the repository's ``models/`` is out of reach.
+    """
+    from .resources import runtime_resource_path
+
+    path = runtime_resource_path(SILERO_VAD_RESOURCE)
+    root = _source_checkout_root()
+    if not path.is_file() and root is not None and (root / SILERO_VAD_RESOURCE).is_file():
+        return root / SILERO_VAD_RESOURCE
+    return path
+
+
 def make_speech_timeline(threshold: float) -> SpeechTimeline:
     """A Silero-backed speech timeline, or an unavailable one (gate off)."""
     global _vad_unavailable_logged
     try:
         from ..vad import SileroOnnxVad
-        from .resources import runtime_resource_path
 
-        path = runtime_resource_path(SILERO_VAD_RESOURCE)
+        path = silero_vad_path()
         if not path.is_file():
             raise FileNotFoundError(f"{path} does not exist")
         vad = SileroOnnxVad(path, threads=1)
