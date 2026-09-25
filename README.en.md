@@ -5,12 +5,12 @@
 EchoLingo is a real-time lecture interpreter. It turns what the lecturer says into side-by-side captions in the original language and your language, sentence by sentence, and after class an AI model of your choice can turn the transcript into study notes. By default, all recognition and translation run on your own computer. The published download is for the Mac; Windows and Linux versions are in testing.
 
 [![Platform](https://img.shields.io/badge/platform-macOS%2014%2B%20%C2%B7%20Apple%20Silicon-lightgrey)](#requirements)
-[![Version](https://img.shields.io/badge/version-0.2.0%20Beta-orange)](https://github.com/Asphr726/EchoLingo/releases)
+[![Version](https://img.shields.io/badge/version-0.3.0%20Beta-orange)](https://github.com/Asphr726/EchoLingo/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 ![EchoLingo live bilingual captions](docs/screenshots/live.png)
 
-> **v0.2.0 Beta**: the published download is for Apple Silicon Macs running macOS 14 or later. Windows and Linux builds are in testing and not published yet; see [Windows / Linux](#windows--linux-in-testing-not-yet-published). The app's interface is in English.
+> **v0.3.0 Beta**: the published download is for Apple Silicon Macs running macOS 14 or later. Windows and Linux builds are in testing and not published yet; see [Windows / Linux](#windows--linux-in-testing-not-yet-published). The app's interface is in English.
 
 [Highlights](#highlights) · [Requirements](#requirements) · [Install](#install) · [Windows / Linux](#windows--linux-in-testing-not-yet-published) · [Quick start](#quick-start) · [Guide](#guide) · [Privacy](#privacy) · [FAQ](#faq) · [Roadmap](#roadmap) · [Build from source](#build-from-source) · [License and acknowledgements](#license-and-acknowledgements)
 
@@ -38,7 +38,7 @@ EchoLingo is a real-time lecture interpreter. It turns what the lecturer says in
 | Memory | 16 GB or more recommended | 16 GB or more recommended |
 | Disk | The local models take about 4.5 GB; keep at least 6 GB free | The same; the optional GPU acceleration pack is another 2–3 GB download and takes more space once unpacked |
 | Permissions | Microphone; to capture sound playing on the Mac (online classes, videos), also Screen & System Audio Recording | Windows: desktop apps must be allowed to use the microphone; Linux: none |
-| Network | Only for downloading models, cloud providers and AI notes | The same |
+| Network | Only for downloading models, update checks, cloud providers and AI notes | The same |
 
 On Windows and Linux, recognition and translation run on the CPU unless the GPU acceleration pack is installed. On slower processors the captions may fall behind the lecture; the [GPU acceleration pack](#windows--linux-in-testing-not-yet-published) or a cloud recognizer solves that.
 
@@ -46,7 +46,7 @@ On Windows and Linux, recognition and translation run on the CPU unless the GPU 
 
 The steps below are for macOS. For Windows and Linux, see [Windows / Linux](#windows--linux-in-testing-not-yet-published).
 
-1. Download `EchoLingo_0.2.0_aarch64.dmg` from [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases).
+1. Download `EchoLingo_0.3.0_aarch64.dmg` from [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases).
 2. Open the dmg and drag **EchoLingo** into the Applications folder.
 3. Open it for the first time. The Beta is not notarized by Apple yet, so macOS blocks it at first:
    - **macOS 14**: in Applications, Control-click (or right-click) EchoLingo, choose **Open**, then choose **Open** again in the dialog.
@@ -77,13 +77,13 @@ The steps below are for macOS. For Windows and Linux, see [Windows / Linux](#win
 
 **Windows 10 / 11 (x64)**
 
-1. Run `EchoLingo_0.2.0_x64-setup.exe`. It installs for your user account only and needs no administrator rights; if the Microsoft Edge WebView2 runtime is missing, the installer adds it.
+1. Run `EchoLingo_0.3.0_x64-setup.exe`. It installs for your user account only and needs no administrator rights; if the Microsoft Edge WebView2 runtime is missing, the installer adds it.
 2. The installer is not code-signed yet, so Windows SmartScreen may say "Windows protected your PC". Click **More info**, then **Run anyway**.
 3. Open EchoLingo from the Start menu and download the local models in **Settings → Models**, as in step 4 of [Install](#install).
 
 **Linux (Ubuntu 22.04+ / Debian 12+, x64)**
 
-1. In the folder you downloaded it to, install the package with `sudo apt install ./EchoLingo_0.2.0_amd64.deb`.
+1. In the folder you downloaded it to, install the package with `sudo apt install ./EchoLingo_0.3.0_amd64.deb`.
 2. Open EchoLingo from the application menu, or run `echolingo-desktop` in a terminal. Only a .deb package is available for now; an AppImage is on the roadmap.
 3. Open EchoLingo from the applications menu and download the local models in **Settings → Models**.
 
@@ -152,7 +152,7 @@ The steps below are for macOS. For Windows and Linux, see [Windows / Linux](#win
 
 | Section | What it holds |
 | --- | --- |
-| General | Open the floating caption |
+| General | Open the floating caption; in-app updates (Updates) |
 | Audio | Default audio profile |
 | Languages | Default source and target languages |
 | Inference | Default inference mode (Auto / Local / Cloud); preload local models at launch |
@@ -187,6 +187,14 @@ The steps below are for macOS. For Windows and Linux, see [Windows / Linux](#win
 
 ![Consent dialog before any upload](docs/screenshots/consent.png)
 
+### In-app updates
+
+- By default EchoLingo checks for a new version once at every launch. You can turn this off in **Settings → General → Updates**.
+- On the Mac, updates install from inside the app: EchoLingo downloads the new version, verifies its signature, replaces the app in place and restarts. Your sessions, settings, models and keys are kept.
+- **Coming from 0.2.0**: version 0.2.0 has no in-app updates, so install once by hand: download the 0.3.0 dmg, quit EchoLingo with ⌘Q and drag the new version into Applications to replace the old one. Later versions update from inside the app.
+- After an update, macOS may ask again for the microphone or Screen & System Audio Recording permission; see [No captions, or no sound gets through](#no-captions-or-no-sound-gets-through).
+- For now only the Mac version updates from inside the app; download new Windows and Linux test builds by hand.
+
 ## Privacy
 
 **What always stays on your computer**
@@ -207,6 +215,8 @@ The steps below are for macOS. For Windows and Linux, see [Windows / Linux](#win
 | Connection tests | Recognition: handshake only; translation: one fixed English sentence; AI assistant: one fixed prompt | The provider being tested | Transcript upload for translation tests; otherwise none |
 
 Audio is never sent for AI notes or titles.
+
+**Update checks**: at launch EchoLingo reads a small version file (`latest.json`) from GitHub, and updates are downloaded from GitHub too. Update checks only contact GitHub and upload nothing; turn them off in **Settings → General → Updates**.
 
 **How to revoke**: turn off Audio upload or Transcript upload in **Settings → Privacy**; turn off Consent or set the provider to **Off** in **Settings → AI assistant**; click **Clear** on a card in **Settings → Cloud providers** to delete a key from the secure store. Data already sent to a third-party provider is governed by that provider's own privacy policy.
 
@@ -330,7 +340,7 @@ npm run desktop:build                            # Windows and Linux: installer 
 APPLE_SIGNING_IDENTITY=- npm run desktop:build   # macOS: local ad-hoc signed build
 ```
 
-The build ends up in `target/release/bundle/`: `dmg/EchoLingo_0.2.0_aarch64.dmg` on macOS, `nsis/EchoLingo_0.2.0_x64-setup.exe` on Windows, and `deb/EchoLingo_0.2.0_amd64.deb` on Linux. `APPLE_SIGNING_IDENTITY=-` produces an ad-hoc signature that is only suitable for your own Mac; public distribution needs a Developer ID certificate and Apple notarization.
+The build ends up in `target/release/bundle/`: `dmg/EchoLingo_0.3.0_aarch64.dmg` on macOS, `nsis/EchoLingo_0.3.0_x64-setup.exe` on Windows, and `deb/EchoLingo_0.3.0_amd64.deb` on Linux. `APPLE_SIGNING_IDENTITY=-` produces an ad-hoc signature that is only suitable for your own Mac; public distribution needs a Developer ID certificate and Apple notarization.
 
 Run the tests:
 
@@ -339,6 +349,17 @@ pytest                                      # Python (with the conda environment
 cargo test --workspace                      # Rust
 npm run typecheck && npm run test:desktop   # user interface
 ```
+
+### Releasing (maintainers)
+
+In-app updates only accept update packages signed with the EchoLingo update signing key. By convention the private key lives in `~/.tauri/echolingo-updater.key` (created with `npx tauri signer generate -w ~/.tauri/echolingo-updater.key`; the public key is `plugins.updater.pubkey` in `apps/desktop/src-tauri/tauri.conf.json`). Keep an offline backup of this file: without it, installed copies can never update from inside the app again and have to be reinstalled by hand. Local builds do not need the key; CI reads its contents from the repository secret `TAURI_SIGNING_PRIVATE_KEY` (plus `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` if the key has a password), for example `gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/echolingo-updater.key`.
+
+1. Bump the version, write `.github/release-notes/vX.Y.Z.md` and push the tag `vX.Y.Z`.
+2. CI builds every platform and creates two drafts: `vX.Y.Z` (the Mac dmg, the update package `.app.tar.gz` and its `.sig`, `SHA256SUMS.txt`, and a `latest.json` to review) and `windows-linux-vX.Y.Z` (the Windows / Linux installers and GPU packs; it stays a draft).
+3. Once it checks out, publish `vX.Y.Z` as a pre-release.
+4. Run `python scripts/update_manifest.py --tag vX.Y.Z --publish` (needs a signed-in GitHub CLI, `gh`). It checks the signing key and the download links, then replaces `latest.json` on the `updater` pre-release; installed copies see the new version at their next check.
+
+`python scripts/smoke_update.py` rehearses a complete in-app update on your Mac with a throwaway key.
 
 ## License and acknowledgements
 

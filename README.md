@@ -5,12 +5,12 @@
 EchoLingo 是一款面向课堂的实时同声字幕工具：把老师的讲课声音实时转成原文与译文逐句对照的双语字幕，下课后还可以用你自己选择的 AI 模型把转录整理成学习笔记。默认所有识别和翻译都在你自己的电脑上完成。目前公开发布的是 Mac 版，Windows 和 Linux 版正在测试中。
 
 [![Platform](https://img.shields.io/badge/platform-macOS%2014%2B%20%C2%B7%20Apple%20Silicon-lightgrey)](#系统要求)
-[![Version](https://img.shields.io/badge/version-0.2.0%20Beta-orange)](https://github.com/Asphr726/EchoLingo/releases)
+[![Version](https://img.shields.io/badge/version-0.3.0%20Beta-orange)](https://github.com/Asphr726/EchoLingo/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 ![EchoLingo 实时双语字幕](docs/screenshots/live.png)
 
-> **v0.2.0 Beta**：公开发布的安装包只支持 Apple Silicon Mac（macOS 14 及以上）。Windows 和 Linux 版正在测试，尚未公开发布，见 [Windows / Linux](#windows--linux测试中尚未公开发布)。应用界面暂时只有英文，下文中的按钮和菜单名称都按界面上的英文原样写出。
+> **v0.3.0 Beta**：公开发布的安装包只支持 Apple Silicon Mac（macOS 14 及以上）。Windows 和 Linux 版正在测试，尚未公开发布，见 [Windows / Linux](#windows--linux测试中尚未公开发布)。应用界面暂时只有英文，下文中的按钮和菜单名称都按界面上的英文原样写出。
 
 [特色](#特色) · [系统要求](#系统要求) · [安装](#安装) · [Windows / Linux](#windows--linux测试中尚未公开发布) · [快速上手](#快速上手) · [使用指南](#使用指南) · [隐私](#隐私) · [常见问题](#常见问题) · [路线图](#路线图) · [从源码构建](#从源码构建) · [许可与致谢](#许可与致谢)
 
@@ -38,7 +38,7 @@ EchoLingo 是一款面向课堂的实时同声字幕工具：把老师的讲课�
 | 内存 | 建议 16 GB 或以上 | 建议 16 GB 或以上 |
 | 磁盘 | 本地模型共约 4.5 GB，建议预留 6 GB 以上的可用空间 | 同左；可选的 GPU 加速包另需下载约 2–3 GB，解压后占用更多 |
 | 权限 | 麦克风；如果要采集电脑播放的声音（网课、视频），还需要“屏幕与系统录音”权限 | Windows：需要允许桌面应用使用麦克风；Linux：无需授权 |
-| 网络 | 只有下载模型、使用云服务或 AI 笔记时才需要 | 同左 |
+| 网络 | 只有下载模型、检查更新、使用云服务或 AI 笔记时才需要 | 同左 |
 
 在 Windows 和 Linux 上，没有安装 GPU 加速包时识别和翻译都在 CPU 上运行。处理器较慢时字幕可能会越来越落后于老师的讲课，这时可以安装 [GPU 加速包](#windows--linux测试中尚未公开发布)，或者改用云端识别服务。
 
@@ -46,7 +46,7 @@ EchoLingo 是一款面向课堂的实时同声字幕工具：把老师的讲课�
 
 以下是 macOS 的安装步骤。Windows 和 Linux 请看 [Windows / Linux](#windows--linux测试中尚未公开发布)。
 
-1. 从 [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases) 下载 `EchoLingo_0.2.0_aarch64.dmg`。
+1. 从 [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases) 下载 `EchoLingo_0.3.0_aarch64.dmg`。
 2. 打开 dmg，把 **EchoLingo** 拖进“应用程序”文件夹。
 3. 第一次打开。Beta 版还没有经过 Apple 公证，macOS 会拦截它：
    - **macOS 14**：在“应用程序”里按住 Control 点按（或右键点按）EchoLingo，选择“打开”，再在弹出的对话框里点“打开”。
@@ -77,13 +77,13 @@ EchoLingo 是一款面向课堂的实时同声字幕工具：把老师的讲课�
 
 **Windows 10 / 11（x64）**
 
-1. 运行 `EchoLingo_0.2.0_x64-setup.exe`。安装程序只为当前用户安装，不需要管理员权限；如果电脑上缺少 Microsoft Edge WebView2 运行时，安装程序会自动安装。
+1. 运行 `EchoLingo_0.3.0_x64-setup.exe`。安装程序只为当前用户安装，不需要管理员权限；如果电脑上缺少 Microsoft Edge WebView2 运行时，安装程序会自动安装。
 2. 安装程序还没有代码签名，Windows SmartScreen 可能提示“Windows 已保护你的电脑”。点“更多信息”，再点“仍要运行”。
 3. 从“开始”菜单打开 EchoLingo，按照[安装](#安装)第 4 步在 **Settings → Models** 下载本地模型。
 
 **Linux（Ubuntu 22.04+ / Debian 12+，x64）**
 
-1. 在下载目录里运行 `sudo apt install ./EchoLingo_0.2.0_amd64.deb` 安装。
+1. 在下载目录里运行 `sudo apt install ./EchoLingo_0.3.0_amd64.deb` 安装。
 2. 从应用菜单打开 EchoLingo，或在终端运行 `echolingo-desktop`。目前只提供 .deb 包，AppImage 在路线图中。
 3. 从应用菜单打开 EchoLingo，同样在 **Settings → Models** 下载本地模型。
 
@@ -152,7 +152,7 @@ EchoLingo 是一款面向课堂的实时同声字幕工具：把老师的讲课�
 
 | 分区 | 内容 |
 | --- | --- |
-| General | 打开悬浮字幕 |
+| General | 打开悬浮字幕；应用内更新（Updates） |
 | Audio | 默认音频配置 |
 | Languages | 默认源语言和目标语言 |
 | Inference | 默认推理模式（Auto / Local / Cloud）；启动时是否预加载本地模型 |
@@ -187,6 +187,14 @@ EchoLingo 是一款面向课堂的实时同声字幕工具：把老师的讲课�
 
 ![上传前的同意对话框](docs/screenshots/consent.png)
 
+### 应用内更新
+
+- EchoLingo 默认在每次启动时检查一次有没有新版本，可以在 **Settings → General → Updates** 关闭。
+- 在 Mac 上可以直接在应用内更新：EchoLingo 下载新版本、校验它的签名，然后原地替换应用并重新启动。课程、设置、模型和密钥都会保留。
+- **从 0.2.0 升级**：0.2.0 还没有应用内更新，需要手动安装一次：下载 0.3.0 的 dmg，⌘Q 退出 EchoLingo，把新版本拖进“应用程序”文件夹替换旧版本。之后的版本都可以在应用内更新。
+- 更新后，macOS 可能会要求重新授予麦克风或“屏幕与系统录音”权限，见[没有字幕，或者听不到声音](#没有字幕或者听不到声音)。
+- 目前只有 Mac 版提供应用内更新；Windows 和 Linux 测试版请手动下载新版本。
+
 ## 隐私
 
 **始终留在本机的内容**
@@ -207,6 +215,8 @@ EchoLingo 是一款面向课堂的实时同声字幕工具：把老师的讲课�
 | 连接测试 | 识别：只做握手；翻译：一句固定英文；AI 助手：一句固定提示 | 被测试的服务 | 翻译测试需要 Transcript upload，其余无 |
 
 AI 笔记和标题永远不会发送音频。
+
+**检查更新**：EchoLingo 启动时从 GitHub 读取一个很小的版本清单（`latest.json`），更新包也从 GitHub 下载。检查更新只连接 GitHub，不会上传任何内容；可以在 **Settings → General → Updates** 关闭。
 
 **如何撤销**：在 **Settings → Privacy** 关闭音频上传或文字上传；在 **Settings → AI assistant** 关闭 Consent，或把 Provider 设为 **Off**；在 **Settings → Cloud providers** 点 **Clear** 从系统安全存储里删除密钥。已经发送给第三方服务的数据，受该服务自己的隐私政策约束。
 
@@ -330,7 +340,7 @@ npm run desktop:build                            # Windows 和 Linux：生成安
 APPLE_SIGNING_IDENTITY=- npm run desktop:build   # macOS：本机自签名构建
 ```
 
-构建产物位于 `target/release/bundle/`：macOS 是 `dmg/EchoLingo_0.2.0_aarch64.dmg`，Windows 是 `nsis/EchoLingo_0.2.0_x64-setup.exe`，Linux 是 `deb/EchoLingo_0.2.0_amd64.deb`。`APPLE_SIGNING_IDENTITY=-` 生成的是只适合自己使用的临时签名；公开分发需要 Developer ID 证书和 Apple 公证。
+构建产物位于 `target/release/bundle/`：macOS 是 `dmg/EchoLingo_0.3.0_aarch64.dmg`，Windows 是 `nsis/EchoLingo_0.3.0_x64-setup.exe`，Linux 是 `deb/EchoLingo_0.3.0_amd64.deb`。`APPLE_SIGNING_IDENTITY=-` 生成的是只适合自己使用的临时签名；公开分发需要 Developer ID 证书和 Apple 公证。
 
 运行测试：
 
@@ -339,6 +349,17 @@ pytest                                      # Python（需要先激活 conda 环
 cargo test --workspace                      # Rust
 npm run typecheck && npm run test:desktop   # 界面
 ```
+
+### 发布新版本（维护者）
+
+应用内更新只接受用 EchoLingo 更新签名密钥签过名的更新包。私钥约定保存在 `~/.tauri/echolingo-updater.key`（用 `npx tauri signer generate -w ~/.tauri/echolingo-updater.key` 生成，公钥是 `apps/desktop/src-tauri/tauri.conf.json` 里的 `plugins.updater.pubkey`）。请务必离线备份这个文件：丢失后，已安装的应用再也无法在应用内更新，只能手动重装。本地构建不需要私钥；CI 从仓库 secret `TAURI_SIGNING_PRIVATE_KEY` 读取私钥内容（私钥有密码时另设 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`），例如 `gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/echolingo-updater.key`。
+
+1. 更新版本号，写好 `.github/release-notes/vX.Y.Z.md`，推送标签 `vX.Y.Z`。
+2. CI 构建全部平台并创建两个草稿：`vX.Y.Z`（Mac 版 dmg、更新包 `.app.tar.gz` 及其 `.sig`、`SHA256SUMS.txt`，以及供检查的 `latest.json`）和 `windows-linux-vX.Y.Z`（Windows / Linux 安装包和 GPU 加速包，保持草稿）。
+3. 检查无误后，把 `vX.Y.Z` 发布为 pre-release。
+4. 运行 `python scripts/update_manifest.py --tag vX.Y.Z --publish`（需要已登录的 GitHub CLI `gh`）。它会校验签名密钥和下载链接，然后替换 `updater` 这个 pre-release 上的 `latest.json`，已安装的应用下次检查时就会看到新版本。
+
+`python scripts/smoke_update.py` 可以用临时密钥在本机 Mac 上完整演练一次应用内更新。
 
 ## 许可与致谢
 
