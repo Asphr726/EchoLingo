@@ -12,6 +12,7 @@ import {
   segmentAtOrAfter,
   setupNeed,
   stageLabel,
+  titleNotice,
   visibleMarkdown,
 } from "./notes";
 
@@ -86,6 +87,33 @@ describe("error guidance", () => {
     expect(errorGuidance("context_too_long").text).toContain("larger context");
     expect(errorGuidance("rate_limited").section).toBeUndefined();
     expect(errorGuidance("something_new").text).toBe("The notes could not be created.");
+  });
+});
+
+describe("title notice", () => {
+  const titleJob = { job_id: "t", session_id: "s", task: "title" as const, state: "running" as const };
+  const failed = {
+    ...titleJob,
+    state: "failed" as const,
+    error: { code: "empty_response", message: "DeepSeek spent its reply budget on reasoning and returned no title." },
+  };
+
+  it("shows why a title job of the open session failed", () => {
+    expect(titleNotice(failed, "s")).toBe("DeepSeek spent its reply budget on reasoning and returned no title.");
+    expect(titleNotice({ ...failed, error: null }, "s")).toBe("The AI title could not be created.");
+  });
+
+  it("clears when a title job starts, succeeds or is cancelled", () => {
+    expect(titleNotice(titleJob, "s")).toBeNull();
+    expect(titleNotice({ ...titleJob, state: "completed" }, "s")).toBeNull();
+    expect(titleNotice({ ...titleJob, state: "cancelled" }, "s")).toBeNull();
+  });
+
+  it("ignores other sessions and other tasks", () => {
+    expect(titleNotice(failed, "other")).toBeUndefined();
+    expect(titleNotice(failed, null)).toBeUndefined();
+    expect(titleNotice({ ...failed, session_id: null }, "s")).toBeUndefined();
+    expect(titleNotice({ ...failed, task: "notes" }, "s")).toBeUndefined();
   });
 });
 

@@ -396,6 +396,7 @@ input::placeholder { color: #9a9c93; }
 .detail-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
 .detail-header h2 { margin-top: 3px; }
 .detail-header p { margin: 7px 0 0; color: var(--muted); font-size: 10px; text-transform: capitalize; }
+.detail-header .title-failure { max-width: 64ch; color: var(--danger); font-size: 11px; line-height: 1.45; text-transform: none; }
 .detail-actions { display: flex; gap: 3px; }
 .rename-row { display: flex; align-items: center; gap: 7px; }
 .rename-row input { width: min(330px, 40vw); }

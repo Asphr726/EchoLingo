@@ -13,7 +13,7 @@ import { type KeyboardEvent, useCallback, useEffect, useLayoutEffect, useRef, us
 import { save } from "@tauri-apps/plugin-dialog";
 import { api, previewOpensNotesTab, subscribeUiEvents } from "../lib/bridge";
 import { formatClock } from "../lib/markdown";
-import { onAssistantChanged, safeFilename, segmentAtOrAfter } from "../lib/notes";
+import { onAssistantChanged, safeFilename, segmentAtOrAfter, titleNotice } from "../lib/notes";
 import { assistantConsentRequest, gatedLabel, useApp } from "../state/AppContext";
 import type {
   AssistantJob,
@@ -59,6 +59,8 @@ export function HistoryView() {
   const [notesLoading, setNotesLoading] = useState(false);
   const [assistant, setAssistant] = useState<AssistantStatus | null>(null);
   const [titlePending, setTitlePending] = useState(false);
+  /** Why the last AI title for the open session failed (auto or requested). */
+  const [titleError, setTitleError] = useState<string | null>(null);
   const [jump, setJump] = useState<JumpTarget | null>(null);
   const [focusSection, setFocusSection] = useState<number | null>(null);
   const selectedId = useRef<string | null>(null);
@@ -90,6 +92,7 @@ export function HistoryView() {
         setTitle(detail.session.title);
         setRenaming(false);
         setConfirmDelete(false);
+        setTitleError(null);
         setJump(null);
         setNotesState(emptyNotes);
         setNotesLoading(true);
@@ -168,6 +171,13 @@ export function HistoryView() {
     void subscribeUiEvents((event) => {
       if (event.kind === "assistant_update") {
         const job = event.payload as AssistantJob;
+        // An automatic title fails in the background; say why next to the
+        // title, where Generate title offers another try.
+        const notice = titleNotice(job, selectedId.current);
+        if (notice !== undefined) {
+          setTitleError(notice);
+          return;
+        }
         if (job.task !== "notes" || !job.session_id || job.session_id !== selectedId.current) return;
         setNotesState((current) => ({ ...current, job }));
         if (job.state === "completed") void loadNotes(job.session_id);
@@ -213,6 +223,7 @@ export function HistoryView() {
         session: { ...selected.session, title: title.trim(), title_source: "user" },
       });
       setRenaming(false);
+      setTitleError(null);
       await refresh();
     } catch (failure) {
       setError(String(failure));
@@ -240,6 +251,7 @@ export function HistoryView() {
     if (gate && !(await requestConsent(gate))) return;
     setTitlePending(true);
     setError(null);
+    setTitleError(null);
     try {
       const result = await api.generateSessionTitle(sessionId);
       // `applied: false` means the store kept a title the user set meanwhile.
@@ -250,7 +262,7 @@ export function HistoryView() {
       );
       await syncList();
     } catch (failure) {
-      setError(String(failure));
+      if (selectedId.current === sessionId) setTitleError(String(failure));
     } finally {
       setTitlePending(false);
     }
@@ -395,6 +407,7 @@ export function HistoryView() {
                   </h2>
                 )}
                 <p>{selected.session.source_language.toUpperCase()} → {selected.session.target_language.toUpperCase()} · {selected.session.audio_profile}</p>
+                <TitleFailure message={renaming ? null : titleError} />
               </div>
               <div className="detail-actions">
                 {selected.session.title_source === "default" && (
@@ -530,6 +543,12 @@ export function HistoryView() {
       </section>
     </div>
   );
+}
+
+/** Why the last AI title attempt failed; the session keeps its title. */
+export function TitleFailure({ message }: { message: string | null }) {
+  if (!message) return null;
+  return <p className="inline-error title-failure" role="alert">{message}</p>;
 }
 
 const rowId = (segmentId: string) => `transcript-row-${segmentId}`;

@@ -146,6 +146,16 @@ export function errorGuidance(code: string | null | undefined): ErrorGuidance {
   }
 }
 
+/** What an `assistant_update` means for the open session's title notice:
+ *  the message of a failed title job (automatic or requested), `null` when a
+ *  title job starts, succeeds or is cancelled, and `undefined` for any other
+ *  job or session. */
+export function titleNotice(job: AssistantJob, sessionId: string | null): string | null | undefined {
+  if (job.task !== "title" || !job.session_id || job.session_id !== sessionId) return undefined;
+  if (job.state !== "failed") return null;
+  return job.error?.message?.trim() || "The AI title could not be created.";
+}
+
 /** The transcript row a section time chip jumps to: the first row that
  *  starts at or after `startMs` (1 s tolerance for mm:ss rounding), else the
  *  last row. */

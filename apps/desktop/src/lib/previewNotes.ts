@@ -4,7 +4,7 @@
  *
  *  `?notes=` selects a state of the AI notes panel for review:
  *  `saved` (default) · `empty` · `streaming` · `sheet` · `error` ·
- *  `unconfigured`. */
+ *  `unconfigured`. `?title=failed` makes Generate title fail. */
 
 import type {
   AssistantJob,
@@ -269,6 +269,20 @@ export class PreviewAssistant {
   }
 
   title(sessionId: string): { title: string } {
+    if (new URLSearchParams(window.location.search).get("title") === "failed") {
+      // As the shell reports it: a failed job update, then the command's error.
+      const message =
+        "DeepSeek spent its reply budget on reasoning and returned no title. Try again, or choose a model without reasoning in Settings → AI assistant.";
+      const failed: AssistantJob = {
+        job_id: `preview-title-${Date.now().toString(36)}`,
+        session_id: sessionId,
+        task: "title",
+        state: "failed",
+        error: { code: "empty_response", message },
+      };
+      this.emit("assistant_update", failed, sessionId);
+      throw message;
+    }
     const session = this.sessions.find((record) => record.id === sessionId);
     const title = "卷积、滤波与图像金字塔";
     if (session && session.title_source !== "user") {
