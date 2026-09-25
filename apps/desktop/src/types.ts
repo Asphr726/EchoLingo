@@ -151,6 +151,8 @@ export interface RuntimePreferences {
    *  setting key (for example `{ dashscope: { region: "beijing" } }`). */
   providers: Record<string, Record<string, string>>;
   assistant: AssistantPreferences;
+  /** Ask the update server for a newer version shortly after launch. */
+  check_updates_at_launch: boolean;
 }
 
 /** AI assistant used for session notes and titles. */
@@ -453,6 +455,40 @@ export interface GpuAccelerationStatus {
   /** Whether the pack's Vulkan translation runtime passed its own check,
    *  apart from CUDA; missing from shells that do not report it. */
   llama_gpu_ok?: boolean | null;
+}
+
+export type UpdateState = "idle" | "checking" | "available" | "up_to_date" | "downloading" | "installing" | "error";
+
+/** A newer version the update server offers. */
+export interface AvailableUpdate {
+  version: string;
+  /** Release notes (Markdown). */
+  notes: string | null;
+  /** Publication time, RFC 3339. */
+  date: string | null;
+  /** The release page, for platforms that cannot update in place. */
+  release_url: string;
+}
+
+/** Payload of `get_update_status`, `check_for_update`, `install_update` and
+ *  the `echolingo://update-status` event. */
+export interface UpdateStatus {
+  current_version: string;
+  state: UpdateState;
+  available: AvailableUpdate | null;
+  /** RFC 3339 time of the last check that got an answer. */
+  last_checked_at: string | null;
+  error: string | null;
+  /** False on Linux and for a macOS copy running outside Applications; the
+   *  release page then offers the download. */
+  in_place_supported: boolean;
+  unsupported_reason: string | null;
+  check_at_launch: boolean;
+  /** Set while downloading; `total_bytes` is null without a known length. */
+  progress: { downloaded_bytes: number; total_bytes: number | null } | null;
+  /** Why the shell refuses to install right now (alignment, an assistant
+   *  job, a model or GPU pack install, a session), or null. */
+  install_blocked_reason: string | null;
 }
 
 export interface SessionRecord {

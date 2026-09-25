@@ -4,6 +4,7 @@ import {
   NAVIGATE_EVENT,
   type NavigationTarget,
   onNavigate,
+  peekPendingAnchor,
   peekPendingSection,
   requestNavigation,
 } from "./navigation";
@@ -39,6 +40,18 @@ describe("in-app navigation", () => {
     requestNavigation({ view: "settings", section: "translation" });
     requestNavigation({ view: "history", section: "translation" });
     expect(peekPendingSection()).toBeNull();
+  });
+
+  it("remembers the element to focus with the section", () => {
+    requestNavigation({ view: "settings", section: "general", anchor: "settings-updates" });
+    expect(peekPendingSection()).toBe("general");
+    expect(peekPendingAnchor()).toBe("settings-updates");
+    requestNavigation({ view: "settings", section: "privacy" });
+    expect(peekPendingAnchor()).toBeNull();
+    requestNavigation({ view: "settings", section: "general", anchor: "settings-updates" });
+    clearPendingSection();
+    expect(peekPendingSection()).toBeNull();
+    expect(peekPendingAnchor()).toBeNull();
   });
 
   it("ignores malformed requests", () => {

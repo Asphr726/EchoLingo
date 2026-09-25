@@ -26,6 +26,7 @@ import type {
   SessionSnapshot,
   StartSessionRequest,
   UiEventEnvelope,
+  UpdateStatus,
 } from "../types";
 import { defaultAssistantPreferences, defaultCaptionPreferences, defaultSessionDefaults, emptySnapshot } from "../types";
 import { platform } from "./platform";
@@ -228,6 +229,131 @@ async function previewInstallGpuPack(): Promise<GpuAccelerationStatus> {
   return previewGpuState;
 }
 
+// Updates of the preview. `&update=available|downloading|error|unsupported|
+// uptodate` shows that state in Settings → General → Updates (and the top-bar
+// pill with `&phase=idle`); without it the preview has not checked yet and
+// Check for updates finds nothing. Install walks through the download and
+// ends as if EchoLingo had restarted on the new version.
+const previewReleaseNotes = [
+  "## Highlights",
+  "",
+  "- **In-app updates.** EchoLingo checks for signed releases and installs them from Settings.",
+  "- Lecture captions keep up better after long pauses.",
+  "",
+  "## Fixes",
+  "",
+  "- The floating caption remembers its size.",
+  "- History search matches titles written by the assistant.",
+].join("\n");
+const previewUpdateIdle: UpdateStatus = {
+  current_version: "0.3.0",
+  state: "idle",
+  available: null,
+  last_checked_at: null,
+  error: null,
+  in_place_supported: true,
+  unsupported_reason: null,
+  check_at_launch: true,
+  progress: null,
+  install_blocked_reason: null,
+};
+let previewUpdateState: UpdateStatus | null = null;
+
+function previewUpdate(): UpdateStatus {
+  if (previewUpdateState) return previewUpdateState;
+  const checked = new Date(Date.now() - 12 * 60_000).toISOString();
+  const available: UpdateStatus = {
+    ...previewUpdateIdle,
+    state: "available",
+    last_checked_at: checked,
+    available: {
+      version: "0.3.1",
+      notes: previewReleaseNotes,
+      date: "2026-09-22T12:00:00Z",
+      release_url: "https://github.com/Asphr726/EchoLingo/releases/tag/v0.3.1",
+    },
+  };
+  switch (previewParam("update")) {
+    case "available":
+      return (previewUpdateState = available);
+    case "downloading":
+      return (previewUpdateState = {
+        ...available,
+        state: "downloading",
+        progress: { downloaded_bytes: 19_293_798, total_bytes: 48_339_763 },
+        install_blocked_reason: "An update is already being installed.",
+      });
+    case "error":
+      return (previewUpdateState = {
+        ...available,
+        state: "error",
+        error: "The update could not be downloaded: error sending request for url (https://github.com/Asphr726/EchoLingo/releases/download/v0.3.1/EchoLingo.app.tar.gz): connection reset",
+      });
+    case "unsupported":
+      return (previewUpdateState = {
+        ...available,
+        in_place_supported: false,
+        unsupported_reason:
+          platform() === "linux"
+            ? "On Linux, install the new .deb package from the release page."
+            : "EchoLingo is running from a disk image or an external volume. Drag it to the Applications folder, open it from there, and update again.",
+      });
+    case "uptodate":
+      return (previewUpdateState = { ...previewUpdateIdle, state: "up_to_date", last_checked_at: checked });
+    default:
+      return previewUpdateIdle;
+  }
+}
+
+const previewUpdateHandlers = new Set<(status: UpdateStatus) => void>();
+
+function setPreviewUpdate(status: UpdateStatus): UpdateStatus {
+  previewUpdateState = status;
+  for (const handler of [...previewUpdateHandlers]) handler(status);
+  return status;
+}
+
+async function previewCheckForUpdate(): Promise<UpdateStatus> {
+  const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+  const current = previewUpdate();
+  setPreviewUpdate({ ...current, state: "checking", error: null });
+  await sleep(900);
+  const checked = new Date().toISOString();
+  return setPreviewUpdate(
+    current.available
+      ? { ...current, state: "available", error: null, last_checked_at: checked }
+      : { ...current, state: "up_to_date", error: null, last_checked_at: checked },
+  );
+}
+
+async function previewInstallUpdate(): Promise<UpdateStatus> {
+  const current = previewUpdate();
+  if (!current.available) throw new Error("No update is ready to install; check for updates first.");
+  if (!current.in_place_supported) throw new Error(current.unsupported_reason ?? "This copy cannot update itself.");
+  if (!previewIdle()) throw new Error("Stop the current session before updating EchoLingo.");
+  const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+  const total = 48_339_763;
+  for (let step = 0; step <= 20; step += 1) {
+    setPreviewUpdate({
+      ...current,
+      state: "downloading",
+      error: null,
+      progress: { downloaded_bytes: Math.round((total * step) / 20), total_bytes: total },
+      install_blocked_reason: "An update is already being installed.",
+    });
+    await sleep(150);
+  }
+  setPreviewUpdate({ ...current, state: "installing", error: null, progress: null, install_blocked_reason: "An update is already being installed." });
+  await sleep(1400);
+  // As after the restart: the new version runs and is up to date.
+  return setPreviewUpdate({
+    ...previewUpdateIdle,
+    current_version: current.available.version,
+    state: "up_to_date",
+    last_checked_at: new Date().toISOString(),
+  });
+}
+
 /** `?consent=session|assistant|setup` opens the consent dialog on load. */
 export function previewConsentRequest(): ConsentRequest | null {
   switch (previewParam("consent")) {
@@ -340,6 +466,7 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
       assistant: previewMode() && previewNotesMode() !== "unconfigured"
         ? { provider_group: "dashscope", model: "", transcript_upload_allowed: previewAssistantConsentValue(true), auto_title: true }
         : defaultAssistantPreferences,
+      check_updates_at_launch: true,
     } satisfies RuntimePreferences,
     get_session_defaults: previewMode()
       ? {
@@ -390,6 +517,7 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
       preload_local_models: true,
       providers: { [String(args?.groupId)]: (args?.settings ?? {}) as Record<string, string> },
       assistant: defaultAssistantPreferences,
+      check_updates_at_launch: true,
     } satisfies RuntimePreferences as T;
   }
   if (previewMode()) {
@@ -439,6 +567,12 @@ function browserFallback<T>(name: string, args?: Record<string, unknown>): T {
         previewGpuState = { ...current, enabled, fallback_reason: null, active: enabled && current.pack_state === "ready" };
         return previewGpuState as T;
       }
+      case "get_update_status":
+        return previewUpdate() as T;
+      case "check_for_update":
+        return previewCheckForUpdate() as T;
+      case "install_update":
+        return previewInstallUpdate() as T;
     }
   }
   if (name === "history_search") return [] as T;
@@ -684,6 +818,19 @@ export async function subscribeModelProgress(
   return listen<ModelProgress>("echolingo://model-progress", ({ payload }) => handler(payload));
 }
 
+/** Every change of the update status, download progress included (the
+ *  shell sends at most about ten a second). */
+export async function subscribeUpdateStatus(
+  handler: (status: UpdateStatus) => void,
+): Promise<UnlistenFn> {
+  if (!isTauri()) {
+    if (!previewMode()) return () => undefined;
+    previewUpdateHandlers.add(handler);
+    return () => void previewUpdateHandlers.delete(handler);
+  }
+  return listen<UpdateStatus>("echolingo://update-status", ({ payload }) => handler(payload));
+}
+
 export const api = {
   snapshot: () => command<SessionSnapshot>("get_app_snapshot"),
   onboardingStatus: () => command<boolean>("onboarding_status"),
@@ -746,6 +893,13 @@ export const api = {
   removeGpuPack: () => command<GpuAccelerationStatus>("remove_gpu_pack"),
   setGpuAcceleration: (enabled: boolean) =>
     command<GpuAccelerationStatus>("set_gpu_acceleration", { enabled }),
+  // In-app updates. The shell checks, downloads, verifies the release
+  // signature and installs; a failed check is reported in the status.
+  getUpdateStatus: () => command<UpdateStatus>("get_update_status"),
+  checkForUpdate: () => command<UpdateStatus>("check_for_update"),
+  /** Refused while a session, an alignment, an assistant job or a model or
+   *  GPU pack install runs. On success EchoLingo restarts. */
+  installUpdate: () => command<UpdateStatus>("install_update"),
   showCaption: () => command<void>("show_caption_window"),
   hideCaption: () => command<void>("hide_caption_window"),
   historySearch: (query = "") =>

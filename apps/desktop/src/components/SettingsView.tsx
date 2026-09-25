@@ -3,10 +3,11 @@ import { type ReactNode, useEffect, useRef, useState } from "react";
 import { api, subscribeModelProgress } from "../lib/bridge";
 import { GLOSSARY_LIMIT } from "../lib/context";
 import { GPU_PACK_PROGRESS_ID } from "../lib/gpu";
-import { clearPendingSection, onNavigate, peekPendingSection } from "../lib/navigation";
+import { clearPendingSection, onNavigate, peekPendingAnchor, peekPendingSection } from "../lib/navigation";
 import { assistantPresets, credentialNeed, groupHasKey, onAssistantChanged } from "../lib/notes";
 import { platform, secureStoreName } from "../lib/platform";
 import { providersForGroup, recipientName } from "../lib/providers";
+import { UPDATES_ANCHOR } from "../lib/update";
 import { useApp } from "../state/AppContext";
 import type {
   AssistantPreferences,
@@ -24,11 +25,13 @@ import type {
   ProviderCatalog,
   ProviderSpec,
   RuntimePreferences,
+  SessionPhase,
   StartSessionRequest,
 } from "../types";
 import { defaultAssistantPreferences } from "../types";
 import { GpuAccelerationCard, useGpuAcceleration } from "./GpuAccelerationCard";
 import { ProviderSelect } from "./ProviderSelect";
+import { UpdatesCard, useUpdates } from "./UpdatesCard";
 
 const sections = [
   "General",
@@ -65,6 +68,9 @@ export function SettingsView() {
   // Counts deep links into a section. The control that followed one is
   // usually gone with the previous view, so focus moves to the heading.
   const [arrivals, setArrivals] = useState(() => (sectionForSlug(peekPendingSection()) ? 1 : 0));
+  // The element a deep link asked for (the Updates group from the top-bar
+  // pill); the heading otherwise.
+  const anchorRef = useRef<string | null>(sectionForSlug(peekPendingSection()) ? peekPendingAnchor() : null);
   useEffect(() => clearPendingSection(), []);
   // A deep link while Settings is already open switches the section here;
   // the main window only switches views.
@@ -73,6 +79,7 @@ export function SettingsView() {
       onNavigate((target) => {
         const next = target.view === "settings" ? sectionForSlug(target.section) : undefined;
         if (!next) return;
+        anchorRef.current = target.anchor ?? null;
         setSection(next);
         setArrivals((count) => count + 1);
         clearPendingSection();
@@ -83,7 +90,16 @@ export function SettingsView() {
     if (arrivals === 0) return;
     // A frame later: the consent dialog that followed the link has closed
     // by then, so the page is no longer inert.
-    const frame = requestAnimationFrame(() => headingRef.current?.focus({ preventScroll: true }));
+    const frame = requestAnimationFrame(() => {
+      const anchor = anchorRef.current ? document.getElementById(anchorRef.current) : null;
+      anchorRef.current = null;
+      if (anchor) {
+        anchor.focus({ preventScroll: true });
+        anchor.scrollIntoView({ block: "start" });
+      } else {
+        headingRef.current?.focus({ preventScroll: true });
+      }
+    });
     return () => cancelAnimationFrame(frame);
   }, [arrivals]);
   // Each section opens at its top; the section list stays where it is.
@@ -106,6 +122,7 @@ export function SettingsView() {
     preload_local_models: true,
     providers: {},
     assistant: defaultAssistantPreferences,
+    check_updates_at_launch: true,
   });
   useEffect(() => {
     let active = true;
@@ -213,6 +230,12 @@ export function SettingsView() {
                 </button>
               </div>
             </SettingsGroup>
+            <UpdatesSettings
+              phase={snapshot.phase}
+              sessionActive={sessionActive}
+              checkAtLaunch={runtime.check_updates_at_launch}
+              onToggleCheckAtLaunch={(enabled) => void updateRuntime({ ...runtime, check_updates_at_launch: enabled })}
+            />
           </div>
         )}
 
@@ -485,6 +508,44 @@ export function SettingsView() {
         )}
       </section>
     </div>
+  );
+}
+
+/** Settings → General: in-app updates. The group is always rendered (the
+ *  top-bar pill focuses it); its body waits for the shell's status. */
+function UpdatesSettings({
+  checkAtLaunch,
+  onToggleCheckAtLaunch,
+  phase,
+  sessionActive,
+}: {
+  phase: SessionPhase;
+  sessionActive: boolean;
+  checkAtLaunch: boolean;
+  onToggleCheckAtLaunch: (enabled: boolean) => void;
+}) {
+  const updates = useUpdates(phase);
+  return (
+    <SettingsGroup
+      id={UPDATES_ANCHOR}
+      title="Updates"
+      description="New versions come from EchoLingo's GitHub releases. Each download is checked against the release signature before it replaces the app, and nothing installs during a session."
+    >
+      {updates.status ? (
+        <UpdatesCard
+          status={updates.status}
+          sessionActive={sessionActive}
+          checkAtLaunch={checkAtLaunch}
+          pending={updates.pending}
+          error={updates.error}
+          onCheck={() => void updates.check()}
+          onInstall={() => void updates.install()}
+          onToggleCheckAtLaunch={onToggleCheckAtLaunch}
+        />
+      ) : (
+        <p className="settings-helper">{updates.unavailable ? "Updates are managed by the EchoLingo desktop app." : "Loading the update status…"}</p>
+      )}
+    </SettingsGroup>
   );
 }
 
@@ -1028,10 +1089,11 @@ function roleSummary(result: CloudProbeAsrResult | CloudProbeTranslationResult, 
   return parts.join(" · ");
 }
 
-function SettingsGroup({ children, description, title }: { children: ReactNode; description: string; title: string }) {
+/** `id` makes the group a deep-link target: it can take focus. */
+function SettingsGroup({ children, description, id, title }: { children: ReactNode; description: string; id?: string; title: string }) {
   return (
-    <section className="settings-group">
-      <header><h3>{title}</h3><p>{description}</p></header>
+    <section className="settings-group" id={id} tabIndex={id ? -1 : undefined} aria-labelledby={id ? `${id}-title` : undefined}>
+      <header><h3 id={id ? `${id}-title` : undefined}>{title}</h3><p>{description}</p></header>
       <div className="settings-group-body">{children}</div>
     </section>
   );

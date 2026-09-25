@@ -113,6 +113,10 @@ button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-
   text-transform: uppercase;
 }
 .topbar h1 { margin: 0; font-size: 26px; font-weight: 680; letter-spacing: -.035em; }
+.topbar-side { display: flex; align-items: center; gap: 18px; }
+.update-pill { display: inline-flex; align-items: center; gap: 6px; min-height: 26px; padding: 0 11px; border: 1px solid #bfd0c3; border-radius: 999px; background: var(--accent-soft); color: var(--accent-deep); font-size: 10px; font-weight: 660; white-space: nowrap; transition: background .18s var(--ease), border-color .18s var(--ease), transform .18s var(--ease); }
+.update-pill:hover { border-color: #a6c1ad; background: #d3e3d7; }
+.update-pill:active { transform: translateY(1px) scale(.98); }
 .topbar-status { display: flex; align-items: center; gap: 11px; }
 .topbar-status div { display: grid; gap: 2px; }
 .topbar-status strong { font-size: 12px; font-weight: 680; }
@@ -489,6 +493,32 @@ input::placeholder { color: #9a9c93; }
 .provider-card-grid .settings-control { max-width: none; }
 .provider-card .settings-helper { margin: 0; }
 .provider-card .cloud-probe { max-width: none; }
+
+/* Settings → General → Updates. */
+.settings-group:focus { outline: none; }
+.settings-group:focus-visible { border-radius: 6px; outline: 2px solid color-mix(in srgb, var(--accent) 60%, white); outline-offset: 6px; }
+.update-summary { display: flex; max-width: 570px; align-items: center; justify-content: space-between; gap: 18px; }
+.update-summary-copy { display: grid; gap: 3px; }
+.update-summary-copy strong { font-size: 12px; font-weight: 670; }
+.update-summary-copy small { color: var(--muted); font-size: 10px; }
+.update-card { display: grid; max-width: 570px; gap: 14px; padding: 18px 20px 17px; border: 1px solid var(--line); border-radius: 12px; background: rgba(255, 255, 255, .42); }
+.update-card-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.update-card-header a.button { text-decoration: none; }
+.update-card-copy { display: grid; min-width: 0; gap: 4px; }
+.update-card-copy > span { display: inline-flex; align-items: center; gap: 5px; color: var(--accent-deep); font-size: 8px; font-weight: 680; letter-spacing: .08em; text-transform: uppercase; }
+.update-card-copy strong { font-size: 13px; font-weight: 670; letter-spacing: -.01em; }
+.update-card-copy small { color: var(--muted); font-size: 10px; }
+.update-card .settings-helper { margin: 0; }
+.update-card .settings-error { overflow-wrap: anywhere; }
+.update-card .settings-note { max-width: none; }
+.update-card .settings-note svg { flex-shrink: 0; }
+.update-progress .model-progress { width: 100%; }
+.update-progress .model-progress small { text-align: left; text-transform: none; }
+.update-notes { max-height: 240px; padding: 14px 16px; overflow-y: auto; overscroll-behavior: contain; border-radius: 9px; background: var(--surface-raised); }
+.update-notes:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 60%, white); outline-offset: 2px; }
+.update-notes .notes-body { font-size: 13px; line-height: 1.55; }
+.update-notes .notes-body > .notes-heading--1, .update-notes .notes-body > .notes-heading--2 { font-size: 14px; }
+.update-notes .notes-body > .notes-heading--2 { margin-top: 1.3em; }
 
 .onboarding-shell { display: grid; height: 100dvh; grid-template-columns: 260px minmax(0, 1fr); background: var(--surface); color: var(--ink); }
 .onboarding-progress { display: flex; flex-direction: column; padding: 34px 28px; border-right: 1px solid var(--line); background: #e7e6df; }

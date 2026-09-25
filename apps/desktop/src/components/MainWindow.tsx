@@ -7,13 +7,15 @@ import {
 } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import { previewConsentRequest } from "../lib/bridge";
-import { type AppView, onNavigate } from "../lib/navigation";
+import { type AppView, onNavigate, requestNavigation } from "../lib/navigation";
+import { isSessionActive, UPDATES_ANCHOR } from "../lib/update";
 import { useApp, useConsent } from "../state/AppContext";
 import { ConsentDialog } from "./ConsentDialog";
 import { HistoryView } from "./HistoryView";
 import { LiveView } from "./LiveView";
 import { Onboarding } from "./Onboarding";
 import { SettingsView } from "./SettingsView";
+import { UpdatePill, useUpdates } from "./UpdatesCard";
 
 type View = AppView;
 
@@ -32,6 +34,7 @@ export function MainWindow() {
   const consent = useConsent();
   const { requestConsent } = consent;
   const activeRoute = snapshot.route?.deployment ?? "not routed";
+  const updates = useUpdates(snapshot.phase);
 
   // Deep links ("Open AI assistant settings") switch the view in place.
   useEffect(() => onNavigate((target) => setView(target.view)), []);
@@ -85,11 +88,18 @@ export function MainWindow() {
             <p className="eyebrow">EchoLingo / {view}</p>
             <h1>{view === "live" ? "Lecture interpreter" : capitalize(view)}</h1>
           </div>
-          <div className="topbar-status" aria-label="Application status">
-            <span className={`status-pulse status-pulse--${snapshot.phase.toLowerCase()}`} />
-            <div>
-              <strong>{loading ? "Connecting" : phaseLabel(snapshot.phase)}</strong>
-              <span>{activeRoute.replaceAll("_", " ")}</span>
+          <div className="topbar-side">
+            <UpdatePill
+              status={updates.status}
+              sessionActive={isSessionActive(snapshot.phase)}
+              onOpen={() => requestNavigation({ view: "settings", section: "general", anchor: UPDATES_ANCHOR })}
+            />
+            <div className="topbar-status" aria-label="Application status">
+              <span className={`status-pulse status-pulse--${snapshot.phase.toLowerCase()}`} />
+              <div>
+                <strong>{loading ? "Connecting" : phaseLabel(snapshot.phase)}</strong>
+                <span>{activeRoute.replaceAll("_", " ")}</span>
+              </div>
             </div>
           </div>
         </header>
