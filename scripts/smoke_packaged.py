@@ -1,10 +1,15 @@
 """Smoke-test the packaged sidecar and llama.cpp runtime.
 
-``prebundle`` checks the frozen sidecar and the llama.cpp directory before
-Tauri bundles them; ``bundle`` checks the finished DMG / NSIS installer /
-.deb / AppImage, running the sidecar self-test from inside each bundle.  A
-failing AppImage is reported and renamed to ``*.AppImage.rejected`` so the
-release upload skips it; every other failure exits non-zero.
+``config`` checks the production Tauri configs before a release build (no
+``dangerous*`` keys, a valid updater public key, updater artifacts only through
+the release overlay). ``prebundle`` checks the frozen sidecar and the llama.cpp
+directory before Tauri bundles them; ``bundle`` checks the finished DMG / NSIS
+installer / .deb / AppImage, running the sidecar self-test from inside each
+bundle, and the signed updater artifacts: the macOS ``.app.tar.gz`` (version
+and code signature of the app inside) and the key id of every ``.sig``.
+``bundle --updater`` requires those artifacts. A failing AppImage is reported
+and renamed to ``*.AppImage.rejected`` so the release upload skips it; every
+other failure exits non-zero.
 """
 
 from __future__ import annotations
@@ -12,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import plistlib
 import subprocess
 import sys
 import tempfile
@@ -20,7 +26,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from update_manifest import (  # noqa: E402
+    ManifestError,
+    format_key_id,
+    public_key_id,
+    signature_key_id,
+)
+
+
+TAURI_DIR = Path("apps/desktop/src-tauri")
+UPDATER_OVERLAY = "tauri.updater.conf.json"
 MAX_ARTIFACT_BYTES = int(1.9 * 1024**3)
 WINDOWS_MAX_PATH = 259
 # Longest plausible per-user install prefix: C:\Users\<20 chars>\AppData\Local\EchoLingo\
@@ -44,9 +61,17 @@ class Results:
         self.lines.append(f"- {message}")
 
 
+def read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def expected_version(root: Path) -> str:
-    config = root / "apps/desktop/src-tauri/tauri.conf.json"
-    return str(json.loads(config.read_text(encoding="utf-8"))["version"])
+    return str(read_json(root / TAURI_DIR / "tauri.conf.json")["version"])
+
+
+def updater_key_id(root: Path) -> bytes:
+    config = read_json(root / TAURI_DIR / "tauri.conf.json")
+    return public_key_id(str(config.get("plugins", {}).get("updater", {}).get("pubkey", "")))
 
 
 def child_environment() -> dict[str, str]:
@@ -170,6 +195,119 @@ def find_one(root: Path, pattern: str) -> Path | None:
     return matches[0] if matches else None
 
 
+# --- release configuration and updater artifacts -------------------------------------
+
+
+def dangerous_keys(value: Any, path: str = "") -> list[str]:
+    """Dotted paths of every ``dangerous*`` key: each one switches off a Tauri safeguard."""
+    found: list[str] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            dotted = f"{path}.{key}" if path else str(key)
+            if str(key).lower().startswith("dangerous"):
+                found.append(dotted)
+            found += dangerous_keys(child, dotted)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            found += dangerous_keys(child, f"{path}[{index}]")
+    return found
+
+
+def check_configs(tauri_dir: Path, results: Results) -> None:
+    for path in sorted(tauri_dir.glob("tauri*.json")):
+        found = dangerous_keys(read_json(path))
+        if found:
+            results.fail(f"{path.name}: {', '.join(found)} must not ship")
+        else:
+            results.ok(f"{path.name}: no dangerous* keys")
+    base = read_json(tauri_dir / "tauri.conf.json")
+    if "createUpdaterArtifacts" in base.get("bundle", {}):
+        # Local builds have no signing key; only release builds add the overlay.
+        results.fail(f"tauri.conf.json sets bundle.createUpdaterArtifacts; leave it to {UPDATER_OVERLAY}")
+    overlay = read_json(tauri_dir / UPDATER_OVERLAY)
+    if overlay.get("bundle") != {"createUpdaterArtifacts": True} or set(overlay) - {"$schema", "bundle"}:
+        results.fail(f"{UPDATER_OVERLAY} must only set bundle.createUpdaterArtifacts = true")
+    updater = base.get("plugins", {}).get("updater", {})
+    try:
+        results.ok(f"updater public key {format_key_id(public_key_id(str(updater.get('pubkey', ''))))}")
+    except ManifestError as error:
+        results.fail(str(error))
+    endpoints = updater.get("endpoints") or []
+    if not endpoints or not all(str(url).startswith("https://") for url in endpoints):
+        results.fail(f"updater endpoints must all be https: {endpoints}")
+    else:
+        results.ok(f"updater endpoints {', '.join(endpoints)}")
+
+
+def check_signature(signed: Path, key_id: bytes | None, results: Results) -> None:
+    signature = signed.with_name(signed.name + ".sig")
+    if not signature.is_file():
+        results.fail(f"{signed.name}: no updater signature {signature.name}")
+        return
+    if key_id is None:
+        results.fail(f"{signature.name}: tauri.conf.json has no valid plugins.updater.pubkey")
+        return
+    try:
+        actual = signature_key_id(signature.read_text(encoding="utf-8"), signature.name)
+    except ManifestError as error:
+        results.fail(str(error))
+        return
+    if actual != key_id:
+        results.fail(
+            f"{signature.name}: signed by key {format_key_id(actual)}, "
+            f"but the app trusts {format_key_id(key_id)}"
+        )
+    else:
+        results.ok(f"{signature.name}: signed by key {format_key_id(actual)}")
+
+
+def check_app_bundle(app: Path, version: str, results: Results, label: str) -> None:
+    with (app / "Contents/Info.plist").open("rb") as handle:
+        short_version = plistlib.load(handle).get("CFBundleShortVersionString")
+    if short_version != version:
+        results.fail(f"{label}: CFBundleShortVersionString {short_version!r} != {version!r}")
+    else:
+        results.ok(f"{label}: {app.name} {short_version}")
+    verify = subprocess.run(
+        ["codesign", "--verify", "--deep", "--strict", str(app)], capture_output=True, text=True
+    )
+    if verify.returncode != 0:
+        results.fail(
+            f"{label}: codesign --verify --deep --strict exit {verify.returncode}: "
+            f"{verify.stderr.strip()[:300]}"
+        )
+    else:
+        results.ok(f"{label}: codesign --verify --deep --strict")
+
+
+def check_macos_updater(
+    bundle_dir: Path, version: str, key_id: bytes | None, results: Results, required: bool
+) -> None:
+    archives = sorted((bundle_dir / "macos").glob("*.app.tar.gz"))
+    if not archives:
+        if required:
+            results.fail(f"no updater archive (*.app.tar.gz) under {bundle_dir / 'macos'}")
+        else:
+            results.note("no updater archive (built without the updater overlay)")
+        return
+    for archive in archives:
+        check_size(archive, results)
+        check_signature(archive, key_id, results)
+        # The updater replaces the installed app with exactly this tree.
+        with tempfile.TemporaryDirectory() as scratch:
+            extracted = subprocess.run(
+                ["tar", "-xzf", str(archive), "-C", scratch], capture_output=True, text=True
+            )
+            apps = sorted(Path(scratch).glob("*.app"))
+            if extracted.returncode != 0 or len(apps) != 1:
+                results.fail(
+                    f"{archive.name}: expected one .app (tar exit {extracted.returncode}, "
+                    f"found {[app.name for app in apps]}) {extracted.stderr.strip()[:300]}"
+                )
+                continue
+            check_app_bundle(apps[0], version, results, archive.name)
+
+
 def check_installed_tree(root: Path, version: str, results: Results, label: str) -> bool:
     sidecar = find_one(root, f"sidecar/echolingo-sidecar{EXE}")
     server = find_one(root, f"runtimes/llama.cpp/llama-server{EXE}")
@@ -192,14 +330,17 @@ def prebundle(args: argparse.Namespace, version: str, results: Results) -> None:
         check_windows_paths([sidecar_root, llama], results)
 
 
-def bundle_macos(bundle_dir: Path, version: str, results: Results) -> None:
+def bundle_macos(
+    bundle_dir: Path, version: str, results: Results, key_id: bytes | None, updater: bool
+) -> None:
+    check_macos_updater(bundle_dir, version, key_id, results, updater)
     dmg = find_one(bundle_dir, "*.dmg")
     if dmg is None:
         results.fail(f"no .dmg under {bundle_dir}")
         return
     check_size(dmg, results)
-    # `--bundles dmg` removes the intermediate .app, and the image is what
-    # users get anyway: test the app inside it.
+    # The image is what new users install: test the app inside it rather than
+    # the build tree's .app (which `--bundles dmg` alone removes).
     with tempfile.TemporaryDirectory() as mount:
         attach = subprocess.run(
             ["hdiutil", "attach", "-nobrowse", "-readonly", "-noautoopen", "-mountpoint", mount, str(dmg)],
@@ -232,12 +373,22 @@ def install_nsis(installer: Path, target: Path) -> subprocess.CompletedProcess[s
     return subprocess.run(f'"{installer}" /S /D={target}', capture_output=True, text=True, timeout=900)
 
 
-def bundle_windows(bundle_dir: Path, version: str, results: Results, install_dir: Path | None) -> None:
+def bundle_windows(
+    bundle_dir: Path,
+    version: str,
+    results: Results,
+    install_dir: Path | None,
+    key_id: bytes | None,
+    updater: bool,
+) -> None:
     installer = find_one(bundle_dir, "*-setup.exe")
     if installer is None:
         results.fail(f"no NSIS installer under {bundle_dir}")
         return
     check_size(installer, results)
+    # The updater downloads and runs this same installer.
+    if updater or installer.with_name(installer.name + ".sig").exists():
+        check_signature(installer, key_id, results)
     if install_dir is None:
         return
     completed = install_nsis(installer, install_dir)
@@ -312,6 +463,12 @@ def main() -> int:
     post.add_argument(
         "--install-dir", type=Path, help="Windows: silently install the NSIS setup here and test it"
     )
+    post.add_argument(
+        "--updater",
+        action="store_true",
+        help="require signed updater artifacts (release builds with the updater overlay)",
+    )
+    commands.add_parser("config", help="check the production Tauri configs")
     install = commands.add_parser("install-nsis", help="silently install an NSIS setup")
     install.add_argument("--installer", type=Path, required=True)
     install.add_argument("--install-dir", type=Path, required=True)
@@ -325,15 +482,22 @@ def main() -> int:
             return 1
         print(args.install_dir)
         return 0
-    if args.stage == "prebundle":
+    if args.stage == "config":
+        check_configs(root / TAURI_DIR, results)
+        title = "Release configuration"
+    elif args.stage == "prebundle":
         prebundle(args, version, results)
         title = "Packaged runtime (pre-bundle)"
     else:
         bundle_dir = args.bundle_dir.resolve()
+        try:
+            key_id: bytes | None = updater_key_id(root)
+        except ManifestError:
+            key_id = None
         if sys.platform == "darwin":
-            bundle_macos(bundle_dir, version, results)
+            bundle_macos(bundle_dir, version, results, key_id, args.updater)
         elif sys.platform == "win32":
-            bundle_windows(bundle_dir, version, results, args.install_dir)
+            bundle_windows(bundle_dir, version, results, args.install_dir, key_id, args.updater)
         else:
             bundle_linux(bundle_dir, version, results)
         title = "Packaged bundles"

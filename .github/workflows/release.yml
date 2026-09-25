@@ -2,7 +2,9 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    # Version tags only: the `updater` manifest tag and the `windows-linux-v*`
+    # draft tags must never start a build.
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
     branches: ["release/**"]
   workflow_dispatch:
 
@@ -31,20 +33,30 @@ jobs:
             os: macos-14
             sidecar_mode: onefile
             sidecar: apps/desktop/src-tauri/binaries/echolingo-sidecar-aarch64-apple-darwin
-            bundles: dmg
-            artifacts: target/release/bundle/dmg/*.dmg
+            # Tauri makes the updater archive (.app.tar.gz) only for the `app` bundle type.
+            bundles: app,dmg
+            updater: true
+            artifacts: |
+              target/release/bundle/dmg/*.dmg
+              target/release/bundle/macos/EchoLingo_*_aarch64.app.tar.gz
+              target/release/bundle/macos/EchoLingo_*_aarch64.app.tar.gz.sig
           - name: windows-x64
             os: windows-latest
             sidecar_mode: onedir
             sidecar: apps/desktop/src-tauri/sidecar/echolingo-sidecar.exe
             bundles: nsis
+            # The updater downloads and runs the signed NSIS setup itself.
+            updater: true
             torch_index: https://download.pytorch.org/whl/cpu
-            artifacts: target/release/bundle/nsis/*-setup.exe
+            artifacts: |
+              target/release/bundle/nsis/*-setup.exe
+              target/release/bundle/nsis/*-setup.exe.sig
           - name: linux-x64
             os: ubuntu-22.04
             sidecar_mode: onedir
             sidecar: apps/desktop/src-tauri/sidecar/echolingo-sidecar
             # linuxdeploy fails on the one-folder sidecar; AppImage is on the roadmap.
+            # No updater artifacts: the app links to the download page on Linux.
             bundles: deb
             torch_index: https://download.pytorch.org/whl/cpu
             artifacts: target/release/bundle/deb/*.deb
@@ -78,6 +90,34 @@ jobs:
           cache-dependency-path: |
             pyproject.toml
             requirements/*.txt
+      - name: Release configuration
+        run: |
+          python scripts/smoke_packaged.py config
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version=$(python -c 'import json; print(json.load(open("apps/desktop/src-tauri/tauri.conf.json"))["version"])')
+            if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match version $version in tauri.conf.json"
+              exit 1
+            fi
+            if [ ! -f ".github/release-notes/$GITHUB_REF_NAME.md" ]; then
+              echo "::error::.github/release-notes/$GITHUB_REF_NAME.md is missing"
+              exit 1
+            fi
+          fi
+      - name: Updater signing key
+        if: matrix.updater
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            # Relative to apps/desktop, where the npm workspace script runs tauri.
+            echo "UPDATER_OVERLAY=src-tauri/tauri.updater.conf.json" >> "$GITHUB_ENV"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "::error::The TAURI_SIGNING_PRIVATE_KEY secret is empty; a release must ship signed updater artifacts."
+            exit 1
+          else
+            echo "::warning::The TAURI_SIGNING_PRIVATE_KEY secret is empty; building without updater artifacts."
+          fi
       - name: Rust toolchain
         run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -118,14 +158,30 @@ jobs:
           # linuxdeploy's strip breaks the frozen sidecar's libraries.
           NO_STRIP: "true"
           APPIMAGE_EXTRACT_AND_RUN: "1"
-        run: npm run tauri --workspace @echolingo/desktop -- build --ci --bundles ${{ matrix.bundles }}
+          # Read only when the overlay turns on createUpdaterArtifacts.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ matrix.updater && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ matrix.updater && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
+        run: >-
+          npm run tauri --workspace @echolingo/desktop -- build --ci --bundles ${{ matrix.bundles }}
+          ${UPDATER_OVERLAY:+--config "$UPDATER_OVERLAY"}
+      - name: Name the macOS updater archive
+        if: runner.os == 'macOS' && env.UPDATER_OVERLAY != ''
+        run: |
+          version=$(python -c 'import json; print(json.load(open("apps/desktop/src-tauri/tauri.conf.json"))["version"])')
+          cd target/release/bundle/macos
+          # The signature covers the archive's bytes, not its name.
+          mv EchoLingo.app.tar.gz "EchoLingo_${version}_aarch64.app.tar.gz"
+          mv EchoLingo.app.tar.gz.sig "EchoLingo_${version}_aarch64.app.tar.gz.sig"
+          ls -l
       - name: Smoke test the bundles
         if: runner.os != 'Windows'
-        run: python scripts/smoke_packaged.py bundle
+        run: python scripts/smoke_packaged.py bundle ${UPDATER_OVERLAY:+--updater}
       - name: Smoke test the installer
         if: runner.os == 'Windows'
         shell: pwsh
-        run: python scripts/smoke_packaged.py bundle --install-dir "$env:RUNNER_TEMP\安装 测试\EchoLingo"
+        run: |
+          $updater = @(if ($env:UPDATER_OVERLAY) { '--updater' })
+          python scripts/smoke_packaged.py bundle --install-dir "$env:RUNNER_TEMP\安装 测试\EchoLingo" @updater
       - uses: actions/upload-artifact@v7
         with:
           name: echolingo-${{ matrix.name }}
@@ -307,31 +363,75 @@ jobs:
           retention-days: 7
 
   release:
-    name: draft release
+    name: draft releases
     needs: [build, gpu-pack, smoke-models]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
     steps:
       - name: Free disk space
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
       - uses: actions/download-artifact@v8
         with:
           pattern: echolingo-*
-          path: dist
-          merge-multiple: true
-      - name: Checksums
-        working-directory: dist
+          path: artifacts
+      - name: Sort the release files
+        # macOS is published as a pre-release; Windows, Linux and the GPU packs
+        # stay in an unpublished draft.
         run: |
-          sha256sum -- * > SHA256SUMS.txt
-          cat SHA256SUMS.txt
-      - name: Draft pre-release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          mkdir -p dist/macos dist/other
+          for artifact in artifacts/*/; do
+            case "$(basename "$artifact")" in
+              echolingo-macos-*) target=dist/macos ;;
+              *) target=dist/other ;;
+            esac
+            # An artifact keeps the folders below its common root (the DMG and the
+            # updater archive come from different bundle folders); releases take files.
+            find "$artifact" -type f -exec mv -n -t "$target" {} +
+          done
+          if [ -n "$(find artifacts -type f)" ]; then
+            echo "::error::duplicate release file names:"
+            find artifacts -type f
+            exit 1
+          fi
+          ls -l dist/macos dist/other
+      - name: Checksums
+        run: |
+          for dir in dist/macos dist/other; do
+            (cd "$dir" && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          done
+      - name: Draft the macOS pre-release
         run: >-
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --prerelease
-          --title "EchoLingo ${TAG#v} Beta" --notes-file ".github/release-notes/$TAG.md" dist/*
+          --title "EchoLingo ${TAG#v} Beta (macOS)" --notes-file ".github/release-notes/$TAG.md"
+          dist/macos/*
+      - name: Draft the Windows and Linux release
+        # No --verify-tag: the windows-linux-v* tag is created at this commit only
+        # if the draft is ever published.
+        run: |
+          notes=".github/release-notes/$TAG-windows-linux.md"
+          if [ -f "$notes" ]; then
+            notes_args=(--notes-file "$notes")
+          else
+            notes_args=(--notes "Windows and Linux builds of EchoLingo ${TAG#v}, not yet tested on real hardware. Keep this release a draft.")
+          fi
+          gh release create "windows-linux-$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --draft --prerelease --title "EchoLingo ${TAG#v} Beta (Windows & Linux, draft)" \
+            "${notes_args[@]}" dist/other/*
+      - name: Update manifest for review
+        # Only attached to the macOS draft. After that release is published,
+        #   python scripts/update_manifest.py --tag vX.Y.Z --publish
+        # replaces latest.json on the `updater` release that installed copies read.
+        run: |
+          python scripts/update_manifest.py --tag "$TAG" --repo "$GITHUB_REPOSITORY" --allow-draft \
+            --out dist/latest.json
+          gh release upload "$TAG" dist/latest.json --repo "$GITHUB_REPOSITORY"

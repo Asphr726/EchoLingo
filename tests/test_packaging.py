@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import base64
 import importlib.util
 import io
 import json
 import plistlib
 import re
+import subprocess
 import sys
 import tarfile
 import zipfile
@@ -364,10 +366,153 @@ def test_bundle_icons_exist() -> None:
 
 def test_desktop_versions_agree() -> None:
     version = _json(TAURI / "tauri.conf.json")["version"]
-    assert version == "0.2.0"
+    assert version == "0.3.0"
     assert _json(ROOT / "apps/desktop/package.json")["version"] == version
     lock = _json(ROOT / "package-lock.json")
     assert lock["packages"]["apps/desktop"]["version"] == version
+    cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+    assert re.search(r'^\[workspace\.package\]\nversion = "([^"]+)"', cargo, re.M).group(1) == version
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert re.search(r'^version = "([^"]+)"', pyproject, re.M).group(1) == version
+    init = (ROOT / "src/echolingo/__init__.py").read_text(encoding="utf-8")
+    assert f'__version__ = "{version}"' in init
+
+
+# --- in-app updater ------------------------------------------------------------------
+
+UPDATER_PUBKEY = (
+    "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDczRDQyNTZFRUQzRDE2MzAKUldRd0Zq"
+    "M3RiaVhVYzIyWEJmR0JxSnZObW1LQkdodFl5TDdJTTlhZGd3bTl5UDhoTVg2SnpBRmkK"
+)
+
+
+def test_updater_plugin_uses_the_production_key_and_manifest() -> None:
+    config = _json(TAURI / "tauri.conf.json")
+    assert config["plugins"]["updater"] == {
+        "pubkey": UPDATER_PUBKEY,
+        "endpoints": ["https://github.com/Asphr726/EchoLingo/releases/download/updater/latest.json"],
+        "windows": {"installMode": "passive"},
+    }
+    manifest = load_script("update_manifest")
+    assert manifest.format_key_id(manifest.public_key_id(UPDATER_PUBKEY)) == "73D4256EED3D1630"
+
+
+def test_updater_artifacts_come_only_from_the_release_overlay() -> None:
+    # Local builds have no signing key, so the base config must not ask for signatures.
+    assert "createUpdaterArtifacts" not in _json(TAURI / "tauri.conf.json")["bundle"]
+    overlay = _json(TAURI / "tauri.updater.conf.json")
+    assert overlay == {
+        "$schema": "https://schema.tauri.app/config/2",
+        "bundle": {"createUpdaterArtifacts": True},
+    }
+    release = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+    # The npm workspace script runs tauri in apps/desktop.
+    assert "UPDATER_OVERLAY=src-tauri/tauri.updater.conf.json" in release
+    assert (ROOT / "apps/desktop" / "src-tauri/tauri.updater.conf.json").is_file()
+    assert 'tags: ["v[0-9]+.[0-9]+.[0-9]+"]' in release
+    assert "bundles: app,dmg" in release
+
+
+def test_production_configs_have_no_dangerous_keys() -> None:
+    smoke = load_script("smoke_packaged")
+    configs = sorted(TAURI.glob("tauri*.json"))
+    assert {path.name for path in configs} >= {
+        "tauri.conf.json",
+        "tauri.linux.conf.json",
+        "tauri.windows.conf.json",
+        "tauri.updater.conf.json",
+    }
+    for path in configs:
+        text = path.read_text(encoding="utf-8")
+        assert "dangerous" not in text.lower(), path.name
+        assert smoke.dangerous_keys(_json(path)) == []
+    nested = {"plugins": {"updater": {"dangerousInsecureTransportProtocol": True}}, "app": [
+        {"security": {"dangerousDisableAssetCspModification": True}}
+    ]}
+    assert smoke.dangerous_keys(nested) == [
+        "plugins.updater.dangerousInsecureTransportProtocol",
+        "app[0].security.dangerousDisableAssetCspModification",
+    ]
+    results = smoke.Results()
+    smoke.check_configs(TAURI, results)
+    assert results.failures == []
+
+
+def _minisign(comment: str, payload: bytes, trailer: str = "") -> str:
+    text = f"untrusted comment: {comment}\n{base64.b64encode(payload).decode()}\n{trailer}"
+    return base64.b64encode(text.encode()).decode()
+
+
+def _signature(key_id: bytes) -> str:
+    trailer = "trusted comment: timestamp:1\tfile:x\n" + base64.b64encode(bytes(64)).decode() + "\n"
+    return _minisign("signature from tauri secret key", b"ED" + key_id + bytes(64), trailer)
+
+
+def test_packaged_smoke_checks_updater_signature_key_ids(tmp_path) -> None:
+    smoke = load_script("smoke_packaged")
+    key_id = bytes.fromhex("30163ded6e25d473")
+    setup = tmp_path / "EchoLingo_0.3.0_x64-setup.exe"
+    setup.write_bytes(b"MZ")
+    results = smoke.Results()
+    smoke.check_signature(setup, key_id, results)
+    assert results.failures == ["EchoLingo_0.3.0_x64-setup.exe: no updater signature "
+                                "EchoLingo_0.3.0_x64-setup.exe.sig"]
+    (tmp_path / f"{setup.name}.sig").write_text(_signature(key_id))
+    results = smoke.Results()
+    smoke.check_signature(setup, key_id, results)
+    assert results.failures == [] and "73D4256EED3D1630" in results.lines[0]
+    (tmp_path / f"{setup.name}.sig").write_text(_signature(bytes(8)))
+    results = smoke.Results()
+    smoke.check_signature(setup, key_id, results)
+    assert "signed by key 0000000000000000" in results.failures[0]
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="needs tar and codesign on macOS")
+def test_packaged_smoke_checks_the_macos_updater_archive(tmp_path) -> None:
+    smoke = load_script("smoke_packaged")
+    key_id = bytes.fromhex("30163ded6e25d473")
+    app = tmp_path / "build" / "EchoLingo.app"
+    (app / "Contents/MacOS").mkdir(parents=True)
+    (app / "Contents/MacOS/echolingo").write_text("#!/bin/sh\nexit 0\n")
+    (app / "Contents/MacOS/echolingo").chmod(0o755)
+    info = {"CFBundleExecutable": "echolingo", "CFBundleIdentifier": "app.echolingo.test",
+            "CFBundlePackageType": "APPL", "CFBundleShortVersionString": "0.3.0"}
+    with (app / "Contents/Info.plist").open("wb") as handle:
+        plistlib.dump(info, handle)
+    subprocess.run(["codesign", "-s", "-", str(app)], check=True, capture_output=True)
+    bundle = tmp_path / "bundle"
+    (bundle / "macos").mkdir(parents=True)
+    archive = bundle / "macos" / "EchoLingo_0.3.0_aarch64.app.tar.gz"
+    subprocess.run(["tar", "-czf", str(archive), "-C", str(app.parent), app.name], check=True)
+    Path(f"{archive}.sig").write_text(_signature(key_id))
+
+    results = smoke.Results()
+    smoke.check_macos_updater(bundle, "0.3.0", key_id, results, required=True)
+    assert results.failures == []
+    assert any("codesign --verify --deep --strict" in line for line in results.lines)
+
+    results = smoke.Results()
+    smoke.check_macos_updater(bundle, "0.3.1", key_id, results, required=True)
+    assert results.failures == [
+        "EchoLingo_0.3.0_aarch64.app.tar.gz: CFBundleShortVersionString '0.3.0' != '0.3.1'"
+    ]
+
+    # Editing the signed bundle breaks its seal.
+    info["CFBundleShortVersionString"] = "0.3.1"
+    with (app / "Contents/Info.plist").open("wb") as handle:
+        plistlib.dump(info, handle)
+    subprocess.run(["tar", "-czf", str(archive), "-C", str(app.parent), app.name], check=True)
+    results = smoke.Results()
+    smoke.check_macos_updater(bundle, "0.3.1", key_id, results, required=True)
+    assert len(results.failures) == 1 and "codesign" in results.failures[0]
+
+    archive.unlink()
+    results = smoke.Results()
+    smoke.check_macos_updater(bundle, "0.3.1", key_id, results, required=True)
+    assert "no updater archive" in results.failures[0]
+    results = smoke.Results()
+    smoke.check_macos_updater(bundle, "0.3.1", key_id, results, required=False)
+    assert results.failures == []
 
 
 def test_tauri_stubs_create_only_missing_bundle_inputs(tmp_path) -> None:
