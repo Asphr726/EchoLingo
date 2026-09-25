@@ -45,7 +45,7 @@ def test_test_builds_use_their_own_identity_and_a_local_insecure_endpoint() -> N
     assert command[:7] == ["npm", "run", "tauri", "--workspace", "@echolingo/desktop", "--", "build"]
     assert command[command.index("--bundles") + 1] == "app"
     configs = [command[index + 1] for index, arg in enumerate(command) if arg == "--config"]
-    assert configs[0] == "/tmp/over lay.json"
+    assert configs[0] == str(Path("/tmp/over lay.json"))
     assert json.loads(configs[1]) == {"version": "0.3.1"}
 
 
@@ -166,10 +166,10 @@ def test_log_watcher_reads_only_new_lines(tmp_path) -> None:
     watcher = smoke.LogWatcher(log)
     assert watcher.text() == ""
     log.parent.mkdir()
-    log.write_text("old start\n")
+    log.write_text("old start\n", newline="\n")
     assert watcher.text() == "old start\n"
     watcher = smoke.LogWatcher(log)
-    with log.open("a") as handle:
+    with log.open("a", newline="\n") as handle:
         handle.write("update install state=installed version=0.3.1\n")
     pattern = smoke.version_pattern(smoke.INSTALLED_PATTERN, "0.3.1")
     assert watcher.search(pattern) == "update install state=installed version=0.3.1"
