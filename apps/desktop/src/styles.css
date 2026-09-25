@@ -650,12 +650,19 @@ body:has(.caption-window), body:has(.caption-window) #root { min-width: 0; min-h
 .ai-notes-layout { display: grid; gap: 14px; }
 .notes-rail { display: none; }
 @container (min-width: 880px) {
-  .ai-notes-layout { grid-template-columns: 200px minmax(0, 1fr); align-items: start; gap: 26px; }
-  .ai-notes-layout--single { grid-template-columns: minmax(0, 1fr); }
+  /* The sheet leads and Contents sits on its right. The DOM keeps the nav
+     first, so screen readers (and the narrow layout) meet Contents before
+     the notes. */
+  .ai-notes-layout { grid-template-columns: minmax(0, 1fr) 200px; grid-template-areas: "sheet rail"; align-items: start; gap: 30px; }
+  .ai-notes-layout--single { grid-template-columns: minmax(0, 1fr); grid-template-areas: "sheet"; }
+  .ai-notes-layout > .notes-sheet { grid-area: sheet; }
   /* Sticks 16px under the History detail pane's top padding (28px). 100cqh is
      the visible stage, so the rail ends 28px above the pane's bottom with or
      without the error banner. */
-  .notes-rail { position: sticky; top: 16px; display: block; max-height: calc(100dvh - 180px); max-height: calc(100cqh - 72px); overflow-y: auto; overscroll-behavior: contain; padding: 4px 0 12px; }
+  .notes-rail { grid-area: rail; position: sticky; top: 16px; display: block; max-height: calc(100dvh - 180px); max-height: calc(100cqh - 72px); overflow-y: auto; overscroll-behavior: contain; padding: 4px 0 12px; }
+  /* A hairline on the sheet side; the active section's accent sits on it. */
+  .notes-rail .notes-section-list { border-left: 1px solid var(--line); }
+  .notes-rail .notes-section-link { margin-left: -1px; }
   .notes-contents-disclosure { display: none; }
 }
 .notes-rail-label { margin: 0 0 8px 12px; color: var(--muted); font-size: 11px; font-weight: 650; }
