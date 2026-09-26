@@ -31,6 +31,7 @@ const DOWNLOAD_ATTEMPTS: u32 = 3;
 /// How long a model download may go without receiving data before the
 /// attempt is abandoned (at least; see [`StallClock`]), in seconds: the
 /// default and the range `ECHOLINGO_MODEL_STALL_SECONDS` may choose from.
+/// Every retry doubles it (see [`attempt_stall_timeout`]).
 const DEFAULT_STALL_SECONDS: u64 = 60;
 const MIN_STALL_SECONDS: u64 = 5;
 const MAX_STALL_SECONDS: u64 = 600;
@@ -826,6 +827,32 @@ fn stall_timeout_from(raw: Option<&str>) -> Duration {
     Duration::from_secs(seconds)
 }
 
+/// The stall timeout of download attempt `attempt` (the first is 1): `base`,
+/// doubled on every retry. Before Xet's first report an attempt waits
+/// [`FIRST_DATA_STALL_FACTOR`] timeouts, which several 64 MB terms sharing a
+/// link below about 0.85 MB/s cannot fill with the default; with the same
+/// allowance each retry would stop that download at the same point again.
+fn attempt_stall_timeout(base: Duration, attempt: u32) -> Duration {
+    base.saturating_mul(1 << attempt.saturating_sub(1).min(8))
+}
+
+/// Keeps a model id in [`ModelManager::active`] until it is dropped, so an
+/// install that fails, panics or is cancelled never stays "installing".
+struct ActiveInstall<'a> {
+    active: &'a Mutex<HashSet<String>>,
+    model_id: String,
+}
+
+impl Drop for ActiveInstall<'_> {
+    fn drop(&mut self) {
+        let mut active = match self.active.lock() {
+            Ok(active) => active,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        active.remove(&self.model_id);
+    }
+}
+
 pub struct ModelManager {
     root: PathBuf,
     cache: PathBuf,
@@ -901,7 +928,7 @@ impl ModelManager {
         callback: ProgressCallback,
     ) -> Result<ModelStatus, ModelManagerError> {
         let spec = model_spec(model_id)?;
-        {
+        let installing = {
             let mut active = self
                 .active
                 .lock()
@@ -909,11 +936,15 @@ impl ModelManager {
             if !active.insert(spec.id.clone()) {
                 return Err(ModelManagerError::AlreadyInstalling(spec.id));
             }
-        }
+            ActiveInstall {
+                active: &self.active,
+                model_id: spec.id.clone(),
+            }
+        };
         let result = self.install_inner(&spec, callback).await;
-        if let Ok(mut active) = self.active.lock() {
-            active.remove(&spec.id);
-        }
+        // Released before the status is read, which would still say
+        // "installing" otherwise.
+        drop(installing);
         result.map(|()| self.status_for(&spec))
     }
 
@@ -959,7 +990,8 @@ impl ModelManager {
 
     /// Download `spec` into a fresh staging directory and return it. An
     /// attempt that stalls is abandoned and the download starts over, in a
-    /// new directory, up to [`DOWNLOAD_ATTEMPTS`] times in all.
+    /// new directory and with twice the stall allowance, up to
+    /// [`DOWNLOAD_ATTEMPTS`] times in all.
     async fn download(
         &self,
         spec: &ModelSpec,
@@ -983,7 +1015,10 @@ impl ModelManager {
                 phase: if attempt == 1 { "starting" } else { "retrying" }.into(),
                 message: note.clone(),
             });
-            let activity = Arc::new(DownloadActivity::new(self.stall_timeout));
+            let activity = Arc::new(DownloadActivity::new(attempt_stall_timeout(
+                self.stall_timeout,
+                attempt,
+            )));
             let request = DownloadRequest {
                 spec: spec.clone(),
                 staging: staging.clone(),
@@ -1082,6 +1117,8 @@ async fn run_download_attempt(
     let runtime = AttemptRuntime::new()?;
     let task = runtime.spawn(downloader(request));
     let outcome = tokio::select! {
+        // A download that finished as its allowance ran out counts as done.
+        biased;
         joined = task => AttemptOutcome::Finished(
             joined.unwrap_or_else(|error| Err(format!("the download task failed: {error}"))),
         ),
@@ -1854,6 +1891,26 @@ mod tests {
     }
 
     #[test]
+    fn each_retry_doubles_the_stall_allowance() {
+        let base = Duration::from_secs(60);
+        let timeouts: Vec<_> = (1..=DOWNLOAD_ATTEMPTS)
+            .map(|attempt| attempt_stall_timeout(base, attempt))
+            .collect();
+        assert_eq!(
+            timeouts,
+            [60, 120, 240].map(Duration::from_secs),
+            "one timeout per attempt"
+        );
+        assert_eq!(attempt_stall_timeout(base, 0), base);
+        assert_eq!(attempt_stall_timeout(base, 40), base * 256);
+        // Before Xet's first report the second attempt waits ten minutes.
+        let start = Instant::now();
+        let mut clock = StallClock::new(attempt_stall_timeout(base, 2), start);
+        clock.xet_bytes(0, start);
+        assert_eq!(clock.time_left(start), Duration::from_secs(600));
+    }
+
+    #[test]
     fn only_changing_byte_counts_hold_off_the_stall_clock() {
         let start = Instant::now();
         let at = |seconds: u64| start + Duration::from_secs(seconds);
@@ -2103,6 +2160,12 @@ mod tests {
             first_attempt < progress_window + Duration::from_secs(3),
             "{first_attempt:?}"
         );
+        // The retry that received nothing had twice the allowance.
+        let second_attempt = started[2] - started[1];
+        assert!(
+            second_attempt >= Duration::from_millis(600),
+            "{second_attempt:?}"
+        );
         let events = events.lock().unwrap();
         let first_retry = events
             .iter()
@@ -2225,6 +2288,54 @@ mod tests {
 
         assert!(!leftover.exists());
         assert!(root.join("test-model").join("model.bin").is_file());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_install_does_not_stay_installing() {
+        let directory = tempfile::tempdir().unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let downloader: Downloader = {
+            let started = started.clone();
+            Arc::new(move |_request: DownloadRequest| {
+                let started = started.clone();
+                Box::pin(async move {
+                    started.notify_one();
+                    std::future::pending().await
+                })
+            })
+        };
+        let manager = ModelManager::with_downloader(
+            directory.path().join("models"),
+            downloader,
+            Duration::from_secs(60),
+        );
+        let id = "hymt2-1.8b";
+        let (callback, _events) = recording_callback();
+
+        let mut install = Box::pin(manager.install(id, callback));
+        tokio::select! {
+            result = &mut install => {
+                // Only a full disk ends the install before its download.
+                assert!(
+                    matches!(result, Err(ModelManagerError::DiskSpace { .. })),
+                    "{result:?}"
+                );
+                return;
+            }
+            () = started.notified() => {}
+        }
+        assert_eq!(
+            manager.status(id).unwrap().state,
+            ModelInstallState::Installing
+        );
+
+        // Dropping the install (the download was still running) releases it.
+        drop(install);
+        assert_ne!(
+            manager.status(id).unwrap().state,
+            ModelInstallState::Installing
+        );
+        assert!(manager.delete(id).is_ok());
     }
 
     #[test]
