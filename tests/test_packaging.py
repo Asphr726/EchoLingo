@@ -11,7 +11,7 @@ import sys
 import tarfile
 import zipfile
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -419,6 +419,26 @@ def test_updater_artifacts_come_only_from_the_release_overlay() -> None:
     assert "bundles: app,dmg" in release
 
 
+def test_release_workflow_drafts_one_release_with_every_signed_platform() -> None:
+    yaml = pytest.importorskip("yaml")
+    text = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+    workflow = yaml.safe_load(text)
+    rows = workflow["jobs"]["build"]["strategy"]["matrix"]["include"]
+    assert [row["name"] for row in rows] == ["macos-arm64", "windows-x64", "linux-x64"]
+    for row in rows:
+        # latest.json lists all three platforms, so each one ships a signed update file.
+        assert row["updater"] is True, row["name"]
+        artifacts = row["artifacts"].split()
+        signed = [path for path in artifacts if not path.endswith((".sig", ".dmg"))]
+        assert signed and all(f"{path}.sig" in artifacts for path in signed), row["name"]
+    # The GPU packs sit in the same vX.Y.Z release the app downloads them from.
+    commands = "\n".join(step.get("run", "") for step in workflow["jobs"]["release"]["steps"])
+    assert commands.count("gh release create") == 1
+    assert 'gh release create "$TAG"' in commands and "--verify-tag" in commands
+    assert "--include-windows --include-linux" in commands
+    assert "windows-linux" not in text
+
+
 def test_production_configs_have_no_dangerous_keys() -> None:
     smoke = load_script("smoke_packaged")
     configs = sorted(TAURI.glob("tauri*.json"))
@@ -511,6 +531,44 @@ def test_packaged_smoke_checks_updater_signature_key_ids(tmp_path) -> None:
         (tmp_path / f"{setup.name}.sig").write_text(_signature(key_id, version))
         results = smoke.Results()
         smoke.check_signature(setup, key_id, results, "0.3.0")
+        assert len(results.failures) == 1 and message in results.failures[0]
+
+
+def test_packaged_smoke_checks_the_linux_deb_signature(tmp_path, monkeypatch) -> None:
+    smoke = load_script("smoke_packaged")
+    key_id = bytes.fromhex("30163ded6e25d473")
+    # dpkg-deb and the self-test of the unpacked tree are covered elsewhere.
+    def completed(args, **_):
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(smoke, "subprocess", SimpleNamespace(run=completed))
+    monkeypatch.setattr(smoke, "check_installed_tree", lambda *args: True)
+    bundle = tmp_path / "bundle"
+    deb = bundle / "deb" / "EchoLingo_0.3.1_amd64.deb"
+    deb.parent.mkdir(parents=True)
+    deb.write_bytes(b"!<arch>\n")
+
+    results = smoke.Results()
+    smoke.bundle_linux(bundle, "0.3.1", results, key_id, updater=False)
+    assert results.failures == []
+    results = smoke.Results()
+    smoke.bundle_linux(bundle, "0.3.1", results, key_id, updater=True)
+    assert results.failures == [f"{deb.name}: no updater signature {deb.name}.sig"]
+
+    signature = Path(f"{deb}.sig")
+    signature.write_text(_signature(key_id, "0.3.1"))
+    results = smoke.Results()
+    smoke.bundle_linux(bundle, "0.3.1", results, key_id, updater=True)
+    assert results.failures == []
+    assert f"- PASS {deb.name}.sig: signed by key 73D4256EED3D1630 for version 0.3.1" in results.lines
+    # A signature that is there is always checked.
+    for text, message in (
+        (_signature(bytes(8), "0.3.1"), "signed by key 0000000000000000"),
+        (_signature(key_id, "0.3.0"), "signed for version 0.3.0, not 0.3.1"),
+    ):
+        signature.write_text(text)
+        results = smoke.Results()
+        smoke.bundle_linux(bundle, "0.3.1", results, key_id, updater=False)
         assert len(results.failures) == 1 and message in results.failures[0]
 
 

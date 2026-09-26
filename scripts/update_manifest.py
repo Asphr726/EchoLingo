@@ -6,9 +6,9 @@ the only asset of a permanent pre-release tagged ``updater``. Assets under
 ``releases/download/<tag>/`` are served for pre-releases too and do not count
 against the GitHub API rate limit.
 
-After a version's macOS pre-release has been published::
+After a version's pre-release has been published::
 
-    python scripts/update_manifest.py --tag v0.3.0 --publish
+    python scripts/update_manifest.py --tag v0.3.1 --publish
 
 reads that release with the ``gh`` CLI, copies the signature of each signed
 updater asset verbatim from its ``.sig`` file, checks the release version, the
@@ -19,10 +19,14 @@ every download answers without credentials and replaces latest.json on the
 ``--allow-draft --out FILE`` writes the manifest of a draft for review and
 ``--dry-run`` prints the manifest; neither changes any release.
 
-Platforms: ``darwin-aarch64`` is required. ``windows-x86_64`` is listed when
-the NSIS setup and its signature are on a published release, or with
-``--include-windows``. Linux is never listed: the app links to the download
-page there instead of updating itself.
+Platforms: ``darwin-aarch64`` (the ``.app.tar.gz``) is required.
+``windows-x86_64`` (the NSIS setup) and ``linux-x86_64-deb`` (the ``.deb``) are
+listed when the file and its signature are on the published release; on a draft
+only with ``--include-windows`` / ``--include-linux``, which also make a missing
+file an error. The app does not install a ``.deb`` itself: the Linux entry tells
+it that a new version is out, and it links to the release page. The key names the
+installer so that a future AppImage (``linux-x86_64-appimage``, then the bare
+``linux-x86_64``) can never be handed a ``.deb``.
 """
 
 from __future__ import annotations
@@ -104,10 +108,19 @@ def anonymous_opener() -> Opener:
 # --- configuration and signatures ----------------------------------------------------
 
 
+REQUIRED_PLATFORM = "darwin-aarch64"
+# The flag that lists an optional platform from a draft release.
+INCLUDE_FLAGS = {"windows-x86_64": "--include-windows", "linux-x86_64-deb": "--include-linux"}
+
+
 def platform_assets(version: str) -> dict[str, str]:
-    """Updater asset per updater platform key, as the release workflow names them."""
+    """Updater asset per updater platform key, as the release workflow names them.
+
+    tauri-plugin-updater looks up ``{os}-{arch}-{installer}`` first, then ``{os}-{arch}``.
+    """
     return {
         "darwin-aarch64": f"EchoLingo_{version}_aarch64.app.tar.gz",
+        "linux-x86_64-deb": f"EchoLingo_{version}_amd64.deb",
         "windows-x86_64": f"EchoLingo_{version}_x64-setup.exe",
     }
 
@@ -217,22 +230,41 @@ def fetch_release(tag: str, repo: str, runner: Runner) -> dict[str, Any]:
     return json.loads(runner(["release", "view", tag, "--repo", repo, "--json", RELEASE_FIELDS]))
 
 
-def select_platforms(release: dict[str, Any], version: str, include_windows: bool) -> dict[str, str]:
+def select_platforms(
+    release: dict[str, Any], version: str, include: Iterable[str] = ()
+) -> dict[str, str]:
+    """Updater asset per platform key to list for ``release``.
+
+    ``include`` names optional platforms that must be listed, even from a draft.
+    """
+    wanted = set(include)
+    unknown = wanted - set(INCLUDE_FLAGS)
+    if unknown:
+        raise ManifestError(f"unknown platforms {', '.join(sorted(unknown))}")
     names = {asset["name"] for asset in release.get("assets") or []}
+    tag = release.get("tagName")
     selected: dict[str, str] = {}
     for platform, asset in platform_assets(version).items():
         missing = ", ".join(name for name in (asset, f"{asset}.sig") if name not in names)
-        if platform == "darwin-aarch64":
+        if platform == REQUIRED_PLATFORM:
             if missing:
-                raise ManifestError(f"{release.get('tagName')} lacks {missing}")
+                raise ManifestError(f"{tag} lacks {missing}")
             selected[platform] = asset
-        elif include_windows:
+        elif platform in wanted:
             if missing:
-                raise ManifestError(f"--include-windows: {release.get('tagName')} lacks {missing}")
+                raise ManifestError(f"{INCLUDE_FLAGS[platform]}: {tag} lacks {missing}")
             selected[platform] = asset
-        elif not missing and not release.get("isDraft"):
+        elif release.get("isDraft"):
+            continue
+        elif not missing:
             selected[platform] = asset
-    return selected
+        elif asset in names:
+            # Installed copies on this platform would not hear about the update.
+            print(
+                f"warning: {platform} is not listed: {tag} has {asset} but no {asset}.sig",
+                file=sys.stderr,
+            )
+    return dict(sorted(selected.items()))
 
 
 def download_signatures(
@@ -418,11 +450,19 @@ def create_manifest(
     if release.get("isDraft"):
         if args.publish:
             raise ManifestError(
-                f"{args.tag} is still a draft; publish the macOS release before its update manifest"
+                f"{args.tag} is still a draft; publish the release before its update manifest"
             )
         if not args.allow_draft:
             raise ManifestError(f"{args.tag} is a draft; pass --allow-draft to review its manifest")
-    assets = select_platforms(release, version, args.include_windows)
+    include = [
+        platform
+        for platform, wanted in (
+            ("windows-x86_64", args.include_windows),
+            ("linux-x86_64-deb", args.include_linux),
+        )
+        if wanted
+    ]
+    assets = select_platforms(release, version, include)
     with tempfile.TemporaryDirectory() as scratch:
         signatures = download_signatures(args.tag, args.repo, assets.values(), runner, Path(scratch))
     check_signing_key(signatures, pubkey)
@@ -450,7 +490,14 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--repo", default=REPOSITORY)
     parser.add_argument("--notes-file", type=Path, help="plain-text notes instead of the release summary")
     parser.add_argument(
-        "--include-windows", action="store_true", help="list the NSIS setup even on a draft release"
+        "--include-windows",
+        action="store_true",
+        help="list the NSIS setup (windows-x86_64) even from a draft; fail if it is missing",
+    )
+    parser.add_argument(
+        "--include-linux",
+        action="store_true",
+        help="list the .deb (linux-x86_64-deb) even from a draft; fail if it is missing",
     )
     parser.add_argument("--allow-draft", action="store_true", help="read a draft release (for review)")
     parser.add_argument("--out", type=Path, help="write the manifest to this file")
@@ -473,10 +520,11 @@ def main(
     try:
         manifest = create_manifest(args, runner, now or datetime.now(timezone.utc), root)
         text = manifest_text(manifest)
+        platforms = ", ".join(manifest["platforms"])
         if args.out is not None:
             args.out.parent.mkdir(parents=True, exist_ok=True)
             args.out.write_text(text, encoding="utf-8")
-            print(f"wrote {args.out}")
+            print(f"wrote {args.out} ({platforms})")
         if args.dry_run or (args.out is None and not args.publish):
             print(text, end="")
         if args.publish:
@@ -492,7 +540,7 @@ def main(
                 publish_manifest(manifest, args.repo, runner, Path(scratch))
             verify_published(manifest, args.repo, opener)
             url = download_url(args.repo, MANIFEST_TAG, MANIFEST_NAME)
-            print(f"published {url} -> {manifest['version']}")
+            print(f"published {url} -> {manifest['version']} ({platforms})")
     except ManifestError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

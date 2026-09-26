@@ -6,7 +6,8 @@ the release overlay). ``prebundle`` checks the frozen sidecar and the llama.cpp
 directory before Tauri bundles them; ``bundle`` checks the finished DMG / NSIS
 installer / .deb / AppImage, running the sidecar self-test from inside each
 bundle, and the signed updater artifacts: the macOS ``.app.tar.gz`` (version
-and code signature of the app inside) and the key id of every ``.sig``.
+and code signature of the app inside), the Windows setup and the Linux ``.deb``,
+checking the key id and the signed version of every ``.sig``.
 ``bundle --updater`` requires those artifacts. A failing AppImage is reported
 and renamed to ``*.AppImage.rejected`` so the release upload skips it; every
 other failure exits non-zero.
@@ -431,12 +432,17 @@ def bundle_windows(
         subprocess.run([str(uninstaller), "/S"], timeout=600)
 
 
-def bundle_linux(bundle_dir: Path, version: str, results: Results) -> None:
+def bundle_linux(
+    bundle_dir: Path, version: str, results: Results, key_id: bytes | None, updater: bool
+) -> None:
     deb = find_one(bundle_dir, "*.deb")
     if deb is None:
         results.fail(f"no .deb under {bundle_dir}")
     else:
         check_size(deb, results)
+        # latest.json announces this .deb to installed copies (linux-x86_64-deb).
+        if updater or deb.with_name(deb.name + ".sig").exists():
+            check_signature(deb, key_id, results, version)
         info = subprocess.run(["dpkg-deb", "--info", str(deb)], capture_output=True, text=True)
         fields = [line.strip() for line in info.stdout.splitlines()]
         depends = next((line for line in fields if line.startswith("Depends:")), "")
@@ -528,7 +534,7 @@ def main() -> int:
         elif sys.platform == "win32":
             bundle_windows(bundle_dir, version, results, args.install_dir, key_id, args.updater)
         else:
-            bundle_linux(bundle_dir, version, results)
+            bundle_linux(bundle_dir, version, results, key_id, args.updater)
         title = "Packaged bundles"
     write_summary(title, results)
     if results.failures:

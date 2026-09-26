@@ -2,8 +2,7 @@ name: Release
 
 on:
   push:
-    # Version tags only: the `updater` manifest tag and the `windows-linux-v*`
-    # draft tags must never start a build.
+    # Version tags only: the `updater` manifest tag must never start a build.
     tags: ["v[0-9]+.[0-9]+.[0-9]+"]
     branches: ["release/**"]
   workflow_dispatch:
@@ -56,10 +55,14 @@ jobs:
             sidecar_mode: onedir
             sidecar: apps/desktop/src-tauri/sidecar/echolingo-sidecar
             # linuxdeploy fails on the one-folder sidecar; AppImage is on the roadmap.
-            # No updater artifacts: the app links to the download page on Linux.
             bundles: deb
+            # The app does not install a .deb itself; it links to the release page.
+            # The signed .deb lets latest.json announce the update (linux-x86_64-deb).
+            updater: true
             torch_index: https://download.pytorch.org/whl/cpu
-            artifacts: target/release/bundle/deb/*.deb
+            artifacts: |
+              target/release/bundle/deb/*.deb
+              target/release/bundle/deb/*.deb.sig
     runs-on: ${{ matrix.os }}
     timeout-minutes: 150
     defaults:
@@ -363,7 +366,7 @@ jobs:
           retention-days: 7
 
   release:
-    name: draft releases
+    name: draft release
     needs: [build, gpu-pack, smoke-models]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
@@ -384,54 +387,41 @@ jobs:
         with:
           pattern: echolingo-*
           path: artifacts
-      - name: Sort the release files
-        # macOS is published as a pre-release; Windows, Linux and the GPU packs
-        # stay in an unpublished draft.
+      - name: Collect the release files
+        # One release per version for every platform: the app downloads its GPU
+        # pack from releases/download/vX.Y.Z/, next to its own installer.
         run: |
-          mkdir -p dist/macos dist/other
+          mkdir -p dist
           for artifact in artifacts/*/; do
-            case "$(basename "$artifact")" in
-              echolingo-macos-*) target=dist/macos ;;
-              *) target=dist/other ;;
-            esac
             # An artifact keeps the folders below its common root (the DMG and the
             # updater archive come from different bundle folders); releases take files.
-            find "$artifact" -type f -exec mv -n -t "$target" {} +
+            find "$artifact" -type f -exec mv -n -t dist {} +
           done
           if [ -n "$(find artifacts -type f)" ]; then
             echo "::error::duplicate release file names:"
             find artifacts -type f
             exit 1
           fi
-          ls -l dist/macos dist/other
+          ls -l dist
       - name: Checksums
+        run: (cd dist && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+      - name: Release notes with checksums
         run: |
-          for dir in dist/macos dist/other; do
-            (cd "$dir" && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt)
-          done
-      - name: Draft the macOS pre-release
+          {
+            cat ".github/release-notes/$TAG.md"
+            printf '\n## SHA-256\n\n```text\n'
+            cat dist/SHA256SUMS.txt
+            printf '```\n'
+          } > "$RUNNER_TEMP/release-notes.md"
+      - name: Draft the pre-release
         run: >-
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --prerelease
-          --title "EchoLingo ${TAG#v} Beta (macOS)" --notes-file ".github/release-notes/$TAG.md"
-          dist/macos/*
-      - name: Draft the Windows and Linux release
-        # No --verify-tag: the windows-linux-v* tag is created at this commit only
-        # if the draft is ever published.
-        run: |
-          notes=".github/release-notes/$TAG-windows-linux.md"
-          if [ -f "$notes" ]; then
-            notes_args=(--notes-file "$notes")
-          else
-            notes_args=(--notes "Windows and Linux builds of EchoLingo ${TAG#v}, not yet tested on real hardware. Keep this release a draft.")
-          fi
-          gh release create "windows-linux-$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --draft --prerelease --title "EchoLingo ${TAG#v} Beta (Windows & Linux, draft)" \
-            "${notes_args[@]}" dist/other/*
+          --title "EchoLingo ${TAG#v} Beta" --notes-file "$RUNNER_TEMP/release-notes.md" dist/*
       - name: Update manifest for review
-        # Only attached to the macOS draft. After that release is published,
+        # Lists macOS, Windows and Linux from the draft. After the release is published,
         #   python scripts/update_manifest.py --tag vX.Y.Z --publish
         # replaces latest.json on the `updater` release that installed copies read.
         run: |
           python scripts/update_manifest.py --tag "$TAG" --repo "$GITHUB_REPOSITORY" --allow-draft \
-            --out dist/latest.json
+            --include-windows --include-linux --out dist/latest.json
           gh release upload "$TAG" dist/latest.json --repo "$GITHUB_REPOSITORY"

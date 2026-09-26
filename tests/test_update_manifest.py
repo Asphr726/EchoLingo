@@ -19,6 +19,8 @@ OTHER_KEY_ID = bytes.fromhex("1112131415161718")
 NOW = datetime(2026, 9, 30, 8, 15, 0, tzinfo=timezone.utc)
 MACOS = "EchoLingo_0.3.0_aarch64.app.tar.gz"
 WINDOWS = "EchoLingo_0.3.0_x64-setup.exe"
+DEB = "EchoLingo_0.3.0_amd64.deb"
+ALL_PLATFORMS = ["darwin-aarch64", "linux-x86_64-deb", "windows-x86_64"]
 BODY = (
     "EchoLingo 0.3.0：**应用内更新**。\nEchoLingo 0.3.0 adds `in-app updates` "
     "([details](https://example.com)).\n\n"
@@ -203,31 +205,78 @@ def test_manifest_for_a_published_release(tmp_path, capsys) -> None:
     assert "wrote" in capsys.readouterr().out
 
 
-def test_windows_is_listed_only_for_a_published_release(tmp_path) -> None:
-    names = (MACOS, f"{MACOS}.sig", WINDOWS, f"{WINDOWS}.sig")
-    gh = gh_for(*names)
-    manifest = um.create_manifest(um.parse_args(["--tag", "v0.3.0"]), gh, NOW, app_root(tmp_path))
-    assert sorted(manifest["platforms"]) == ["darwin-aarch64", "windows-x86_64"]
-    assert manifest["platforms"]["windows-x86_64"]["url"].endswith(f"/v0.3.0/{WINDOWS}")
-    assert manifest["platforms"]["windows-x86_64"]["signature"] == signature(KEY_ID, WINDOWS)
+def test_a_published_release_lists_every_signed_platform(tmp_path, capsys) -> None:
+    gh = gh_for(MACOS, f"{MACOS}.sig", WINDOWS, f"{WINDOWS}.sig", DEB, f"{DEB}.sig",
+                "EchoLingo_0.3.0_aarch64.dmg", "echolingo-gpu-pack-0.3.0-linux-x64.json")
+    out = tmp_path / "latest.json"
+    assert run(tmp_path, gh, "--out", str(out)) == 0
+    manifest = json.loads(out.read_text(encoding="utf-8"))
+    assert list(manifest["platforms"]) == ALL_PLATFORMS
+    for platform, name in (("windows-x86_64", WINDOWS), ("linux-x86_64-deb", DEB)):
+        entry = manifest["platforms"][platform]
+        assert entry == {
+            "signature": signature(KEY_ID, name),
+            "url": f"https://github.com/Asphr726/EchoLingo/releases/download/v0.3.0/{name}",
+        }
+    # Every signature comes from the one version release.
+    download = gh.calls[1]
+    patterns = [download[i + 1] for i, arg in enumerate(download) if arg == "--pattern"]
+    assert download[2] == "v0.3.0"
+    assert sorted(patterns) == sorted(f"{name}.sig" for name in (MACOS, WINDOWS, DEB))
+    assert "(darwin-aarch64, linux-x86_64-deb, windows-x86_64)" in capsys.readouterr().out
 
-    draft = gh_for(*names, draft=True)
-    args = um.parse_args(["--tag", "v0.3.0", "--allow-draft"])
-    manifest = um.create_manifest(args, draft, NOW, app_root(tmp_path / "draft"))
-    assert sorted(manifest["platforms"]) == ["darwin-aarch64"]
-    assert manifest["pub_date"] == "2026-09-30T08:15:00Z"
 
-    args = um.parse_args(["--tag", "v0.3.0", "--allow-draft", "--include-windows"])
-    manifest = um.create_manifest(args, draft, NOW, app_root(tmp_path / "forced"))
-    assert sorted(manifest["platforms"]) == ["darwin-aarch64", "windows-x86_64"]
+def test_linux_is_listed_under_the_deb_key_only() -> None:
+    # A bare linux-x86_64 entry would also be offered to a future AppImage.
+    assert um.platform_assets("0.3.1")["linux-x86_64-deb"] == "EchoLingo_0.3.1_amd64.deb"
+    assert "linux-x86_64" not in um.platform_assets("0.3.1")
+    published = release(MACOS, f"{MACOS}.sig", DEB, f"{DEB}.sig")
+    assert um.select_platforms(published, "0.3.0") == {"darwin-aarch64": MACOS, "linux-x86_64-deb": DEB}
 
 
-def test_linux_is_never_listed_and_unsigned_windows_is_skipped() -> None:
-    published = release(MACOS, f"{MACOS}.sig", WINDOWS, "EchoLingo_0.3.0_amd64.deb",
-                        "EchoLingo_0.3.0_amd64.deb.sig")
-    assert um.select_platforms(published, "0.3.0", include_windows=False) == {"darwin-aarch64": MACOS}
+def test_a_draft_lists_optional_platforms_only_when_asked(tmp_path) -> None:
+    draft = gh_for(MACOS, f"{MACOS}.sig", WINDOWS, f"{WINDOWS}.sig", DEB, f"{DEB}.sig", draft=True)
+    for flags, platforms in (
+        ((), ["darwin-aarch64"]),
+        (("--include-windows",), ["darwin-aarch64", "windows-x86_64"]),
+        (("--include-linux",), ["darwin-aarch64", "linux-x86_64-deb"]),
+        (("--include-windows", "--include-linux"), ALL_PLATFORMS),
+    ):
+        args = um.parse_args(["--tag", "v0.3.0", "--allow-draft", *flags])
+        root = app_root(tmp_path / ("-".join(flags) or "none"))
+        manifest = um.create_manifest(args, draft, NOW, root)
+        assert list(manifest["platforms"]) == platforms, flags
+        assert manifest["pub_date"] == "2026-09-30T08:15:00Z"
+
+
+def test_unsigned_platforms_are_skipped_with_a_warning_or_refused_when_asked(capsys) -> None:
+    published = release(MACOS, f"{MACOS}.sig", WINDOWS, DEB, "EchoLingo_0.3.0_aarch64.dmg")
+    assert um.select_platforms(published, "0.3.0") == {"darwin-aarch64": MACOS}
+    warnings = capsys.readouterr().err
+    assert f"windows-x86_64 is not listed: v0.3.0 has {WINDOWS} but no {WINDOWS}.sig" in warnings
+    assert f"linux-x86_64-deb is not listed: v0.3.0 has {DEB} but no {DEB}.sig" in warnings
+    # A platform that is simply not on the release is not worth a warning.
+    assert um.select_platforms(release(MACOS, f"{MACOS}.sig"), "0.3.0") == {"darwin-aarch64": MACOS}
+    assert capsys.readouterr().err == ""
     with pytest.raises(um.ManifestError, match=f"--include-windows: v0.3.0 lacks {WINDOWS}.sig"):
-        um.select_platforms(published, "0.3.0", include_windows=True)
+        um.select_platforms(published, "0.3.0", ["windows-x86_64"])
+    with pytest.raises(um.ManifestError, match=f"--include-linux: v0.3.0 lacks {DEB}.sig"):
+        um.select_platforms(published, "0.3.0", ["linux-x86_64-deb"])
+    with pytest.raises(um.ManifestError, match=f"--include-linux: v0.3.0 lacks {DEB}, {DEB}.sig"):
+        um.select_platforms(release(MACOS, f"{MACOS}.sig"), "0.3.0", ["linux-x86_64-deb"])
+    with pytest.raises(um.ManifestError, match="unknown platforms linux-x86_64"):
+        um.select_platforms(published, "0.3.0", ["linux-x86_64"])
+
+
+def test_a_linux_signature_from_another_key_or_version_is_refused(tmp_path, capsys) -> None:
+    gh = gh_for(MACOS, f"{MACOS}.sig", DEB, f"{DEB}.sig")
+    gh.signatures[f"{DEB}.sig"] = signature(OTHER_KEY_ID, DEB)
+    assert run(tmp_path, gh, "--dry-run") == 1
+    assert f"{DEB}.sig was signed by key 1817161514131211" in capsys.readouterr().err
+    gh.signatures[f"{DEB}.sig"] = signature(KEY_ID, DEB, "0.2.9")
+    assert run(tmp_path / "older", gh, "--publish") == 1
+    assert f"{DEB}.sig was signed for version 0.2.9, not 0.3.0" in capsys.readouterr().err
+    assert ("release", "upload") not in gh.commands()
 
 
 def test_the_macos_archive_and_signature_are_required(tmp_path, capsys) -> None:
