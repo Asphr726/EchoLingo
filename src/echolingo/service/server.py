@@ -15,6 +15,7 @@ from ..assistant.service import AssistantService, request_id_of
 from ..backends import registry
 from .cloud_probe import probe_cloud
 from .parent_watchdog import start_parent_watchdog_from_environment
+from .power_throttling import disable_power_throttling
 from .protocol import PROTOCOL_VERSION, ProtocolError, decode_audio_packet
 from .session import DesktopInferenceSession
 
@@ -289,6 +290,9 @@ def main(argv: list[str] | None = None) -> int:
     # Per-connection chatter from the WebSocket library is not useful in
     # logs/sidecar.log; provider probes and sessions log through "echolingo.*".
     logging.getLogger("websockets").setLevel(logging.WARNING)
+    # Also for the Conda launch, where the Desktop's power-throttling opt-out
+    # reaches only `conda` (a no-op outside Windows).
+    disable_power_throttling()
     parser = argparse.ArgumentParser(prog="echolingo-sidecar")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)

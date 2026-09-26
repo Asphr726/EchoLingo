@@ -96,6 +96,11 @@ def _install_qwen_import_shims() -> None:
 
 def main() -> int:
     _configure_standard_streams()
+    # Windows power throttling slows the model runtimes; harmless where the
+    # Desktop has already opted this process out, and a no-op elsewhere.
+    from echolingo.service.power_throttling import disable_power_throttling
+
+    disable_power_throttling()
     if len(sys.argv) > 1 and sys.argv[1] == "watch-process":
         from echolingo.service.process_watchdog import run_child_until_parent_exit
 

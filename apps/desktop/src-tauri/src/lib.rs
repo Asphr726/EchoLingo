@@ -3366,6 +3366,12 @@ async fn history_export_to_path(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // The window is often minimized or behind slides during a lecture, and
+    // lecture halls often mean battery power: keep Windows from throttling
+    // the process that captures audio and drives the live captions.
+    if let Err(error) = process_support::disable_power_throttling_for_current_process() {
+        eprintln!("could not disable power throttling: {error}");
+    }
     // WebKitGTK's DMA-BUF renderer shows blank windows with several GPU
     // drivers (notably NVIDIA); the plain renderer works everywhere.
     #[cfg(target_os = "linux")]

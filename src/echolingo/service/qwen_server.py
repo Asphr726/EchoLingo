@@ -43,6 +43,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+from .power_throttling import disable_power_throttling
 from .qwen_segment_policy import (
     ASR_CONTEXT_HEADER,
     PauseRollTracker,
@@ -761,6 +762,9 @@ def main(argv: list[str] | None = None) -> int:
     # WhisperLiveKit parses its arguments at import time.
     sys.argv = [sys.argv[0], *argv]
     _configure_logging()
+    # Also for the Conda launch, where the Desktop's power-throttling opt-out
+    # reaches only `conda` (a no-op outside Windows).
+    disable_power_throttling()
     warmup_seconds = float(os.environ.get(WARMUP_ENVIRONMENT_KEY, "3.0") or 0.0)
     install_streaming_policy(
         decode_policy_from_environment(), warmup_seconds=warmup_seconds

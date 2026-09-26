@@ -10,6 +10,7 @@ import time
 from collections.abc import Callable, Sequence
 
 from .parent_watchdog import watch_parent
+from .power_throttling import disable_power_throttling_for_process
 
 
 def _child_creationflags() -> int:
@@ -52,6 +53,9 @@ def run_child_until_parent_exit(
         stdin=subprocess.DEVNULL,
         creationflags=_child_creationflags(),
     )
+    # The child does the real work, and the Desktop's power-throttling
+    # opt-out reaches only this wrapper (a no-op outside Windows).
+    disable_power_throttling_for_process(child.pid)
     stopping = threading.Event()
 
     def request_stop(_signal: int, _frame: object) -> None:

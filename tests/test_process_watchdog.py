@@ -55,3 +55,28 @@ def test_default_liveness_is_set_up_once_before_the_child_starts(monkeypatch) ->
 
     assert result != 0
     assert watched == [4321]
+
+
+def test_the_native_child_is_opted_out_of_power_throttling(monkeypatch) -> None:
+    opted_out: list[int] = []
+    monkeypatch.setattr(
+        process_watchdog, "disable_power_throttling_for_process", opted_out.append
+    )
+    started: list[subprocess.Popen] = []
+    popen = subprocess.Popen
+
+    def record(*arguments, **options):
+        child = popen(*arguments, **options)
+        started.append(child)
+        return child
+
+    monkeypatch.setattr(process_watchdog.subprocess, "Popen", record)
+    result = run_child_until_parent_exit(
+        [sys.executable, "-c", "raise SystemExit(0)"],
+        parent_process_id=999_999,
+        poll_seconds=0.01,
+        alive=lambda _pid: True,
+    )
+
+    assert result == 0
+    assert opted_out == [started[0].pid]

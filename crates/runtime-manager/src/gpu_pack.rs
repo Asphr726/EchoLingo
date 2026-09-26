@@ -9,7 +9,7 @@
 use crate::{
     activate_directory_retrying, remove_scoped_directory, GpuRuntimeLayout, ModelProgress,
 };
-use process_support::configure_background;
+use process_support::background_output;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -353,8 +353,8 @@ pub async fn detect_nvidia_gpu() -> Result<Option<GpuInfo>, String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    configure_background(&mut command);
-    let output = match tokio::time::timeout(DETECTION_TIMEOUT, command.output()).await {
+    let answer = tokio::time::timeout(DETECTION_TIMEOUT, background_output(&mut command)).await;
+    let output = match answer {
         Err(_) => return Err("nvidia-smi did not answer".into()),
         Ok(Err(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Ok(Err(error)) => return Err(error.to_string()),
@@ -1448,8 +1448,7 @@ async fn run_self_test(pack: &Path) -> Result<Value, GpuPackError> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    configure_background(&mut command);
-    let output = tokio::time::timeout(SELF_TEST_TIMEOUT, command.output())
+    let output = tokio::time::timeout(SELF_TEST_TIMEOUT, background_output(&mut command))
         .await
         .map_err(|_| GpuPackError::SelfTest("timed out".into()))?
         .map_err(|error| GpuPackError::SelfTest(format!("cannot start the sidecar: {error}")))?;
@@ -1498,8 +1497,7 @@ async fn check_llama_server(pack: &Path) -> (bool, Value) {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    configure_background(&mut command);
-    match tokio::time::timeout(LLAMA_CHECK_TIMEOUT, command.output()).await {
+    match tokio::time::timeout(LLAMA_CHECK_TIMEOUT, background_output(&mut command)).await {
         Err(_) => (false, json!({"ok": false, "detail": "timed out"})),
         Ok(Err(error)) => (false, json!({"ok": false, "detail": error.to_string()})),
         Ok(Ok(output)) => {

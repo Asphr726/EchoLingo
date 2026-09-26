@@ -16,6 +16,7 @@ tauri-build = { version = "2", features = [] }
 app-core = { path = "../../../crates/app-core" }
 audio-core = { path = "../../../crates/audio-core" }
 inference-ipc = { path = "../../../crates/inference-ipc" }
+process-support = { path = "../../../crates/process-support" }
 runtime-manager = { path = "../../../crates/runtime-manager" }
 transcript-store = { path = "../../../crates/transcript-store" }
 chrono.workspace = true

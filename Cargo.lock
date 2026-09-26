@@ -1372,6 +1372,7 @@ dependencies = [
  "futures-util",
  "inference-ipc",
  "keyring",
+ "process-support",
  "raw-window-handle",
  "reqwest",
  "runtime-manager",

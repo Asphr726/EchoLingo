@@ -5,9 +5,12 @@
 //! outlives its owner: on Unix each child leads its own process group, on
 //! Windows each child is placed in a kill-on-close Job Object, so stopping or
 //! dropping a [`ProcessTree`] stops the whole tree, grandchildren included.
+//!
+//! On Windows every helper is also opted out of power throttling (see
+//! [`disable_power_throttling_for_current_process`]).
 
 use std::io;
-use std::process::ExitStatus;
+use std::process::{ExitStatus, Output};
 use std::time::Duration;
 use tokio::process::{Child, Command};
 
@@ -26,6 +29,133 @@ pub fn configure_background(command: &mut Command) -> &mut Command {
     command.kill_on_drop(true)
 }
 
+/// Run a short-lived helper to completion and collect its output, like
+/// [`Command::output`], with [`configure_background`] applied and power
+/// throttling disabled on Windows. Unlike [`Command::output`], only the
+/// streams the caller set to [`std::process::Stdio::piped`] are collected.
+/// The helper is killed if the returned future is dropped (for example by a
+/// timeout).
+pub async fn background_output(command: &mut Command) -> io::Result<Output> {
+    configure_background(command);
+    let child = command.spawn()?;
+    disable_power_throttling_for_child(&child);
+    child.wait_with_output().await
+}
+
+/// Ask Windows not to throttle this process (EcoQoS): no lowered CPU
+/// clocks or efficiency-core scheduling while it has no visible window or
+/// runs on battery, and no coarser timers. Windows applies both to
+/// windowless background processes, which slowed the local ASR and
+/// translation services (and the GPU work they feed) by more than half. A
+/// no-op elsewhere; callers treat a failure as a warning only.
+pub fn disable_power_throttling_for_current_process() -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        // The pseudo handle needs no closing.
+        let process = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
+        power::disable_throttling(process)
+    }
+    #[cfg(not(windows))]
+    Ok(())
+}
+
+/// [`disable_power_throttling_for_current_process`] for a spawned helper.
+/// Best effort: a failure is reported on stderr and the helper keeps running.
+fn disable_power_throttling_for_child(child: &Child) {
+    #[cfg(windows)]
+    if let Some(process) = child.raw_handle() {
+        if let Err(error) = power::disable_throttling(process.cast()) {
+            eprintln!(
+                "could not disable power throttling for process {}: {error}",
+                child.id().unwrap_or_default()
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = child;
+}
+
+/// The power throttling requests, spelled out so their values can be
+/// checked on every platform.
+#[cfg(any(windows, test))]
+mod throttling {
+    /// One `PROCESS_POWER_THROTTLING_STATE`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct PowerThrottlingState {
+        pub(crate) version: u32,
+        pub(crate) control_mask: u32,
+        pub(crate) state_mask: u32,
+    }
+
+    /// `PROCESS_POWER_THROTTLING_CURRENT_VERSION`.
+    pub(crate) const VERSION: u32 = 1;
+    /// `PROCESS_POWER_THROTTLING_EXECUTION_SPEED`: EcoQoS (lowered clocks,
+    /// efficiency cores).
+    pub(crate) const EXECUTION_SPEED: u32 = 0x1;
+    /// `PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION`: coarser timers.
+    pub(crate) const IGNORE_TIMER_RESOLUTION: u32 = 0x4;
+
+    /// The states to request, in order. A mechanism listed in the control
+    /// mask but cleared in the state mask is turned off for the process.
+    /// Windows 10 does not know the timer flag and rejects the whole
+    /// request, so the execution-speed opt-out alone is the fallback.
+    pub(crate) const OPT_OUTS: [PowerThrottlingState; 2] = [
+        PowerThrottlingState {
+            version: VERSION,
+            control_mask: EXECUTION_SPEED | IGNORE_TIMER_RESOLUTION,
+            state_mask: 0,
+        },
+        PowerThrottlingState {
+            version: VERSION,
+            control_mask: EXECUTION_SPEED,
+            state_mask: 0,
+        },
+    ];
+}
+
+#[cfg(windows)]
+mod power {
+    use super::throttling::{PowerThrottlingState, OPT_OUTS};
+    use std::ffi::c_void;
+    use std::io;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Threading::{
+        ProcessPowerThrottling, SetProcessInformation, PROCESS_POWER_THROTTLING_STATE,
+    };
+
+    impl From<PowerThrottlingState> for PROCESS_POWER_THROTTLING_STATE {
+        fn from(state: PowerThrottlingState) -> Self {
+            Self {
+                Version: state.version,
+                ControlMask: state.control_mask,
+                StateMask: state.state_mask,
+            }
+        }
+    }
+
+    /// Apply the first opt-out Windows accepts; the error of the last one
+    /// when it accepts none.
+    pub(crate) fn disable_throttling(process: HANDLE) -> io::Result<()> {
+        let mut result = Ok(());
+        for state in OPT_OUTS {
+            let state = PROCESS_POWER_THROTTLING_STATE::from(state);
+            let applied = unsafe {
+                SetProcessInformation(
+                    process,
+                    ProcessPowerThrottling,
+                    (&state as *const PROCESS_POWER_THROTTLING_STATE).cast::<c_void>(),
+                    std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+                )
+            };
+            if applied != 0 {
+                return Ok(());
+            }
+            result = Err(io::Error::last_os_error());
+        }
+        result
+    }
+}
+
 /// A spawned child together with every process it starts.
 pub struct ProcessTree {
     child: Child,
@@ -35,10 +165,14 @@ pub struct ProcessTree {
 
 impl ProcessTree {
     /// Configure `command` with [`configure_background`], spawn it and take
-    /// ownership of its process tree.
+    /// ownership of its process tree. On Windows the child is also opted out
+    /// of power throttling (best effort). That does not reach the processes
+    /// the child starts: a helper that launches the real workload (the
+    /// `watch-process` wrapper) opts it out itself.
     pub fn spawn(command: &mut Command) -> io::Result<Self> {
         configure_background(command);
         let child = command.spawn()?;
+        disable_power_throttling_for_child(&child);
         let group = Group::attach(&child);
         Ok(Self {
             child,
@@ -375,6 +509,89 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(status.code(), Some(3));
+    }
+
+    #[test]
+    fn power_throttling_is_turned_off_with_a_windows_10_fallback() {
+        use throttling::{PowerThrottlingState, OPT_OUTS};
+
+        assert_eq!(
+            OPT_OUTS,
+            [
+                PowerThrottlingState {
+                    version: 1,
+                    control_mask: 0x5,
+                    state_mask: 0,
+                },
+                PowerThrottlingState {
+                    version: 1,
+                    control_mask: 0x1,
+                    state_mask: 0,
+                },
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn power_throttling_values_match_the_windows_headers() {
+        use windows_sys::Win32::System::Threading::{
+            PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
+        };
+
+        assert_eq!(
+            throttling::VERSION,
+            PROCESS_POWER_THROTTLING_CURRENT_VERSION
+        );
+        assert_eq!(
+            throttling::EXECUTION_SPEED,
+            PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+        );
+        assert_eq!(
+            throttling::IGNORE_TIMER_RESOLUTION,
+            PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+        );
+        let state = PROCESS_POWER_THROTTLING_STATE::from(throttling::OPT_OUTS[0]);
+        assert_eq!(
+            (state.Version, state.ControlMask, state.StateMask),
+            (1, 0x5, 0)
+        );
+    }
+
+    #[test]
+    fn the_current_process_can_be_opted_out() {
+        // A no-op outside Windows; on Windows the call must succeed.
+        disable_power_throttling_for_current_process().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_output_collects_the_helper_output() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "echo out; echo err >&2; exit 2"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let output = background_output(&mut command).await.unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.stdout, b"out\n");
+        assert_eq!(output.stderr, b"err\n");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn background_output_collects_the_helper_output() {
+        let mut command = Command::new("cmd");
+        command
+            .args(["/c", "echo out& exit 2"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let output = background_output(&mut command).await.unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "out");
     }
 
     #[cfg(windows)]
