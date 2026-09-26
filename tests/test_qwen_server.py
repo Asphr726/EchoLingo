@@ -246,7 +246,8 @@ def test_strip_can_be_disabled_for_ab_runs() -> None:
     assert event["segment_rollover"] and streamer.completed_text == "what makes some."
 
 
-def test_build_streamer_adds_the_session_context_to_the_prompt(monkeypatch) -> None:
+def _policy_asr(monkeypatch, policy):
+    """The policy-applying ASR class over a fake upstream that builds real streamers."""
     streamer_module = pytest.importorskip("qwen3_asr_causal.streamer")
     tokenizer = WordTokenizer()
 
@@ -277,8 +278,12 @@ def test_build_streamer_adds_the_session_context_to_the_prompt(monkeypatch) -> N
     fake_package.qwen3_streaming = fake_module
     monkeypatch.setitem(sys.modules, "whisperlivekit", fake_package)
     monkeypatch.setitem(sys.modules, "whisperlivekit.qwen3_streaming", fake_module)
-    wrapped = qwen_server.install_streaming_policy(qwen_server.DECODE_POLICY_DEFAULTS, warmup_seconds=0)
-    asr = wrapped()
+    return qwen_server.install_streaming_policy(policy, warmup_seconds=0)()
+
+
+def test_build_streamer_adds_the_session_context_to_the_prompt(monkeypatch) -> None:
+    streamer_module = pytest.importorskip("qwen3_asr_causal.streamer")
+    asr = _policy_asr(monkeypatch, qwen_server.DECODE_POLICY_DEFAULTS)
 
     plain = asr.build_streamer("en")
     assert plain.config.prompt_prefix_template == [1]
@@ -301,6 +306,10 @@ def test_build_streamer_adds_the_session_context_to_the_prompt(monkeypatch) -> N
     assert biased.echolingo_plain_prompt_template == [1]
     assert biased.echolingo_context_gate is True
     assert biased.echolingo_silence_roll_ms == 2000
+    # The digital-silence guard covers every stream, context or not.
+    for streamer in (plain, biased):
+        assert streamer.echolingo_digital_silence_guard is True
+        assert streamer.echolingo_digital_silence_dbfs == -80.0
 
 
 async def test_context_middleware_sets_and_resets_the_session_context() -> None:
@@ -462,13 +471,15 @@ class LoudnessVad:
 class GateRig:
     """A context-gated streamer and the sample clock the online processor keeps.
 
-    ``audio`` feeds the speech timeline and advances ``state.audio.frames_seen``
-    like the mel extractor; ``decode`` asks for the prompt the way
-    ``append_mel_chunk`` does, then applies the hypothesis.
+    ``audio`` feeds the speech timeline (and the peak timeline, when one is
+    given) and advances ``state.audio.frames_seen`` like the mel extractor;
+    ``decode`` asks for the prompt the way ``append_mel_chunk`` does, then
+    applies the hypothesis.
     """
 
-    def __init__(self, *, timeline=_DEFAULT, **overrides) -> None:
+    def __init__(self, *, timeline=_DEFAULT, peaks=None, **overrides) -> None:
         self.timeline = SpeechTimeline(LoudnessVad()) if timeline is _DEFAULT else timeline
+        self.peaks = peaks
         values = dict(
             prompt_prefix_template=CONTEXT_PROMPT,
             echolingo_plain_prompt_template=PLAIN_PROMPT,
@@ -485,14 +496,20 @@ class GateRig:
         values.update(overrides)
         self.streamer = _streamer(**values)
         self.streamer.echolingo_speech_timeline = self.timeline
+        self.streamer.echolingo_peak_timeline = peaks
         self.samples = 0
         self.cached_steps = 0
 
-    def audio(self, seconds: float, *, speech: bool) -> None:
-        count = int(round(seconds * 16_000))
-        if self.timeline is not None:
-            self.timeline.feed(np.full(count, 0.5 if speech else 0.0, dtype=np.float32))
-        self.samples += count
+    def audio(self, seconds: float, *, speech: bool = False, level: float | None = None) -> None:
+        """A constant signal: 0.5 for speech, else ``level`` (digital zero by default)."""
+        value = 0.5 if speech else (level or 0.0)
+        self.feed(np.full(int(round(seconds * 16_000)), value, dtype=np.float32))
+
+    def feed(self, samples: np.ndarray) -> None:
+        for timeline in (self.timeline, self.peaks):
+            if timeline is not None:
+                timeline.feed(samples)
+        self.samples += samples.size
         self.streamer.state.audio.frames_seen = self.samples // 160
 
     def decode(self, text: str, *, steps: int = 13, is_flush: bool = False):
@@ -740,21 +757,24 @@ def test_context_gate_settings_default_and_clamp() -> None:
 
 
 class _GateStreamer:
-    def __init__(self, plain, gate: bool) -> None:
+    def __init__(self, plain, gate: bool, guard: bool = False) -> None:
         self.echolingo_plain_prompt_template = plain
         self.echolingo_context_gate = gate
         self.echolingo_speech_timeline = None
+        self.echolingo_digital_silence_guard = guard
+        self.echolingo_peak_timeline = None
 
 
 class _GateAsr:
     echolingo_context_gate_probability = 0.4
 
-    def __init__(self, plain, gate: bool = True) -> None:
+    def __init__(self, plain, gate: bool = True, guard: bool = False) -> None:
         self.plain = plain
         self.gate = gate
+        self.guard = guard
 
     def build_streamer(self, language=None):
-        return _GateStreamer(self.plain, self.gate)
+        return _GateStreamer(self.plain, self.gate, self.guard)
 
 
 class _UpstreamProcessor:
@@ -842,3 +862,278 @@ def test_silero_vad_path_prefers_the_bundle_then_the_source_checkout(tmp_path, m
     # No model anywhere: the regular lookup's path comes back for the error.
     (checkout / qwen_server.SILERO_VAD_RESOURCE).unlink()
     assert qwen_server.silero_vad_path() == elsewhere / qwen_server.SILERO_VAD_RESOURCE
+
+
+# ---------------------------------------------------------------------------
+# Digital-silence guard: a segment of nothing but digital silence (a loopback
+# source with nothing playing) never displays or commits the model's invented
+# "The.", and rolls empty so speech starts a fresh segment.
+# ---------------------------------------------------------------------------
+
+import ast  # noqa: E402
+import importlib.util  # noqa: E402
+import typing  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from echolingo.service.qwen_segment_policy import PeakTimeline  # noqa: E402
+
+
+def _guard_rig(*, context: bool, **overrides) -> GateRig:
+    """A stream wired like the online processor does, with or without a lecture context."""
+    if not context:
+        overrides.setdefault("timeline", None)
+        overrides.setdefault("prompt_prefix_template", None)
+        overrides.setdefault("echolingo_plain_prompt_template", None)
+    return GateRig(peaks=PeakTimeline(), **overrides)
+
+
+@pytest.mark.parametrize("context", [False, True])
+def test_digital_silence_never_displays_or_commits_the_invented_text(context: bool) -> None:
+    rig = _guard_rig(context=context)
+    events = []
+    for _ in range(10):
+        rig.audio(1.0)
+        prompt, event = rig.decode("The.")
+        # With a context, the silent segment stays on the plain prompt.
+        assert prompt == (PLAIN_PROMPT if context else None)
+        assert event["committed"] == event["display"] == event["unstable"] == ""
+        events.append(event)
+    assert rig.streamer.completed_text == ""
+    assert rig.streamer.digital_silence_suppressed == 10
+    assert rig.streamer.context_latches == rig.streamer.context_latches_deferred == 0
+    # Each segment rolls, empty, at the decode that brings it to 2 s (26 steps).
+    assert [event["segment_rollover"] for event in events] == [False, True] * 5
+    assert {event["segment_final_text"] for event in events[1::2]} == {""}
+    assert rig.streamer.rolls_by_reason == {"digital_silence": 5}
+    assert rig.streamer.edge_marks_stripped == 0
+    # The roll resets the segment like every other roll: the next one starts
+    # at the encoded end, with a fresh tracker, gate and decoder KV.
+    assert rig.streamer._segment_start_sample == (rig.samples // 160 - RIGHT_CONTEXT_FRAMES) * 160
+    assert rig.streamer._pause_tracker._candidate is None
+    assert not rig.streamer._context_latched and not rig.streamer._context_gated
+    assert rig.streamer._previous_segment_hypothesis is None
+    assert rig.streamer.state.decoder is None
+    # The session-end flush adds nothing either.
+    rig.audio(0.5)
+    _, event = rig.decode("The.", is_flush=True)
+    assert not event["segment_rollover"] and event["committed"] == ""
+    assert rig.streamer.finalize(finalize_mode="latest").final_text == ""
+
+
+def test_without_the_guard_digital_silence_commits_the_invented_text() -> None:
+    rig = _guard_rig(context=False, echolingo_digital_silence_guard=False)
+    for _ in range(4):
+        rig.audio(1.0)
+        _, event = rig.decode("The.")
+    # The pause roll takes the unchanged "The." for a finished sentence.
+    assert event["segment_rollover_reason"] == "pause"
+    assert rig.streamer.completed_text == "The."
+    assert rig.streamer.digital_silence_suppressed == 0
+
+
+def test_digital_silence_roll_waits_for_two_seconds_and_never_rolls_a_flush() -> None:
+    rig = _guard_rig(context=False)
+    rig.audio(1.9)
+    _, event = rig.decode("The.", steps=24)  # 1.92 s in the decoder
+    assert not event["segment_rollover"] and event["display"] == ""
+    rig.audio(0.1)
+    _, event = rig.decode("The.", steps=1, is_flush=True)
+    assert not event["segment_rollover"] and event["display"] == ""
+    rig.audio(0.1)
+    _, event = rig.decode("The.", steps=1)
+    assert event["segment_rollover_reason"] == "digital_silence"
+    assert event["committed"] == "" and rig.streamer.segments_finalized == 1
+
+
+@pytest.mark.parametrize("context", [False, True])
+def test_a_segment_with_one_audible_sample_decodes_exactly_as_without_the_guard(
+    context: bool,
+) -> None:
+    runs = []
+    for guard in (True, False):
+        rig = _guard_rig(context=context, echolingo_digital_silence_guard=guard)
+        blip = np.zeros(16_000, dtype=np.float32)
+        blip[8_000] = 10 ** (-79 / 20)  # one sample just above -80 dBFS
+        rig.feed(blip)
+        events = [rig.decode("The.")]
+        for _ in range(3):  # the last decode pause-rolls the segment
+            rig.audio(1.0)
+            events.append(rig.decode("The."))
+        runs.append((events, rig.streamer.completed_text, rig.streamer.digital_silence_suppressed))
+    assert runs[0] == runs[1]
+    assert runs[0][1] == "The." and runs[0][2] == 0
+    assert runs[0][0][-1][1]["segment_rollover_reason"] == "pause"
+
+
+@pytest.mark.parametrize(
+    ("level", "dbfs", "silent"),
+    [
+        (0.0, -80.0, True),
+        (1 / 32768, -80.0, True),  # 1 LSB of int16 dither
+        (3 / 32768, -80.0, True),
+        (4 / 32768, -80.0, False),
+        (10 ** (-79 / 20), -80.0, False),
+        (1 / 32768, -100.0, False),  # a stricter level
+        (1 / 32768, -120.0, False),
+        (0.0, -120.0, True),
+    ],
+)
+def test_digital_silence_level(level: float, dbfs: float, silent: bool) -> None:
+    rig = _guard_rig(context=False, echolingo_digital_silence_dbfs=dbfs)
+    rig.audio(1.0, level=level)
+    _, event = rig.decode("The")
+    assert (event["display"] == "") is silent
+    assert rig.streamer.digital_silence_suppressed == int(silent)
+
+
+@pytest.mark.parametrize("context", [False, True])
+def test_speech_after_digital_silence_starts_a_fresh_segment(context: bool) -> None:
+    rig = _guard_rig(context=context)
+    for _ in range(3):
+        rig.audio(1.0)
+        rig.decode("The.")
+    assert rig.streamer.rolls_by_reason == {"digital_silence": 1}
+    # The roll at 2 s dropped the silent audio steps up to the encoded end.
+    assert rig.streamer._segment_start_sample == (200 - RIGHT_CONTEXT_FRAMES) * 160
+    rig.audio(1.0, speech=True)
+    prompt, event = rig.decode("So today we talk")
+    # The speech segment behaves as before: its text is back and, with a
+    # context, the gate latches (nothing was committed under the plain prompt).
+    assert prompt == (CONTEXT_PROMPT if context else None)
+    assert event["display"] == event["unstable"] == "So today we talk"
+    assert rig.streamer.context_latches == int(context)
+    assert rig.streamer.context_latches_deferred == 0
+    sentence = "So today we talk about optimization."
+    rig.audio(1.0)
+    assert not rig.decode(sentence)[1]["segment_rollover"]
+    rig.audio(1.0)
+    _, event = rig.decode(sentence)
+    assert event["segment_rollover_reason"] == "pause"
+    assert rig.streamer.completed_text == sentence
+    assert rig.streamer.digital_silence_suppressed == 3
+
+
+def test_digital_silence_settings_default_and_clamp() -> None:
+    policy = qwen_server.decode_policy_from_environment({})
+    assert policy["echolingo_digital_silence_guard"] is True
+    assert policy["echolingo_digital_silence_dbfs"] == -80.0
+
+    def resolved(name: str, raw: str):
+        key = f"echolingo_digital_silence_{name.lower()}"
+        environment = {f"ECHOLINGO_QWEN_DIGITAL_SILENCE_{name}": raw}
+        return qwen_server.decode_policy_from_environment(environment)[key]
+
+    assert resolved("GUARD", "0") is False
+    assert resolved("GUARD", "off") is False
+    assert resolved("GUARD", "1") is True
+    assert resolved("DBFS", "-100") == -100.0
+    assert resolved("DBFS", "-150") == -120.0
+    assert resolved("DBFS", "-20") == -60.0
+    assert resolved("DBFS", "80") == -60.0
+    assert resolved("DBFS", "-inf") == -80.0
+    assert resolved("DBFS", "nan") == -80.0
+    assert resolved("DBFS", "quiet") == -80.0
+
+
+def test_turning_the_guard_off_reaches_the_streamer_and_the_processor(monkeypatch) -> None:
+    policy = qwen_server.decode_policy_from_environment(
+        {"ECHOLINGO_QWEN_DIGITAL_SILENCE_GUARD": "0", "ECHOLINGO_QWEN_DIGITAL_SILENCE_DBFS": "-90"}
+    )
+    asr = _policy_asr(monkeypatch, policy)
+    streamer = asr.build_streamer("en")
+    assert streamer.echolingo_digital_silence_guard is False
+    assert streamer.echolingo_digital_silence_dbfs == -90.0
+    processor_class = qwen_server.make_online_processor_class(_UpstreamProcessor)
+    session = processor_class(asr)
+    session.insert_audio_chunk(np.zeros(2048, dtype=np.float32), 0.128)
+    assert session.streamer.echolingo_peak_timeline is None
+    assert session._peak_timeline is None
+    # Default policy: the same stream gets the guard's peak timeline.
+    session = processor_class(_policy_asr(monkeypatch, qwen_server.DECODE_POLICY_DEFAULTS))
+    assert isinstance(session.streamer.echolingo_peak_timeline, PeakTimeline)
+
+
+def test_online_processor_feeds_a_peak_timeline_to_every_guarded_stream(monkeypatch) -> None:
+    monkeypatch.setattr(
+        qwen_server,
+        "make_speech_timeline",
+        lambda threshold: SpeechTimeline(LoudnessVad(), threshold=threshold),
+    )
+    processor_class = qwen_server.make_online_processor_class(_UpstreamProcessor)
+    for plain in (None, [5]):
+        session = processor_class(_GateAsr(plain=plain, guard=True))
+        peaks = session.streamer.echolingo_peak_timeline
+        assert isinstance(peaks, PeakTimeline)
+        # The VAD is still loaded only for a session with a context.
+        speech = session.streamer.echolingo_speech_timeline
+        assert (speech is None) == (plain is None)
+        session.insert_audio_chunk(np.zeros(1000, dtype=np.float32), 0.0625)
+        assert peaks.samples == 1000 and session.inserted == 1000
+        if speech is not None:
+            assert speech.frames == 1
+        first = session.streamer
+        session.start_silence()
+        # The rebuilt streamer shares the reset timeline.
+        assert session.streamer is not first
+        assert session.streamer.echolingo_peak_timeline is peaks and peaks.samples == 0
+        session.finish()
+    session = processor_class(_GateAsr(plain=None, guard=False))
+    session.insert_audio_chunk(np.zeros(1000, dtype=np.float32), 0.0625)
+    assert session.streamer.echolingo_peak_timeline is None
+
+
+def test_stream_counters_are_logged_as_counts_only(caplog) -> None:
+    rig = _guard_rig(context=False)
+    for _ in range(2):
+        rig.audio(1.0)
+        rig.decode("The.")
+    with caplog.at_level(logging.INFO, logger=qwen_server.logger.name):
+        qwen_server.log_stream_counters(rig.streamer)
+        qwen_server.log_stream_counters(_streamer())  # no timeline attached: no line
+        qwen_server.log_stream_counters(None)
+    assert [record.getMessage() for record in caplog.records] == [
+        "qwen3-streaming counters: 0 context latches, 0 deferred latches, "
+        "2 digital-silence hypotheses dropped, rolls {'digital_silence': 1}"
+    ]
+
+
+def _upstream_pcm_to_float():
+    """WhisperLiveKit's s16le decoder, compiled from the installed source.
+
+    Importing ``whisperlivekit.audio_processor`` would load torch and
+    configure root logging, so only this method is compiled.
+    """
+    spec = importlib.util.find_spec("whisperlivekit")
+    if spec is None or not spec.submodule_search_locations:
+        pytest.skip("whisperlivekit is not installed")
+    path = Path(next(iter(spec.submodule_search_locations))) / "audio_processor.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "convert_pcm_to_float":
+            namespace = {"np": np, "Union": typing.Union}
+            exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
+            return namespace["convert_pcm_to_float"]
+    pytest.fail("whisperlivekit's AudioProcessor.convert_pcm_to_float is gone")
+
+
+def test_the_guard_measures_pcm_on_the_scale_the_upstream_server_delivers() -> None:
+    # The Desktop streams s16le (--pcm-input, --no-vac); WhisperLiveKit hands
+    # every sample to insert_audio_chunk as float32 divided by 32768.
+    convert = _upstream_pcm_to_float()
+    online = pytest.importorskip("qwen3_asr_causal.online")
+    pcm = np.array([0, 1, -3, 4, -32768, 32767], dtype="<i2")
+    audio = convert(None, pcm.tobytes())
+    assert audio.dtype == np.float32
+    assert np.array_equal(audio, pcm.astype(np.float64) / 32768)  # exact: a power of two
+    assert audio[4] == -1.0 and audio[5] < 1.0
+    processor = object.__new__(online.Qwen3StreamingOnlineProcessor)
+    processor.audio_buffer = np.array([], dtype=np.float32)
+    processor.insert_audio_chunk(audio, 0.0)
+    assert np.array_equal(processor.audio_buffer, audio)  # what the mel extractor gets
+    # Full scale is 1.0: up to 3 LSB of dither is digital silence at the
+    # default -80 dBFS, 4 LSB is not.
+    threshold = 10 ** (qwen_server.DECODE_POLICY_DEFAULTS["echolingo_digital_silence_dbfs"] / 20)
+    peaks = PeakTimeline(frame_samples=1)
+    peaks.feed(audio)
+    assert peaks.peak(0, 3) < threshold <= peaks.peak(3, 4)
+    assert peaks.peak(4, 5) == 1.0

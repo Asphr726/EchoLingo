@@ -23,6 +23,15 @@ With a session context, a Silero VAD timeline (an annotation only: every frame
 is still decoded) keeps each segment on the plain prompt until it holds speech,
 then latches the context on for the rest of that segment; a latched segment
 rolls once a long silence follows its last speech.
+
+Digital-silence guard: a loopback source with nothing playing delivers exact
+digital zeros, which the model decodes as "The." until the pause roll commits
+it as a sentence (a stable "The" can also prefix the first real sentence). A
+per-frame peak timeline on every stream identifies a segment whose received
+samples all lie below ``echolingo_digital_silence_dbfs``. Such audio cannot
+hold speech: its hypothesis is dropped before the commit logic sees it, and
+once the segment holds ``DIGITAL_SILENCE_ROLL_MS`` it rolls empty so speech
+starts a fresh segment. No audio is dropped; every sample is still decoded.
 """
 
 from __future__ import annotations
@@ -47,6 +56,7 @@ from .power_throttling import disable_power_throttling
 from .qwen_segment_policy import (
     ASR_CONTEXT_HEADER,
     PauseRollTracker,
+    PeakTimeline,
     SpeechTimeline,
     decode_asr_context,
     strip_edge_punct,
@@ -80,6 +90,11 @@ DECODE_POLICY_DEFAULTS: dict[str, Any] = {
     # Roll a context-latched segment once this much silence follows its last
     # speech and the hypothesis stopped changing. 0 disables.
     "echolingo_silence_roll_ms": 2000,
+    # Drop the hypothesis of a segment whose audio so far is digital silence
+    # (every sample below the level, in dBFS) and roll it empty after
+    # DIGITAL_SILENCE_ROLL_MS. False turns the guard off.
+    "echolingo_digital_silence_guard": True,
+    "echolingo_digital_silence_dbfs": -80.0,
 }
 
 _ENVIRONMENT_KEYS = {
@@ -100,10 +115,18 @@ _ENVIRONMENT_KEYS = {
         "ECHOLINGO_QWEN_CONTEXT_GATE_PROBABILITY", float, 0.05, 0.9,
     ),
     "echolingo_silence_roll_ms": ("ECHOLINGO_QWEN_SILENCE_ROLL_MS", int, 800, 10_000),
+    "echolingo_digital_silence_guard": ("ECHOLINGO_QWEN_DIGITAL_SILENCE_GUARD", bool, None, None),
+    "echolingo_digital_silence_dbfs": (
+        "ECHOLINGO_QWEN_DIGITAL_SILENCE_DBFS", float, -120.0, -60.0,
+    ),
 }
 # Out-of-range values of these keys are clamped into range instead of ignored.
 _CLAMPED_ENVIRONMENT_KEYS = frozenset(
-    {"echolingo_context_gate_probability", "echolingo_silence_roll_ms"}
+    {
+        "echolingo_context_gate_probability",
+        "echolingo_silence_roll_ms",
+        "echolingo_digital_silence_dbfs",
+    }
 )
 # For these keys 0 means "off" and is accepted although below the minimum.
 _ZERO_DISABLES_KEYS = frozenset({"echolingo_silence_roll_ms"})
@@ -112,6 +135,9 @@ _ZERO_DISABLES_KEYS = frozenset({"echolingo_silence_roll_ms"})
 CONTEXT_GATE_MIN_SPEECH_MS = 160
 # The silence roll never rolls a segment shorter than this many decoder steps.
 SILENCE_ROLL_MIN_STEPS = 12
+# A segment of nothing but digital silence rolls once its decoder holds this
+# much audio.
+DIGITAL_SILENCE_ROLL_MS = 2000
 SILERO_VAD_RESOURCE = "models/silero_vad.onnx"
 
 # Lecture context of the WebSocket session being set up; the online processor
@@ -264,10 +290,17 @@ def make_segmented_streamer_class(base: type) -> type:
         echolingo_context_gate: bool = True
         echolingo_silence_roll_ms: int = 2000
         echolingo_speech_timeline: Any = dataclasses.field(default=None, repr=False)
+        # Digital-silence guard; the online processor attaches
+        # ``echolingo_peak_timeline`` (without one the guard is inactive).
+        echolingo_digital_silence_guard: bool = True
+        echolingo_digital_silence_dbfs: float = -80.0
+        echolingo_peak_timeline: Any = dataclasses.field(default=None, repr=False)
         rolls_by_reason: dict = dataclasses.field(default_factory=dict)
         edge_marks_stripped: int = 0
         context_latches: int = 0
         context_latches_deferred: int = 0
+        # Decodes whose hypothesis held text and was dropped as digital silence.
+        digital_silence_suppressed: int = 0
         _pause_tracker: Any = dataclasses.field(default=None, repr=False)
         _pause_confirmed_roll: bool = dataclasses.field(default=False, repr=False)
         # Per-segment gate state (reset on every roll).
@@ -291,7 +324,27 @@ def make_segmented_streamer_class(base: type) -> type:
             )
 
         def update_from_hypothesis(self, hypothesis_tokens: Any, **kwargs: Any) -> dict[str, Any]:
+            # Whatever the model decoded from a segment of pure digital
+            # silence is invented: drop it before the stable-commit and roll
+            # logic see it, so nothing is displayed or committed. The audio
+            # itself was still decoded; only this text is withheld.
+            digital_silence = self._segment_is_digital_silence()
+            if digital_silence:
+                if self._has_text_tokens(hypothesis_tokens):
+                    self.digital_silence_suppressed += 1
+                hypothesis_tokens = []
             event = super().update_from_hypothesis(hypothesis_tokens, **kwargs)
+            if (
+                digital_silence
+                and not event.get("segment_rollover")
+                and not kwargs.get("is_flush")
+                and int(kwargs.get("cached_steps") or 0) * self._step_samples()
+                >= self._ms_samples(DIGITAL_SILENCE_ROLL_MS)
+            ):
+                # Roll the empty segment so speech starts a fresh, short one
+                # instead of joining a long silent one (whose re-decode can
+                # prefix the first sentence with "The").
+                return self._roll(event, "digital_silence")
             if self.echolingo_eager_upstream:
                 if event.get("segment_rollover"):
                     self._note_roll(str(event.get("segment_rollover_reason") or "eager"))
@@ -320,6 +373,10 @@ def make_segmented_streamer_class(base: type) -> type:
                 reason = "silence"
             if reason is None:
                 return event
+            return self._roll(event, reason)
+
+        def _roll(self, event: dict[str, Any], reason: str) -> dict[str, Any]:
+            """Roll the active segment now and report it in ``event``."""
             # A pause- or silence-confirmed end keeps its mark; after a
             # confirmed interior boundary the hypothesis tail may end in a new
             # edge mark (strip).
@@ -455,6 +512,28 @@ def make_segmented_streamer_class(base: type) -> type:
             # be decoded into this segment.
             return timeline.speech_samples(encoded, head) == 0
 
+        # -- digital-silence guard ---------------------------------------
+
+        def _segment_is_digital_silence(self) -> bool:
+            """Every sample received since the segment start is digital silence.
+
+            Covers the whole segment up to the newest sample, a superset of
+            what the decoder and the encoder's right context have seen. Audio
+            the peak timeline no longer holds counts as not silent.
+            """
+            timeline = self.echolingo_peak_timeline
+            if not self.echolingo_digital_silence_guard or timeline is None:
+                return False
+            start = self._segment_samples()[0]
+            peak = timeline.peak(start, timeline.samples)
+            if peak is None:
+                return False
+            return peak < 10.0 ** (float(self.echolingo_digital_silence_dbfs) / 20.0)
+
+        def _has_text_tokens(self, hypothesis_tokens: Any) -> bool:
+            markers = {int(self.config.wait_token_id), int(self.config.word_start_token_id)}
+            return any(int(token) not in markers for token in hypothesis_tokens)
+
         def _segment_samples(self) -> tuple[int, int, int]:
             """(segment start, encoded end, audio head) in samples.
 
@@ -542,52 +621,72 @@ def make_speech_timeline(threshold: float) -> SpeechTimeline:
     return SpeechTimeline(vad, threshold=threshold, frame_samples=SileroOnnxVad.FRAME_SAMPLES)
 
 
-def log_context_gate_counters(streamer: Any) -> None:
-    """One INFO line with a gated streamer's counters (never any text)."""
-    if getattr(streamer, "echolingo_speech_timeline", None) is None:
+def log_stream_counters(streamer: Any) -> None:
+    """One INFO line with a stream's gate and guard counters (never any text)."""
+    if (
+        getattr(streamer, "echolingo_speech_timeline", None) is None
+        and getattr(streamer, "echolingo_peak_timeline", None) is None
+    ):
         return
     logger.info(
-        "qwen3-streaming context gate: %d latches, %d deferred latches, rolls %s",
+        "qwen3-streaming counters: %d context latches, %d deferred latches, "
+        "%d digital-silence hypotheses dropped, rolls %s",
         int(getattr(streamer, "context_latches", 0)),
         int(getattr(streamer, "context_latches_deferred", 0)),
+        int(getattr(streamer, "digital_silence_suppressed", 0)),
         dict(getattr(streamer, "rolls_by_reason", {}) or {}),
     )
 
 
 def make_online_processor_class(base: type) -> type:
-    """Subclass the upstream online processor to feed the context gate's VAD."""
+    """Subclass the upstream online processor to feed the gate and the guard."""
 
     class EchoLingoQwen3StreamingOnlineProcessor(base):  # type: ignore[misc,valid-type]
         def __init__(self, asr: Any, *args: Any, **kwargs: Any) -> None:
             self._speech_timeline: SpeechTimeline | None = None
+            self._peak_timeline: PeakTimeline | None = None
             super().__init__(asr, *args, **kwargs)
-            self._attach_speech_timeline()
+            self._attach_timelines()
 
         def insert_audio_chunk(self, audio: Any, audio_stream_end_time: float) -> Any:
-            # The timeline and the mel extractor count the same samples. This
+            # The timelines and the mel extractor count the same samples. This
             # runs on the event loop and the decodes in a worker thread, but
             # WhisperLiveKit awaits each process_iter/start_silence/finish
             # before it inserts the next chunk, so they never overlap.
-            timeline = self._speech_timeline
-            if timeline is not None:
-                timeline.feed(audio)
+            for timeline in (self._speech_timeline, self._peak_timeline):
+                if timeline is not None:
+                    timeline.feed(audio)
             return super().insert_audio_chunk(audio, audio_stream_end_time)
 
         def start_silence(self) -> Any:
             finished = getattr(self, "streamer", None)
             result = super().start_silence()
-            log_context_gate_counters(finished)
-            # The streamer was rebuilt and the mel extractor reset: both count
+            log_stream_counters(finished)
+            # The streamer was rebuilt and the mel extractor reset: all count
             # from sample 0 again.
-            if self._speech_timeline is not None:
-                self._speech_timeline.reset()
-            self._attach_speech_timeline()
+            for timeline in (self._speech_timeline, self._peak_timeline):
+                if timeline is not None:
+                    timeline.reset()
+            self._attach_timelines()
             return result
 
         def finish(self) -> Any:
             result = super().finish()
-            log_context_gate_counters(getattr(self, "streamer", None))
+            log_stream_counters(getattr(self, "streamer", None))
             return result
+
+        def _attach_timelines(self) -> None:
+            self._attach_peak_timeline()
+            self._attach_speech_timeline()
+
+        def _attach_peak_timeline(self) -> None:
+            """Give every guarded streamer the session's peak timeline."""
+            streamer = getattr(self, "streamer", None)
+            if streamer is None or not getattr(streamer, "echolingo_digital_silence_guard", False):
+                return
+            if self._peak_timeline is None:
+                self._peak_timeline = PeakTimeline()
+            streamer.echolingo_peak_timeline = self._peak_timeline
 
         def _attach_speech_timeline(self) -> None:
             """Give a context-carrying streamer the session's speech timeline.
@@ -675,6 +774,8 @@ def install_streaming_policy(
         echolingo_context_gate = True
         echolingo_context_gate_probability = 0.25
         echolingo_silence_roll_ms = 2000
+        echolingo_digital_silence_guard = True
+        echolingo_digital_silence_dbfs = -80.0
         _echolingo_streamer_class: type | None = None
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -727,6 +828,8 @@ def install_streaming_policy(
                 echolingo_strip_edge_punct=bool(self.echolingo_strip_edge_punct),
                 echolingo_context_gate=bool(self.echolingo_context_gate),
                 echolingo_silence_roll_ms=int(self.echolingo_silence_roll_ms),
+                echolingo_digital_silence_guard=bool(self.echolingo_digital_silence_guard),
+                echolingo_digital_silence_dbfs=float(self.echolingo_digital_silence_dbfs),
             )
             return cls(**values)
 

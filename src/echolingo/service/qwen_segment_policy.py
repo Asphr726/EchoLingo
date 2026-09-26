@@ -14,6 +14,8 @@ the invented edge mark before the text is committed.
 
 ``SpeechTimeline`` records where the stream held speech so the streamer can
 keep the lecture context out of the prompt while a segment is still silent.
+``PeakTimeline`` records the loudest sample of each frame so the streamer can
+recognise a segment that so far holds nothing but digital silence.
 """
 
 from __future__ import annotations
@@ -242,6 +244,99 @@ class SpeechTimeline:
         if not frames.size:
             return None
         return min((int(frames[-1]) + 1) * self.frame_samples, int(end))
+
+
+# ---------------------------------------------------------------------------
+# Peak timeline (recognises digital silence)
+# ---------------------------------------------------------------------------
+
+
+class PeakTimeline:
+    """Per-frame peak magnitude on a session's 16 kHz sample clock.
+
+    Frame ``i`` covers samples ``[i * frame_samples, (i + 1) * frame_samples)``
+    counted from the last ``reset``, the grid ``SpeechTimeline`` uses. The
+    partial tail frame is tracked as well, so a query sees every sample fed.
+    Only about the last ``keep_seconds`` of frames are kept. Pure numpy and
+    cheap enough to run on every stream.
+
+    Float audio is full scale at 1.0 (WhisperLiveKit hands the online
+    processor s16le PCM divided by 32768); signed integer PCM is scaled to the
+    same range.
+    """
+
+    def __init__(
+        self,
+        *,
+        frame_samples: int = 512,
+        sample_rate_hz: int = 16_000,
+        keep_seconds: float = 60.0,
+    ) -> None:
+        self.frame_samples = max(1, int(frame_samples))
+        self.sample_rate_hz = int(sample_rate_hz)
+        self._max_frames = max(1, int(keep_seconds * self.sample_rate_hz) // self.frame_samples)
+        self._peaks = np.zeros((0,), dtype=np.float32)
+        self._first_frame = 0  # stream index of self._peaks[0]
+        self._tail = np.zeros((0,), dtype=np.float32)  # magnitudes of the partial frame
+
+    @property
+    def frames(self) -> int:
+        """Complete frames fed since the last reset."""
+        return self._first_frame + int(self._peaks.size)
+
+    @property
+    def samples(self) -> int:
+        """Samples fed since the last reset, the partial frame included."""
+        return self.frames * self.frame_samples + int(self._tail.size)
+
+    def feed(self, audio: Any) -> None:
+        values = np.asarray(audio).reshape(-1)
+        if not values.size:
+            return
+        magnitude = np.abs(values.astype(np.float32))
+        if np.issubdtype(values.dtype, np.signedinteger):
+            magnitude /= float(-np.iinfo(values.dtype).min)
+        magnitude = np.concatenate((self._tail, magnitude))
+        size = self.frame_samples
+        count = magnitude.size // size
+        self._tail = magnitude[count * size :]
+        if not count:
+            return
+        peaks = magnitude[: count * size].reshape(count, size).max(axis=1)
+        self._peaks = np.concatenate((self._peaks, peaks))
+        excess = int(self._peaks.size) - self._max_frames
+        if excess > 0:
+            self._peaks = self._peaks[excess:]
+            self._first_frame += excess
+
+    def reset(self) -> None:
+        self._peaks = np.zeros((0,), dtype=np.float32)
+        self._first_frame = 0
+        self._tail = np.zeros((0,), dtype=np.float32)
+
+    def peak(self, start: int, end: int) -> float | None:
+        """Largest magnitude in the frames overlapping samples ``[start, end)``.
+
+        ``end`` is clipped to the samples fed, and a range without samples
+        reads 0.0. None when part of the range was already trimmed away: that
+        audio is unknown, not silent. A NaN sample makes the peak NaN, which
+        no threshold test accepts as silence.
+        """
+        start = max(0, int(start))
+        end = min(int(end), self.samples)
+        if end <= start:
+            return 0.0
+        size = self.frame_samples
+        first = start // size
+        if first < self._first_frame:
+            return None
+        last = -(-end // size)  # exclusive; may reach into the partial frame
+        offset = self._first_frame
+        parts = [self._peaks[first - offset : min(last, self.frames) - offset]]
+        if last > self.frames:
+            parts.append(self._tail)
+        window = np.concatenate(parts)
+        return float(window.max()) if window.size else 0.0
 
 
 # ---------------------------------------------------------------------------

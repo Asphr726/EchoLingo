@@ -8,6 +8,7 @@ import pytest
 from echolingo.service.qwen_segment_policy import (
     ASR_CONTEXT_MAX_CHARS,
     PauseRollTracker,
+    PeakTimeline,
     SpeechTimeline,
     decode_asr_context,
     encode_asr_context,
@@ -186,6 +187,67 @@ def test_speech_timeline_without_a_working_vad_is_unavailable() -> None:
     assert timeline.available
     timeline.feed(np.ones(2048, dtype=np.float32))
     assert not timeline.available and timeline.frames == 0
+
+
+# ---------------------------------------------------------------------------
+# Peak timeline
+# ---------------------------------------------------------------------------
+
+
+def test_peak_timeline_keeps_frame_boundaries_across_odd_chunk_sizes() -> None:
+    audio = np.zeros(10 * 512 + 300, dtype=np.float32)
+    audio[3 * 512] = 0.25  # first sample of frame 3
+    audio[5 * 512 - 1] = -0.5  # last sample of frame 4
+    audio[10 * 512 + 299] = 0.125  # last sample of the partial tail frame
+    timeline = PeakTimeline()
+    offset = 0
+    for size in (100, 700, 1, 1234, 999, 17):
+        timeline.feed(audio[offset : offset + size])
+        offset += size
+    timeline.feed(audio[offset:])
+    assert timeline.frames == 10 and timeline.samples == 10 * 512 + 300
+    assert timeline.peak(0, 3 * 512) == 0.0
+    assert timeline.peak(3 * 512, 4 * 512) == 0.25
+    assert timeline.peak(4 * 512, 5 * 512) == 0.5
+    assert timeline.peak(5 * 512, 10 * 512) == 0.0
+    assert timeline.peak(3 * 512 - 1, 3 * 512 + 1) == 0.25  # partial frame overlap
+    assert timeline.peak(2000, 1600) == 0.0  # empty range
+    # The partial tail frame counts; beyond the samples fed there is nothing.
+    assert timeline.peak(10 * 512, 10 * 512 + 1) == 0.125
+    assert timeline.peak(5 * 512, 10**9) == 0.125
+    assert timeline.peak(10**8, 10**9) == 0.0
+    # The tail and the next samples make one frame.
+    timeline.feed(np.zeros(212, dtype=np.float32))
+    assert timeline.frames == 11 and timeline.samples == 11 * 512
+    assert timeline.peak(10 * 512, 11 * 512) == 0.125
+
+
+def test_peak_timeline_scales_integer_pcm_like_the_float_stream() -> None:
+    pcm = np.zeros(1024, dtype=np.int16)
+    pcm[10], pcm[600] = -32768, 3
+    as_int, as_float = PeakTimeline(), PeakTimeline()
+    as_int.feed(pcm)
+    as_float.feed(pcm.astype(np.float32) / 32768.0)
+    for timeline in (as_int, as_float):
+        assert timeline.peak(0, 512) == 1.0  # no int16 overflow in abs(-32768)
+        assert timeline.peak(512, 1024) == pytest.approx(3 / 32768)
+
+
+def test_peak_timeline_trim_reset_and_nan() -> None:
+    timeline = PeakTimeline(keep_seconds=4 * 512 / 16_000)  # keeps 4 frames
+    timeline.feed(np.zeros(10 * 512, dtype=np.float32))
+    assert timeline.frames == 10
+    # Trimmed audio is unknown, not silent.
+    assert timeline.peak(0, 10 * 512) is None
+    assert timeline.peak(6 * 512 - 1, 10 * 512) is None
+    assert timeline.peak(6 * 512, 10 * 512) == 0.0
+    timeline.feed(np.full(100, 0.5, dtype=np.float32))
+    timeline.reset()
+    assert timeline.frames == 0 and timeline.samples == 0
+    assert timeline.peak(0, 10**6) == 0.0
+    # A NaN sample never reads as silence.
+    timeline.feed(np.array([0.0, np.nan, 0.0], dtype=np.float32))
+    assert not timeline.peak(0, 3) < 1.0
 
 
 def test_silero_frame_probabilities_keep_the_partial_frame(monkeypatch) -> None:
