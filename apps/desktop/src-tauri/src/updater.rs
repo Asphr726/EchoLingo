@@ -1014,13 +1014,13 @@ mod tests {
     #[test]
     fn status_serializes_for_the_webview() {
         let status = UpdateStatus {
-            current_version: "0.3.0".into(),
+            current_version: "0.3.1".into(),
             state: UpdateState::Downloading,
             available: Some(AvailableUpdate {
-                version: "0.3.1".into(),
+                version: "0.3.2".into(),
                 notes: Some("## Fixes\n\n- Faster start".into()),
                 date: Some("2026-09-20T08:00:00Z".into()),
-                release_url: release_url("0.3.1"),
+                release_url: release_url("0.3.2"),
             }),
             last_checked_at: Some("2026-09-24T10:00:00Z".into()),
             error: None,
@@ -1035,11 +1035,11 @@ mod tests {
         };
         let value = serde_json::to_value(&status).unwrap();
         assert_eq!(value["state"], "downloading");
-        assert_eq!(value["current_version"], "0.3.0");
-        assert_eq!(value["available"]["version"], "0.3.1");
+        assert_eq!(value["current_version"], "0.3.1");
+        assert_eq!(value["available"]["version"], "0.3.2");
         assert_eq!(
             value["available"]["release_url"],
-            "https://github.com/Asphr726/EchoLingo/releases/tag/v0.3.1"
+            "https://github.com/Asphr726/EchoLingo/releases/tag/v0.3.2"
         );
         assert_eq!(value["progress"]["downloaded_bytes"], 1_024);
         assert!(value["progress"]["total_bytes"].is_null());
@@ -1379,8 +1379,8 @@ mod tests {
         ));
         assert!(check_answer(Err(UpdaterError::MissingSignedVersion)).is_err());
         assert_eq!(
-            no_platform_entry_log_line("0.3.0", Trigger::Launch, "windows-x86_64"),
-            "update check result=no_platform_entry current=0.3.0 trigger=launch \
+            no_platform_entry_log_line("0.3.1", Trigger::Launch, "windows-x86_64"),
+            "update check result=no_platform_entry current=0.3.1 trigger=launch \
              targets=windows-x86_64"
         );
     }

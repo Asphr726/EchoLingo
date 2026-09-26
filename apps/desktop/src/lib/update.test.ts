@@ -12,9 +12,9 @@ import {
 } from "./update";
 
 const status: UpdateStatus = {
-  current_version: "0.3.0",
+  current_version: "0.3.1",
   state: "available",
-  available: { version: "0.3.1", notes: null, date: null, release_url: "https://github.com/Asphr726/EchoLingo/releases/tag/v0.3.1" },
+  available: { version: "0.3.2", notes: null, date: null, release_url: "https://github.com/Asphr726/EchoLingo/releases/tag/v0.3.2" },
   last_checked_at: null,
   error: null,
   in_place_supported: true,
@@ -68,10 +68,10 @@ describe("update helpers", () => {
   });
 
   it("labels the pill", () => {
-    expect(versionLabel("v0.3.1")).toBe("v0.3.1");
-    expect(updatePillLabel(status, false)).toBe("Update available · v0.3.1");
+    expect(versionLabel("v0.3.2")).toBe("v0.3.2");
+    expect(updatePillLabel(status, false)).toBe("Update available · v0.3.2");
     expect(updatePillLabel(status, true)).toBeNull();
-    expect(updatePillLabel({ ...status, state: "installing" }, false)).toBe("Updating to v0.3.1…");
+    expect(updatePillLabel({ ...status, state: "installing" }, false)).toBe("Updating to v0.3.2…");
     expect(updatePillLabel(null, false)).toBeNull();
   });
 });

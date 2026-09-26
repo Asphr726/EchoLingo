@@ -246,7 +246,7 @@ const previewReleaseNotes = [
   "- History search matches titles written by the assistant.",
 ].join("\n");
 const previewUpdateIdle: UpdateStatus = {
-  current_version: "0.3.0",
+  current_version: "0.3.1",
   state: "idle",
   available: null,
   last_checked_at: null,
@@ -267,10 +267,10 @@ function previewUpdate(): UpdateStatus {
     state: "available",
     last_checked_at: checked,
     available: {
-      version: "0.3.1",
+      version: "0.3.2",
       notes: previewReleaseNotes,
       date: "2026-09-22T12:00:00Z",
-      release_url: "https://github.com/Asphr726/EchoLingo/releases/tag/v0.3.1",
+      release_url: "https://github.com/Asphr726/EchoLingo/releases/tag/v0.3.2",
     },
   };
   switch (previewParam("update")) {
@@ -287,7 +287,7 @@ function previewUpdate(): UpdateStatus {
       return (previewUpdateState = {
         ...available,
         state: "error",
-        error: "The update could not be downloaded: error sending request for url (https://github.com/Asphr726/EchoLingo/releases/download/v0.3.1/EchoLingo.app.tar.gz): connection reset",
+        error: "The update could not be downloaded: error sending request for url (https://github.com/Asphr726/EchoLingo/releases/download/v0.3.2/EchoLingo_0.3.2_aarch64.app.tar.gz): connection reset",
       });
     case "unsupported":
       return (previewUpdateState = {

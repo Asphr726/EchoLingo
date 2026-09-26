@@ -420,7 +420,8 @@ export interface ModelProgress {
   total_bytes: number;
   bytes_per_second: number | null;
   phase: string;
-  /** Why a `failed` phase failed, when the shell says. */
+  /** Why a `failed` phase failed, when the shell says, or why a model
+   *  download started over (on every event of the retried attempt). */
   message?: string | null;
 }
 

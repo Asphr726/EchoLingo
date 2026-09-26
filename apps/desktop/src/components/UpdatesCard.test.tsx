@@ -7,7 +7,7 @@ import { UpdatePill, UpdatesCard } from "./UpdatesCard";
 const now = Date.parse("2026-09-24T12:00:00Z");
 
 const idle: UpdateStatus = {
-  current_version: "0.3.0",
+  current_version: "0.3.1",
   state: "idle",
   available: null,
   last_checked_at: null,
@@ -23,10 +23,10 @@ const available: UpdateStatus = {
   state: "available",
   last_checked_at: "2026-09-24T11:48:00Z",
   available: {
-    version: "0.3.1",
+    version: "0.3.2",
     notes: "## Fixes\n\n- The caption window keeps its **size**.\n\n<script>alert(1)</script>",
     date: "2026-09-22T12:00:00Z",
-    release_url: "https://github.com/Asphr726/EchoLingo/releases/tag/v0.3.1",
+    release_url: "https://github.com/Asphr726/EchoLingo/releases/tag/v0.3.2",
   },
 };
 
@@ -59,7 +59,7 @@ function render(
 describe("UpdatesCard", () => {
   it("shows the version, the manual check and the launch preference before any check", () => {
     const html = render(idle, { checkAtLaunch: false });
-    expect(html).toContain("<strong>EchoLingo 0.3.0</strong>");
+    expect(html).toContain("<strong>EchoLingo 0.3.1</strong>");
     expect(html).toContain('<small role="status">Not checked yet</small>');
     expect(html).toMatch(/<button class="button" type="button">.*Check for updates<\/button>/);
     expect(html).toContain('<input type="checkbox"/><span>Check for updates when EchoLingo starts</span>');
@@ -75,8 +75,8 @@ describe("UpdatesCard", () => {
 
   it("offers an available update with its notes and the macOS permission note", () => {
     const html = render(available);
-    expect(html).toContain('aria-label="EchoLingo 0.3.1"');
-    expect(html).toContain("<strong>EchoLingo v0.3.1</strong>");
+    expect(html).toContain('aria-label="EchoLingo 0.3.2"');
+    expect(html).toContain("<strong>EchoLingo v0.3.2</strong>");
     expect(html).toContain("Released September 22, 2026");
     expect(html).toMatch(/<button class="button button--primary" type="button">.*Download and install<\/button>/);
     // Release notes go through the notes renderer: Markdown, never raw HTML.
@@ -137,7 +137,7 @@ describe("UpdatesCard", () => {
       { ...available, in_place_supported: false, unsupported_reason: "On Linux, install the new .deb package from the release page." },
       { platform: "linux" },
     );
-    expect(html).toContain('<a class="button button--primary" href="https://github.com/Asphr726/EchoLingo/releases/tag/v0.3.1" target="_blank" rel="noreferrer">Download');
+    expect(html).toContain('<a class="button button--primary" href="https://github.com/Asphr726/EchoLingo/releases/tag/v0.3.2" target="_blank" rel="noreferrer">Download');
     expect(html).toContain("On Linux, install the new .deb package from the release page.");
     expect(html).not.toContain("Download and install");
   });
@@ -180,7 +180,7 @@ describe("UpdatePill", () => {
   it("names the new version", () => {
     const html = pill(available);
     expect(html).toMatch(/^<button class="update-pill" type="button" title="Open the update in Settings">/);
-    expect(html).toContain("Update available · v0.3.1</button>");
+    expect(html).toContain("Update available · v0.3.2</button>");
   });
 
   it("is hidden while recording and without an update", () => {
@@ -190,6 +190,6 @@ describe("UpdatePill", () => {
   });
 
   it("follows a running install", () => {
-    expect(pill({ ...available, state: "downloading" })).toContain("Updating to v0.3.1…");
+    expect(pill({ ...available, state: "downloading" })).toContain("Updating to v0.3.2…");
   });
 });
