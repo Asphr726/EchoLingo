@@ -326,6 +326,9 @@ export function SettingsView() {
                         <span>{model.role}</span>
                         <strong>{model.display_name}</strong>
                         <small>{formatBytes(model.size_bytes)} · {model.state.replace("_", " ")}</small>
+                        {(busy || model.state === "installing") && progress?.message && (
+                          <small className="model-row-note" role="status">{progress.message}</small>
+                        )}
                       </div>
                       <div className="model-row-actions">
                         {(busy || model.state === "installing") && (

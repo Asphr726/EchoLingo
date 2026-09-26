@@ -7,11 +7,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
+use std::future::Future;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -23,6 +25,26 @@ pub mod gpu_pack;
 pub const MODEL_CATALOG_VERSION: u16 = 1;
 /// SIGTERM-to-SIGKILL grace when a local model service is stopped.
 const SERVICE_STOP_GRACE: Duration = Duration::from_secs(2);
+/// Model download attempts per install, the first included. Only a stalled
+/// attempt is retried; a download error ends the install at once.
+const DOWNLOAD_ATTEMPTS: u32 = 3;
+/// How long a model download may go without receiving data before the
+/// attempt is abandoned (at least; see [`StallClock`]), in seconds: the
+/// default and the range `ECHOLINGO_MODEL_STALL_SECONDS` may choose from.
+const DEFAULT_STALL_SECONDS: u64 = 60;
+const MIN_STALL_SECONDS: u64 = 5;
+const MAX_STALL_SECONDS: u64 = 600;
+const STALL_SECONDS_ENVIRONMENT: &str = "ECHOLINGO_MODEL_STALL_SECONDS";
+/// Xet transfers (most Hugging Face files) report bytes only once a whole
+/// term of up to 64 MB is written, and fetch several terms at once, so on a
+/// slow link data flows long before the first report. Until the first one
+/// the allowed silence is this many stall timeouts.
+const FIRST_DATA_STALL_FACTOR: u32 = 5;
+/// For the same reason the allowed silence is at least this many times the
+/// longest silence the attempt has already come back from.
+const STALL_GAP_FACTOR: u32 = 3;
+/// How often the stall watchdog looks at the clock at most.
+const STALL_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -78,7 +100,8 @@ pub struct ModelProgress {
     pub total_bytes: u64,
     pub bytes_per_second: Option<f64>,
     pub phase: String,
-    /// Why an install failed (`phase: "failed"`).
+    /// Why an install failed (`phase: "failed"`), or why a model download
+    /// started over (on every event of the new attempt).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -738,19 +761,94 @@ fn log_tail(path: &Path, limit: usize) -> String {
 
 type ProgressCallback = Arc<dyn Fn(ModelProgress) + Send + Sync>;
 
+/// One model download attempt: fill `staging` with the model's files and
+/// report through `progress`.
+struct DownloadRequest {
+    spec: ModelSpec,
+    staging: PathBuf,
+    cache: PathBuf,
+    progress: Arc<ModelProgressHandler>,
+}
+
+type DownloadFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+type Downloader = Arc<dyn Fn(DownloadRequest) -> DownloadFuture + Send + Sync>;
+
+/// The Hugging Face download of a pinned model revision.
+fn hugging_face_download(request: DownloadRequest) -> DownloadFuture {
+    Box::pin(async move {
+        let DownloadRequest {
+            spec,
+            staging,
+            cache,
+            progress,
+        } = request;
+        let client = HFClient::builder()
+            .cache_dir(&cache)
+            .user_agent(format!("echolingo/{}", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|error| error.to_string())?;
+        let (owner, name) = spec
+            .repository
+            .split_once('/')
+            .ok_or_else(|| "invalid repository name".to_string())?;
+        let repository = client.model(owner, name);
+        let result = match &spec.download {
+            DownloadKind::Snapshot { allow_patterns } => repository
+                .snapshot_download()
+                .revision(spec.revision.clone())
+                .allow_patterns(allow_patterns.clone())
+                .local_dir(staging)
+                .max_workers(4)
+                .progress(progress)
+                .send()
+                .await
+                .map(|_| ()),
+            DownloadKind::File { filename } => repository
+                .download_file()
+                .filename(filename.clone())
+                .revision(spec.revision.clone())
+                .local_dir(staging)
+                .progress(progress)
+                .send()
+                .await
+                .map(|_| ()),
+        };
+        result.map_err(|error| error.to_string())
+    })
+}
+
+/// `ECHOLINGO_MODEL_STALL_SECONDS` (clamped to its range) or the default.
+fn stall_timeout_from(raw: Option<&str>) -> Duration {
+    let seconds = raw
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(|seconds| seconds.clamp(MIN_STALL_SECONDS, MAX_STALL_SECONDS))
+        .unwrap_or(DEFAULT_STALL_SECONDS);
+    Duration::from_secs(seconds)
+}
+
 pub struct ModelManager {
     root: PathBuf,
     cache: PathBuf,
     active: Mutex<HashSet<String>>,
+    downloader: Downloader,
+    stall_timeout: Duration,
 }
 
 impl ModelManager {
     pub fn new(root: PathBuf) -> Self {
+        let stall_timeout =
+            stall_timeout_from(std::env::var(STALL_SECONDS_ENVIRONMENT).ok().as_deref());
+        Self::with_downloader(root, Arc::new(hugging_face_download), stall_timeout)
+    }
+
+    fn with_downloader(root: PathBuf, downloader: Downloader, stall_timeout: Duration) -> Self {
         let cache = root.join(".downloads");
         Self {
             root,
             cache,
             active: Mutex::new(HashSet::new()),
+            downloader,
+            stall_timeout,
         }
     }
 
@@ -835,58 +933,7 @@ impl ModelManager {
             });
         }
 
-        let staging = self.root.join(format!(".{}.installing", spec.id));
-        remove_scoped_directory(&self.root, &staging)?;
-        std::fs::create_dir_all(&staging)?;
-        callback(ModelProgress {
-            model_id: spec.id.clone(),
-            bytes_completed: 0,
-            total_bytes: spec.expected_bytes,
-            bytes_per_second: None,
-            phase: "starting".into(),
-            message: None,
-        });
-
-        let client = HFClient::builder()
-            .cache_dir(&self.cache)
-            .user_agent(format!("echolingo/{}", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|error| ModelManagerError::Download(error.to_string()))?;
-        let (owner, name) = spec
-            .repository
-            .split_once('/')
-            .ok_or_else(|| ModelManagerError::Download("invalid repository name".into()))?;
-        let repository = client.model(owner, name);
-        let progress = ModelProgressHandler {
-            model_id: spec.id.clone(),
-            callback: callback.clone(),
-            files: Mutex::new(HashMap::new()),
-        };
-        let download_result = match &spec.download {
-            DownloadKind::Snapshot { allow_patterns } => repository
-                .snapshot_download()
-                .revision(spec.revision.clone())
-                .allow_patterns(allow_patterns.clone())
-                .local_dir(staging.clone())
-                .max_workers(4)
-                .progress(progress)
-                .send()
-                .await
-                .map(|_| ()),
-            DownloadKind::File { filename } => repository
-                .download_file()
-                .filename(filename.clone())
-                .revision(spec.revision.clone())
-                .local_dir(staging.clone())
-                .progress(progress)
-                .send()
-                .await
-                .map(|_| ()),
-        };
-        if let Err(error) = download_result {
-            remove_scoped_directory(&self.root, &staging)?;
-            return Err(ModelManagerError::Download(error.to_string()));
-        }
+        let staging = self.download(spec, &callback).await?;
 
         callback(ModelProgress {
             model_id: spec.id.clone(),
@@ -910,6 +957,88 @@ impl ModelManager {
         Ok(())
     }
 
+    /// Download `spec` into a fresh staging directory and return it. An
+    /// attempt that stalls is abandoned and the download starts over, in a
+    /// new directory, up to [`DOWNLOAD_ATTEMPTS`] times in all.
+    async fn download(
+        &self,
+        spec: &ModelSpec,
+        callback: &ProgressCallback,
+    ) -> Result<PathBuf, ModelManagerError> {
+        // Retry directories an earlier install could not remove.
+        for attempt in 2..=DOWNLOAD_ATTEMPTS {
+            self.discard_staging(&self.staging_directory(spec, attempt));
+        }
+        for attempt in 1..=DOWNLOAD_ATTEMPTS {
+            let staging = self.staging_directory(spec, attempt);
+            remove_scoped_directory(&self.root, &staging)?;
+            std::fs::create_dir_all(&staging)?;
+            let note = (attempt > 1)
+                .then(|| format!("Download stalled; retrying ({attempt}/{DOWNLOAD_ATTEMPTS})"));
+            callback(ModelProgress {
+                model_id: spec.id.clone(),
+                bytes_completed: 0,
+                total_bytes: spec.expected_bytes,
+                bytes_per_second: None,
+                phase: if attempt == 1 { "starting" } else { "retrying" }.into(),
+                message: note.clone(),
+            });
+            let activity = Arc::new(DownloadActivity::new(self.stall_timeout));
+            let request = DownloadRequest {
+                spec: spec.clone(),
+                staging: staging.clone(),
+                cache: self.cache.clone(),
+                progress: Arc::new(ModelProgressHandler {
+                    model_id: spec.id.clone(),
+                    callback: callback.clone(),
+                    note,
+                    activity: activity.clone(),
+                    files: Mutex::new(HashMap::new()),
+                }),
+            };
+            match run_download_attempt(&self.downloader, request, &activity).await? {
+                AttemptOutcome::Finished(Ok(())) => return Ok(staging),
+                AttemptOutcome::Finished(Err(error)) => {
+                    self.discard_staging(&staging);
+                    return Err(ModelManagerError::Download(error));
+                }
+                AttemptOutcome::Stalled => {
+                    eprintln!(
+                        "model download of {} stalled (attempt {attempt}/{DOWNLOAD_ATTEMPTS})",
+                        spec.id
+                    );
+                    self.discard_staging(&staging);
+                }
+            }
+        }
+        Err(ModelManagerError::Download(format!(
+            "the download stalled {DOWNLOAD_ATTEMPTS} times without receiving data; \
+             check the network connection and try again"
+        )))
+    }
+
+    /// The staging directory of download attempt `attempt`: each attempt
+    /// has its own, so a write that was still in flight when a stalled
+    /// attempt was stopped can never land in the next one.
+    fn staging_directory(&self, spec: &ModelSpec, attempt: u32) -> PathBuf {
+        if attempt <= 1 {
+            self.root.join(format!(".{}.installing", spec.id))
+        } else {
+            self.root.join(format!(".{}.installing-{attempt}", spec.id))
+        }
+    }
+
+    /// Best-effort removal of an abandoned staging directory. It can fail on
+    /// Windows while a file in it is still open; the next install retries.
+    fn discard_staging(&self, staging: &Path) {
+        if let Err(error) = remove_scoped_directory(&self.root, staging) {
+            eprintln!(
+                "could not remove {} ({error}); the next install removes it",
+                staging.display()
+            );
+        }
+    }
+
     pub fn verify(&self, model_id: &str) -> Result<ModelStatus, ModelManagerError> {
         let spec = model_spec(model_id)?;
         verify_required_file(&self.root.join(&spec.id), &spec)?;
@@ -930,23 +1059,221 @@ impl ModelManager {
     }
 }
 
+enum AttemptOutcome {
+    Finished(Result<(), String>),
+    Stalled,
+}
+
+/// Run one download attempt on a runtime of its own until it finishes or
+/// stalls.
+///
+/// hf-hub runs a Xet transfer (and its progress poller) as detached tasks on
+/// the runtime that polls the download, so dropping the download future alone
+/// would leave a stalled transfer running, and writing into the staging
+/// directory, for the life of the app. Shutting the attempt's runtime down
+/// drops every task it spawned; only a blocking file write that is already
+/// running finishes, which is why each attempt also has its own staging
+/// directory.
+async fn run_download_attempt(
+    downloader: &Downloader,
+    request: DownloadRequest,
+    activity: &DownloadActivity,
+) -> io::Result<AttemptOutcome> {
+    let runtime = AttemptRuntime::new()?;
+    let task = runtime.spawn(downloader(request));
+    let outcome = tokio::select! {
+        joined = task => AttemptOutcome::Finished(
+            joined.unwrap_or_else(|error| Err(format!("the download task failed: {error}"))),
+        ),
+        () = activity.stalled() => AttemptOutcome::Stalled,
+    };
+    // Late events of this attempt must not reach the UI after the next one
+    // has started.
+    activity.retire();
+    drop(runtime);
+    Ok(outcome)
+}
+
+/// The multi-thread runtime of one download attempt (Xet requires one with
+/// time and I/O drivers), shut down without blocking when dropped, which is
+/// safe inside another runtime.
+struct AttemptRuntime {
+    handle: tokio::runtime::Handle,
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl AttemptRuntime {
+    fn new() -> io::Result<Self> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("model-download")
+            .build()?;
+        Ok(Self {
+            handle: runtime.handle().clone(),
+            runtime: Some(runtime),
+        })
+    }
+
+    fn spawn(&self, download: DownloadFuture) -> tokio::task::JoinHandle<Result<(), String>> {
+        self.handle.spawn(download)
+    }
+}
+
+impl Drop for AttemptRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+/// When a download attempt last received data and how long it may stay
+/// silent. Only events that change a byte count (or start or finish the
+/// transfer) count: hf-hub's Xet poller repeats the same totals ten times a
+/// second while a transfer is stuck.
+#[derive(Debug)]
+struct StallClock {
+    stall_timeout: Duration,
+    last_advance: Instant,
+    longest_silence: Duration,
+    file_bytes: u64,
+    /// Xet's aggregate byte count, once it has reported one.
+    xet_bytes: Option<u64>,
+}
+
+impl StallClock {
+    fn new(stall_timeout: Duration, now: Instant) -> Self {
+        Self {
+            stall_timeout,
+            last_advance: now,
+            longest_silence: Duration::ZERO,
+            file_bytes: 0,
+            xet_bytes: None,
+        }
+    }
+
+    fn advance(&mut self, now: Instant) {
+        self.longest_silence = self
+            .longest_silence
+            .max(now.saturating_duration_since(self.last_advance));
+        self.last_advance = self.last_advance.max(now);
+    }
+
+    /// The sum of the per-file byte counts (plain HTTP transfers and Xet).
+    fn file_bytes(&mut self, bytes: u64, now: Instant) {
+        if bytes != self.file_bytes {
+            self.file_bytes = bytes;
+            self.advance(now);
+        }
+    }
+
+    /// Xet's aggregate byte count.
+    fn xet_bytes(&mut self, bytes: u64, now: Instant) {
+        if self.xet_bytes != Some(bytes) {
+            let first_report = self.xet_bytes.is_none();
+            self.xet_bytes = Some(bytes);
+            // A first report of zero bytes only says that Xet has started.
+            if !(first_report && bytes == 0) {
+                self.advance(now);
+            }
+        }
+    }
+
+    /// The stall timeout, stretched for Xet's coarse steps (see
+    /// [`FIRST_DATA_STALL_FACTOR`] and [`STALL_GAP_FACTOR`]).
+    fn allowed_silence(&self) -> Duration {
+        let mut allowed = self
+            .stall_timeout
+            .max(self.longest_silence * STALL_GAP_FACTOR);
+        if self.xet_bytes == Some(0) {
+            allowed = allowed.max(self.stall_timeout * FIRST_DATA_STALL_FACTOR);
+        }
+        allowed
+    }
+
+    /// Zero once the attempt has stalled.
+    fn time_left(&self, now: Instant) -> Duration {
+        (self.last_advance + self.allowed_silence()).saturating_duration_since(now)
+    }
+}
+
+/// A download attempt's [`StallClock`] shared with its progress handler.
+struct DownloadActivity {
+    clock: Mutex<StallClock>,
+    /// Held while an event is passed on, so that nothing of the attempt is
+    /// reported once [`Self::retire`] has returned.
+    retired: Mutex<bool>,
+}
+
+impl DownloadActivity {
+    fn new(stall_timeout: Duration) -> Self {
+        Self {
+            clock: Mutex::new(StallClock::new(stall_timeout, Instant::now())),
+            retired: Mutex::new(false),
+        }
+    }
+
+    fn record(&self, update: impl FnOnce(&mut StallClock, Instant)) {
+        if let Ok(mut clock) = self.clock.lock() {
+            update(&mut clock, Instant::now());
+        }
+    }
+
+    /// Resolves once the attempt has stalled.
+    async fn stalled(&self) {
+        loop {
+            let left = match self.clock.lock() {
+                Ok(clock) => clock.time_left(Instant::now()),
+                Err(_) => STALL_CHECK_INTERVAL,
+            };
+            if left.is_zero() {
+                return;
+            }
+            // The allowance can shrink (Xet's first bytes end the longer
+            // wait for them), so look again at least every interval.
+            tokio::time::sleep(left.min(STALL_CHECK_INTERVAL)).await;
+        }
+    }
+
+    /// Run `report` unless the attempt is over.
+    fn report(&self, report: impl FnOnce()) {
+        if let Ok(retired) = self.retired.lock() {
+            if !*retired {
+                report();
+            }
+        }
+    }
+
+    fn retire(&self) {
+        if let Ok(mut retired) = self.retired.lock() {
+            *retired = true;
+        }
+    }
+}
+
 struct ModelProgressHandler {
     model_id: String,
     callback: ProgressCallback,
+    /// Shown with every event of a retried attempt.
+    note: Option<String>,
+    activity: Arc<DownloadActivity>,
     files: Mutex<HashMap<String, (u64, u64)>>,
 }
 
 impl ProgressHandler for ModelProgressHandler {
     fn on_progress(&self, event: &ProgressEvent) {
         let progress = match event {
-            ProgressEvent::Download(DownloadEvent::Start { total_bytes, .. }) => ModelProgress {
-                model_id: self.model_id.clone(),
-                bytes_completed: 0,
-                total_bytes: *total_bytes,
-                bytes_per_second: None,
-                phase: "downloading".into(),
-                message: None,
-            },
+            ProgressEvent::Download(DownloadEvent::Start { total_bytes, .. }) => {
+                self.activity.record(StallClock::advance);
+                ModelProgress {
+                    model_id: self.model_id.clone(),
+                    bytes_completed: 0,
+                    total_bytes: *total_bytes,
+                    bytes_per_second: None,
+                    phase: "downloading".into(),
+                    message: None,
+                }
+            }
             ProgressEvent::Download(DownloadEvent::Progress { files }) => {
                 let mut cumulative = match self.files.lock() {
                     Ok(value) => value,
@@ -958,9 +1285,12 @@ impl ProgressHandler for ModelProgressHandler {
                         (file.bytes_completed, file.total_bytes),
                     );
                 }
+                let bytes_completed = cumulative.values().map(|value| value.0).sum();
+                self.activity
+                    .record(|clock, now| clock.file_bytes(bytes_completed, now));
                 ModelProgress {
                     model_id: self.model_id.clone(),
-                    bytes_completed: cumulative.values().map(|value| value.0).sum(),
+                    bytes_completed,
                     total_bytes: cumulative.values().map(|value| value.1).sum(),
                     bytes_per_second: None,
                     phase: "downloading".into(),
@@ -971,25 +1301,37 @@ impl ProgressHandler for ModelProgressHandler {
                 bytes_completed,
                 total_bytes,
                 bytes_per_sec,
-            }) => ModelProgress {
-                model_id: self.model_id.clone(),
-                bytes_completed: *bytes_completed,
-                total_bytes: *total_bytes,
-                bytes_per_second: *bytes_per_sec,
-                phase: "downloading".into(),
-                message: None,
-            },
-            ProgressEvent::Download(DownloadEvent::Complete) => ModelProgress {
-                model_id: self.model_id.clone(),
-                bytes_completed: 0,
-                total_bytes: 0,
-                bytes_per_second: None,
-                phase: "downloaded".into(),
-                message: None,
-            },
+            }) => {
+                self.activity
+                    .record(|clock, now| clock.xet_bytes(*bytes_completed, now));
+                ModelProgress {
+                    model_id: self.model_id.clone(),
+                    bytes_completed: *bytes_completed,
+                    total_bytes: *total_bytes,
+                    bytes_per_second: *bytes_per_sec,
+                    phase: "downloading".into(),
+                    message: None,
+                }
+            }
+            ProgressEvent::Download(DownloadEvent::Complete) => {
+                self.activity.record(StallClock::advance);
+                ModelProgress {
+                    model_id: self.model_id.clone(),
+                    bytes_completed: 0,
+                    total_bytes: 0,
+                    bytes_per_second: None,
+                    phase: "downloaded".into(),
+                    message: None,
+                }
+            }
             _ => return,
         };
-        (self.callback)(progress);
+        self.activity.report(|| {
+            (self.callback)(ModelProgress {
+                message: self.note.clone(),
+                ..progress
+            })
+        });
     }
 }
 
@@ -1196,6 +1538,7 @@ fn remove_scoped_directory(root: &Path, target: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn runtime_layout(root: &Path, executable: PathBuf) -> LocalRuntimeLayout {
         LocalRuntimeLayout {
@@ -1496,6 +1839,392 @@ mod tests {
         manager.select_gpu_runtime(None).await;
         manager.select_gpu_runtime(Some(pack)).await;
         assert_eq!(manager.gpu_fallback_reason(), None);
+    }
+
+    const MB: u64 = 1024 * 1024;
+
+    #[test]
+    fn stall_timeout_comes_from_the_environment_within_its_range() {
+        assert_eq!(stall_timeout_from(None), Duration::from_secs(60));
+        assert_eq!(stall_timeout_from(Some("90")), Duration::from_secs(90));
+        assert_eq!(stall_timeout_from(Some(" 30 ")), Duration::from_secs(30));
+        assert_eq!(stall_timeout_from(Some("1")), Duration::from_secs(5));
+        assert_eq!(stall_timeout_from(Some("99999")), Duration::from_secs(600));
+        assert_eq!(stall_timeout_from(Some("soon")), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn only_changing_byte_counts_hold_off_the_stall_clock() {
+        let start = Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let mut clock = StallClock::new(Duration::from_secs(60), start);
+        assert_eq!(clock.time_left(start), Duration::from_secs(60));
+        clock.file_bytes(MB, at(1));
+        clock.xet_bytes(64 * MB, at(2));
+        // Xet's poller repeating the same totals is not progress.
+        for second in 3..62 {
+            clock.xet_bytes(64 * MB, at(second));
+            clock.file_bytes(MB, at(second));
+        }
+        assert_eq!(clock.time_left(at(61)), Duration::from_secs(1));
+        assert!(clock.time_left(at(62)).is_zero());
+    }
+
+    #[test]
+    fn a_slow_xet_transfer_gets_room_for_its_coarse_steps() {
+        let start = Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let mut clock = StallClock::new(Duration::from_secs(60), start);
+        // Small files over plain HTTP, then Xet starts on the large one.
+        clock.file_bytes(20_000, at(1));
+        clock.xet_bytes(0, at(2));
+        // Several 64 MB terms share a slow link before the first is written.
+        assert!(!clock.time_left(at(250)).is_zero());
+        assert!(clock.time_left(at(301)).is_zero());
+        clock.xet_bytes(64 * MB, at(250));
+        // One-minute steps from now on are no stall either.
+        clock.xet_bytes(128 * MB, at(320));
+        assert!(!clock.time_left(at(320 + 600)).is_zero());
+        assert!(clock.time_left(at(320 + 3 * 249)).is_zero());
+    }
+
+    #[test]
+    fn a_fast_transfer_that_stops_stalls_after_the_timeout() {
+        let start = Instant::now();
+        let at = |millis: u64| start + Duration::from_millis(millis);
+        let mut clock = StallClock::new(Duration::from_secs(60), start);
+        clock.xet_bytes(0, at(500));
+        for step in 1..=6 {
+            clock.xet_bytes(step * 64 * MB, at(1_000 + step * 500));
+        }
+        assert!(clock.time_left(at(4_000 + 59_000)) > Duration::ZERO);
+        assert!(clock.time_left(at(4_000 + 60_000)).is_zero());
+    }
+
+    #[test]
+    fn a_retired_attempt_reports_nothing() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let activity = Arc::new(DownloadActivity::new(Duration::from_secs(60)));
+        let handler = ModelProgressHandler {
+            model_id: "test-model".into(),
+            callback: Arc::new(move |progress: ModelProgress| sink.lock().unwrap().push(progress)),
+            note: Some("Download stalled; retrying (2/3)".into()),
+            activity: activity.clone(),
+            files: Mutex::new(HashMap::new()),
+        };
+        let event = ProgressEvent::Download(DownloadEvent::AggregateProgress {
+            bytes_completed: MB,
+            total_bytes: 4 * MB,
+            bytes_per_sec: None,
+        });
+        handler.on_progress(&event);
+        activity.retire();
+        handler.on_progress(&event);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].bytes_completed, MB);
+        assert_eq!(
+            events[0].message.as_deref(),
+            Some("Download stalled; retrying (2/3)")
+        );
+    }
+
+    /// A small model whose one file is `content`.
+    fn test_model(content: &[u8]) -> ModelSpec {
+        ModelSpec {
+            id: "test-model".into(),
+            display_name: "Test model".into(),
+            role: ModelRole::Asr,
+            repository: "test/model".into(),
+            revision: "0".repeat(40),
+            expected_bytes: content.len() as u64,
+            required_file: "model.bin".into(),
+            required_file_sha256: format!("{:x}", Sha256::digest(content)),
+            download: DownloadKind::File {
+                filename: "model.bin".into(),
+            },
+        }
+    }
+
+    type Recorded = Arc<Mutex<Vec<ModelProgress>>>;
+
+    fn recording_callback() -> (ProgressCallback, Recorded) {
+        let events: Recorded = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        (
+            Arc::new(move |progress: ModelProgress| sink.lock().unwrap().push(progress)),
+            events,
+        )
+    }
+
+    /// Counts its drops: a dropped future or task has really stopped.
+    struct DropCounter(Arc<AtomicUsize>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    async fn wait_for_count(counter: &AtomicUsize, expected: usize) -> bool {
+        for _ in 0..200 {
+            if counter.load(Ordering::SeqCst) == expected {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    fn aggregate(bytes_completed: u64) -> ProgressEvent {
+        ProgressEvent::Download(DownloadEvent::AggregateProgress {
+            bytes_completed,
+            total_bytes: 100 * MB,
+            bytes_per_sec: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_download_that_never_progresses_is_stopped_and_retried_then_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("models");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let futures_dropped = Arc::new(AtomicUsize::new(0));
+        let transfers_dropped = Arc::new(AtomicUsize::new(0));
+        let downloader: Downloader = {
+            let calls = calls.clone();
+            let futures_dropped = futures_dropped.clone();
+            let transfers_dropped = transfers_dropped.clone();
+            Arc::new(move |request: DownloadRequest| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let future_guard = DropCounter(futures_dropped.clone());
+                let transfer_guard = DropCounter(transfers_dropped.clone());
+                Box::pin(async move {
+                    let _future_guard = future_guard;
+                    // Like hf-hub's Xet transfer: a detached task that keeps
+                    // writing into the staging directory.
+                    let partial = request.staging.join("model.bin.incomplete");
+                    tokio::spawn(async move {
+                        let _transfer_guard = transfer_guard;
+                        loop {
+                            let _ = std::fs::write(&partial, b"partial");
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    });
+                    std::future::pending::<Result<(), String>>().await
+                })
+            })
+        };
+        let manager =
+            ModelManager::with_downloader(root.clone(), downloader, Duration::from_millis(100));
+        let spec = test_model(b"weights");
+        let (callback, events) = recording_callback();
+
+        let error = manager.install_inner(&spec, callback).await.unwrap_err();
+
+        assert!(
+            matches!(&error, ModelManagerError::Download(message) if message.contains("stalled 3 times")),
+            "{error}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        // Every attempt, and the transfer it left behind, really stopped.
+        assert!(wait_for_count(&futures_dropped, 3).await);
+        assert!(wait_for_count(&transfers_dropped, 3).await);
+        for attempt in 1..=3 {
+            assert!(!manager.staging_directory(&spec, attempt).exists());
+        }
+        assert!(!root.join("test-model").exists());
+        let events = events.lock().unwrap();
+        let retries: Vec<_> = events
+            .iter()
+            .filter(|event| event.phase == "retrying")
+            .map(|event| event.message.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            retries,
+            [
+                "Download stalled; retrying (2/3)",
+                "Download stalled; retrying (3/3)"
+            ]
+        );
+        assert_eq!(events[0].phase, "starting");
+        assert_eq!(events[0].message, None);
+    }
+
+    #[tokio::test]
+    async fn a_download_is_retried_only_once_its_bytes_stop_moving() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("models");
+        let started = Arc::new(Mutex::new(Vec::<Instant>::new()));
+        let progress_window = Duration::from_millis(1_000);
+        let downloader: Downloader = {
+            let started = started.clone();
+            Arc::new(move |request: DownloadRequest| {
+                let attempt = {
+                    let mut started = started.lock().unwrap();
+                    started.push(Instant::now());
+                    started.len()
+                };
+                Box::pin(async move {
+                    if attempt == 1 {
+                        let began = Instant::now();
+                        let mut bytes = 0;
+                        while began.elapsed() < progress_window {
+                            bytes += MB;
+                            request.progress.on_progress(&aggregate(bytes));
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        // Stuck: the poller keeps repeating the same total.
+                        loop {
+                            request.progress.on_progress(&aggregate(bytes));
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    }
+                    std::future::pending::<Result<(), String>>().await
+                })
+            })
+        };
+        let manager = ModelManager::with_downloader(root, downloader, Duration::from_millis(300));
+        let (callback, events) = recording_callback();
+
+        let error = manager
+            .install_inner(&test_model(b"weights"), callback)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ModelManagerError::Download(_)));
+        let started = started.lock().unwrap();
+        assert_eq!(started.len(), 3);
+        let first_attempt = started[1] - started[0];
+        // Not stopped while bytes arrived, but soon after they stopped.
+        assert!(first_attempt >= progress_window, "{first_attempt:?}");
+        assert!(
+            first_attempt < progress_window + Duration::from_secs(3),
+            "{first_attempt:?}"
+        );
+        let events = events.lock().unwrap();
+        let first_retry = events
+            .iter()
+            .position(|event| event.phase == "retrying")
+            .unwrap();
+        assert!(events[..first_retry]
+            .iter()
+            .any(|event| event.phase == "downloading" && event.bytes_completed > 0));
+        // Nothing from the stalled attempt arrives after the retry began.
+        assert!(events[first_retry..]
+            .iter()
+            .all(|event| event.bytes_completed == 0));
+    }
+
+    #[tokio::test]
+    async fn a_stalled_download_succeeds_on_the_next_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("models");
+        let content = b"model weights".to_vec();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let downloader: Downloader = {
+            let calls = calls.clone();
+            let content = content.clone();
+            Arc::new(move |request: DownloadRequest| {
+                let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                let content = content.clone();
+                Box::pin(async move {
+                    if attempt == 1 {
+                        std::fs::write(request.staging.join("model.bin.incomplete"), b"part")
+                            .unwrap();
+                        return std::future::pending().await;
+                    }
+                    assert!(!request.staging.join("model.bin.incomplete").exists());
+                    std::fs::write(request.staging.join("model.bin"), &content).unwrap();
+                    request.progress.on_progress(&ProgressEvent::Download(
+                        DownloadEvent::Progress {
+                            files: vec![hf_hub::progress::FileProgress {
+                                filename: "model.bin".into(),
+                                bytes_completed: content.len() as u64,
+                                total_bytes: content.len() as u64,
+                                status: hf_hub::progress::FileStatus::Complete,
+                            }],
+                        },
+                    ));
+                    Ok(())
+                })
+            })
+        };
+        let manager =
+            ModelManager::with_downloader(root.clone(), downloader, Duration::from_millis(100));
+        let spec = test_model(&content);
+        let (callback, events) = recording_callback();
+
+        manager.install_inner(&spec, callback).await.unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            std::fs::read(root.join("test-model").join("model.bin")).unwrap(),
+            content
+        );
+        assert!(installed_manifest_matches(&root.join("test-model"), &spec));
+        assert!(!manager.staging_directory(&spec, 1).exists());
+        assert!(!manager.staging_directory(&spec, 2).exists());
+        let events = events.lock().unwrap();
+        let phases: Vec<_> = events.iter().map(|event| event.phase.as_str()).collect();
+        assert_eq!(
+            phases,
+            ["starting", "retrying", "downloading", "verifying", "ready"]
+        );
+        assert_eq!(
+            events[2].message.as_deref(),
+            Some("Download stalled; retrying (2/3)")
+        );
+        assert_eq!(events[4].message, None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_download_is_not_retried() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("models");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let downloader: Downloader = {
+            let calls = calls.clone();
+            Arc::new(move |_request: DownloadRequest| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Err("HTTP 404".to_string()) })
+            })
+        };
+        let manager =
+            ModelManager::with_downloader(root.clone(), downloader, Duration::from_millis(100));
+        let spec = test_model(b"weights");
+        let (callback, _events) = recording_callback();
+
+        let error = manager.install_inner(&spec, callback).await.unwrap_err();
+
+        assert!(matches!(&error, ModelManagerError::Download(message) if message == "HTTP 404"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!manager.staging_directory(&spec, 1).exists());
+    }
+
+    #[tokio::test]
+    async fn an_install_clears_retry_directories_left_behind() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("models");
+        let spec = test_model(b"weights");
+        let downloader: Downloader = Arc::new(|request: DownloadRequest| {
+            Box::pin(async move {
+                std::fs::write(request.staging.join("model.bin"), b"weights").unwrap();
+                Ok(())
+            })
+        });
+        let manager =
+            ModelManager::with_downloader(root.clone(), downloader, Duration::from_millis(100));
+        let leftover = manager.staging_directory(&spec, 3);
+        std::fs::create_dir_all(&leftover).unwrap();
+        std::fs::write(leftover.join("model.bin.incomplete"), b"part").unwrap();
+        let (callback, _events) = recording_callback();
+
+        manager.install_inner(&spec, callback).await.unwrap();
+
+        assert!(!leftover.exists());
+        assert!(root.join("test-model").join("model.bin").is_file());
     }
 
     #[test]

@@ -459,6 +459,7 @@ input::placeholder { color: #9a9c93; }
 .model-row-copy > span { color: var(--muted); font-size: 8px; font-weight: 680; letter-spacing: .08em; text-transform: uppercase; }
 .model-row-copy strong { font-size: 11px; }
 .model-row-copy small { color: var(--muted); font-size: 9px; text-transform: capitalize; }
+.model-row-copy .model-row-note { color: var(--danger); text-transform: none; }
 .model-row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
 .model-progress { display: grid; width: 140px; height: 24px; align-content: end; gap: 4px; overflow: hidden; }
 .model-progress::before { content: ""; grid-area: 1 / 1; align-self: end; height: 3px; border-radius: 2px; background: #d8d9d1; }
