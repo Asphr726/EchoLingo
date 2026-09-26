@@ -104,7 +104,7 @@ def test_self_test_prints_one_json_object_and_exits_zero_when_all_checks_pass(
         "ok", "version", "platform", "frozen", "utf8_mode", "ssl_ca_certs", "checks", "cuda"
     }
     assert report["ok"] is True
-    assert report["version"] == __version__ == "0.3.0"
+    assert report["version"] == __version__ == "0.3.1"
     assert report["frozen"] is False
     assert isinstance(report["utf8_mode"], bool)
     assert isinstance(report["ssl_ca_certs"], int)

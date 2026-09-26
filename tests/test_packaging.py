@@ -366,7 +366,7 @@ def test_bundle_icons_exist() -> None:
 
 def test_desktop_versions_agree() -> None:
     version = _json(TAURI / "tauri.conf.json")["version"]
-    assert version == "0.3.0"
+    assert version == "0.3.1"
     assert _json(ROOT / "apps/desktop/package.json")["version"] == version
     lock = _json(ROOT / "package-lock.json")
     assert lock["packages"]["apps/desktop"]["version"] == version
