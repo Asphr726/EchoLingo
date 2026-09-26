@@ -623,9 +623,37 @@ impl Trigger {
     }
 }
 
-/// Ask the update server. `Ok(None)` also covers a `latest.json` without
-/// an entry for this platform.
-async fn fetch(app: &AppHandle) -> Result<Option<Update>, String> {
+/// What the update server said about this version.
+enum CheckAnswer {
+    Available(Box<Update>),
+    UpToDate,
+    /// `latest.json` lists no build for this platform (the targets asked
+    /// for), for example while that platform's release is still a draft.
+    /// Shown as up to date and logged apart so it can be told from one.
+    NoPlatformEntry(String),
+}
+
+fn check_answer(result: Result<Option<Update>, UpdaterError>) -> Result<CheckAnswer, String> {
+    match result {
+        Ok(Some(update)) => Ok(CheckAnswer::Available(Box::new(update))),
+        Ok(None) => Ok(CheckAnswer::UpToDate),
+        Err(UpdaterError::TargetNotFound(target)) => Ok(CheckAnswer::NoPlatformEntry(target)),
+        Err(UpdaterError::TargetsNotFound(targets)) => {
+            Ok(CheckAnswer::NoPlatformEntry(targets.join(",")))
+        }
+        Err(error) => Err(error_text(&error)),
+    }
+}
+
+fn no_platform_entry_log_line(current: &str, trigger: Trigger, targets: &str) -> String {
+    format!(
+        "update check result=no_platform_entry current={current} trigger={} targets={targets}",
+        trigger.as_str()
+    )
+}
+
+/// Ask the update server.
+async fn fetch(app: &AppHandle) -> Result<CheckAnswer, String> {
     // Connect and read timeouts only: a whole-request timeout would also
     // cut off a large download on a slow connection.
     let mut builder = app.updater_builder().configure_client(|client| {
@@ -648,9 +676,7 @@ async fn fetch(app: &AppHandle) -> Result<Option<Update>, String> {
             "The update server did not answer within {} seconds.",
             CHECK_TIMEOUT.as_secs()
         )),
-        Ok(Ok(update)) => Ok(update),
-        Ok(Err(UpdaterError::TargetNotFound(_) | UpdaterError::TargetsNotFound(_))) => Ok(None),
-        Ok(Err(error)) => Err(error_text(&error)),
+        Ok(result) => check_answer(result),
     }
 }
 
@@ -676,7 +702,7 @@ async fn check(app: &AppHandle, trigger: Trigger) {
     let outcome = fetch(app).await;
     let now = Utc::now();
     match outcome {
-        Ok(Some(update)) => {
+        Ok(CheckAnswer::Available(update)) => {
             let available = describe_update(&update);
             log(
                 app,
@@ -686,9 +712,9 @@ async fn check(app: &AppHandle, trigger: Trigger) {
                     trigger.as_str()
                 ),
             );
-            state.updater.found(update, available, now);
+            state.updater.found(*update, available, now);
         }
-        Ok(None) => {
+        Ok(CheckAnswer::UpToDate) => {
             log(
                 app,
                 &format!(
@@ -696,6 +722,10 @@ async fn check(app: &AppHandle, trigger: Trigger) {
                     trigger.as_str()
                 ),
             );
+            state.updater.up_to_date(now);
+        }
+        Ok(CheckAnswer::NoPlatformEntry(targets)) => {
+            log(app, &no_platform_entry_log_line(&current, trigger, &targets));
             state.updater.up_to_date(now);
         }
         Err(message) => {
@@ -1330,6 +1360,29 @@ mod tests {
         );
         drop(running);
         assert!(waiting.await.is_some());
+    }
+
+    #[test]
+    fn a_missing_platform_entry_reads_as_up_to_date_but_is_logged_apart() {
+        assert!(matches!(check_answer(Ok(None)), Ok(CheckAnswer::UpToDate)));
+        assert!(matches!(
+            check_answer(Err(UpdaterError::TargetNotFound("windows-x86_64".into()))),
+            Ok(CheckAnswer::NoPlatformEntry(targets)) if targets == "windows-x86_64"
+        ));
+        assert!(matches!(
+            check_answer(Err(UpdaterError::TargetsNotFound(vec![
+                "windows-x86_64-nsis".into(),
+                "windows-x86_64".into(),
+            ]))),
+            Ok(CheckAnswer::NoPlatformEntry(targets))
+                if targets == "windows-x86_64-nsis,windows-x86_64"
+        ));
+        assert!(check_answer(Err(UpdaterError::MissingSignedVersion)).is_err());
+        assert_eq!(
+            no_platform_entry_log_line("0.3.0", Trigger::Launch, "windows-x86_64"),
+            "update check result=no_platform_entry current=0.3.0 trigger=launch \
+             targets=windows-x86_64"
+        );
     }
 
     #[test]
