@@ -119,3 +119,18 @@ async def test_default_loader_imports_and_loads_off_the_event_loop(tmp_path, mon
         task.cancel()
     assert seen["thread"] != loop_thread
     assert ticks >= 5
+
+
+async def test_missing_qwen_asr_still_reports_the_aligner_unavailable(tmp_path, monkeypatch) -> None:
+    import sys
+
+    (tmp_path / "config.json").write_text("{}")
+    (tmp_path / "model.safetensors").write_bytes(b"0")
+    # A None entry makes `from qwen_asr import ...` raise ImportError; the
+    # import now runs on the worker thread and must surface the same way.
+    monkeypatch.setitem(sys.modules, "qwen_asr", None)
+    service = QwenForcedAlignmentService(tmp_path)
+    with pytest.raises(AlignmentUnavailableError, match="qwen-asr is required"):
+        await service.align(request())
+    # Nothing is cached, so a later session tries the import again.
+    assert service._model is None
