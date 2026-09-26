@@ -150,9 +150,17 @@ def check_transformers() -> str:
 
 
 def check_qwen_asr() -> str:
+    from pathlib import Path
+
+    import qwen_asr.inference.qwen3_forced_aligner as aligner_module
     from qwen_asr import Qwen3ForcedAligner
 
-    return f"{Qwen3ForcedAligner.__name__} importable"
+    # The aligner reads this package data file when it loads; a build that
+    # leaves it out can import the class but never aligns a session.
+    dictionary = Path(aligner_module.__file__).parent / "assets" / "korean_dict_jieba.dict"
+    if not dictionary.is_file():
+        raise RuntimeError(f"missing qwen_asr data file {dictionary.name}")
+    return f"{Qwen3ForcedAligner.__name__} importable; aligner data present"
 
 
 def check_nagisa() -> str:

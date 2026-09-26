@@ -27,6 +27,19 @@ LANGUAGE_NAMES = {
 }
 
 
+def _load_official_aligner(model_path: str, **kwargs: Any) -> Any:
+    """Import the official aligner and load its weights (blocking)."""
+    from .runtime.ascii_paths import install_nagisa_ascii_paths
+
+    # qwen_asr imports nagisa, which loads its model on import.
+    install_nagisa_ascii_paths()
+    try:
+        from qwen_asr import Qwen3ForcedAligner
+    except ImportError as error:
+        raise AlignmentUnavailableError("qwen-asr is required for forced alignment") from error
+    return Qwen3ForcedAligner.from_pretrained(model_path, **kwargs)
+
+
 class QwenForcedAlignmentService:
     """Lazy, out-of-pipeline adapter for the official Qwen forced aligner."""
 
@@ -60,19 +73,12 @@ class QwenForcedAlignmentService:
             return self._model
         async with self._load_lock:
             if self._model is None:
-                loader = self._loader
-                if loader is None:
-                    from .runtime.ascii_paths import install_nagisa_ascii_paths
-
-                    # qwen_asr imports nagisa, which loads its model on import.
-                    install_nagisa_ascii_paths()
-                    try:
-                        from qwen_asr import Qwen3ForcedAligner
-                    except ImportError as error:
-                        raise AlignmentUnavailableError(
-                            "qwen-asr is required for forced alignment"
-                        ) from error
-                    loader = Qwen3ForcedAligner.from_pretrained
+                loader = self._loader or _load_official_aligner
+                # Importing qwen_asr pulls in torch, transformers and nagisa's
+                # model and takes tens of seconds in the packaged sidecar, so
+                # it runs on the worker thread with the weights: blocking the
+                # event loop that long makes the Desktop's IPC keepalive give
+                # up and the finished session is never aligned.
                 self._model = await asyncio.to_thread(
                     loader, str(self.model_path), **self._load_kwargs
                 )

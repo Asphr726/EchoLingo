@@ -79,3 +79,43 @@ async def test_qwen_adapter_reports_missing_weights_without_touching_ui(tmp_path
     service = QwenForcedAlignmentService(tmp_path)
     with pytest.raises(AlignmentUnavailableError, match="weights are unavailable"):
         await service.align(request("ja", "講義を始めます"))
+
+
+async def test_default_loader_imports_and_loads_off_the_event_loop(tmp_path, monkeypatch) -> None:
+    import asyncio
+    import threading
+    import time
+
+    import echolingo.alignment as alignment
+
+    (tmp_path / "config.json").write_text("{}")
+    (tmp_path / "model.safetensors").write_bytes(b"0")
+    loop_thread = threading.get_ident()
+    seen: dict[str, int] = {}
+
+    class FakeModel:
+        def align(self, audio, text, language):
+            return [[]]
+
+    def slow_import_and_load(model_path, **kwargs):
+        # Stands in for importing qwen_asr/torch and reading the weights.
+        seen["thread"] = threading.get_ident()
+        time.sleep(0.3)
+        return FakeModel()
+
+    monkeypatch.setattr(alignment, "_load_official_aligner", slow_import_and_load)
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.02)
+            ticks += 1
+
+    task = asyncio.create_task(ticker())
+    try:
+        await QwenForcedAlignmentService(tmp_path).align(request())
+    finally:
+        task.cancel()
+    assert seen["thread"] != loop_thread
+    assert ticks >= 5

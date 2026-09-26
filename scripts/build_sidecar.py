@@ -136,6 +136,10 @@ def pyinstaller_command(
         "echolingo.assistant",
         "--collect-submodules",
         "pypdf",
+        # The forced aligner reads qwen_asr's package data (Korean jieba
+        # dictionary) when it loads.
+        "--collect-data",
+        "qwen_asr",
         "--add-data",
         f"{silero}{os.pathsep}models",
         # nagisa loads its tokenizer model from its package data directory.

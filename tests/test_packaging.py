@@ -657,3 +657,9 @@ def test_packaged_self_test_validation() -> None:
     problems = smoke.validate_self_test(broken, "0.3.0")
     assert "torch: DLL load failed" in problems
     assert len(problems) == 5
+
+
+def test_sidecar_build_bundles_qwen_asr_package_data(tmp_path) -> None:
+    build = load_script("build_sidecar")
+    command = build.pyinstaller_command(ROOT, tmp_path, "onedir", tmp_path / "v", "/site/nagisa")
+    assert command[command.index("--collect-data") + 1] == "qwen_asr"
