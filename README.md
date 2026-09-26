@@ -2,17 +2,17 @@
 
 简体中文 | [English](README.en.md)
 
-EchoLingo 是一款面向课堂的实时同声字幕工具：把老师的讲课声音实时转成原文与译文逐句对照的双语字幕，下课后还可以用你自己选择的 AI 模型把转录整理成学习笔记。默认所有识别和翻译都在你自己的电脑上完成。目前公开发布的是 Mac 版，Windows 和 Linux 版正在测试中。
+EchoLingo 是一款面向课堂的实时同声字幕工具：把老师的讲课声音实时转成原文与译文逐句对照的双语字幕，下课后还可以用你自己选择的 AI 模型把转录整理成学习笔记。默认所有识别和翻译都在你自己的电脑上完成。支持 Mac、Windows 和 Linux。
 
-[![Platform](https://img.shields.io/badge/platform-macOS%2014%2B%20%C2%B7%20Apple%20Silicon-lightgrey)](#系统要求)
-[![Version](https://img.shields.io/badge/version-0.3.0%20Beta-orange)](https://github.com/Asphr726/EchoLingo/releases)
+[![Platform](https://img.shields.io/badge/platform-macOS%2014%2B%20%C2%B7%20Windows%20%C2%B7%20Linux-lightgrey)](#系统要求)
+[![Version](https://img.shields.io/badge/version-0.3.1%20Beta-orange)](https://github.com/Asphr726/EchoLingo/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 ![EchoLingo 实时双语字幕](docs/screenshots/live.png)
 
-> **v0.3.0 Beta**：公开发布的安装包只支持 Apple Silicon Mac（macOS 14 及以上）。Windows 和 Linux 版正在测试，尚未公开发布，见 [Windows / Linux](#windows--linux测试中尚未公开发布)。应用界面暂时只有英文，下文中的按钮和菜单名称都按界面上的英文原样写出。
+> **v0.3.1 Beta**：支持 Apple Silicon Mac（macOS 14 及以上）、Windows 10 / 11（x64）和 Linux（Ubuntu 22.04+ / Debian 12+，x64），Windows 和 Linux 的安装方法见 [Windows / Linux](#windows--linux)。应用界面暂时只有英文，下文中的按钮和菜单名称都按界面上的英文原样写出。
 
-[特色](#特色) · [系统要求](#系统要求) · [安装](#安装) · [Windows / Linux](#windows--linux测试中尚未公开发布) · [快速上手](#快速上手) · [使用指南](#使用指南) · [隐私](#隐私) · [常见问题](#常见问题) · [路线图](#路线图) · [从源码构建](#从源码构建) · [许可与致谢](#许可与致谢)
+[特色](#特色) · [系统要求](#系统要求) · [安装](#安装) · [Windows / Linux](#windows--linux) · [快速上手](#快速上手) · [使用指南](#使用指南) · [隐私](#隐私) · [常见问题](#常见问题) · [路线图](#路线图) · [从源码构建](#从源码构建) · [许可与致谢](#许可与致谢)
 
 ## 特色
 
@@ -31,22 +31,22 @@ EchoLingo 是一款面向课堂的实时同声字幕工具：把老师的讲课�
 
 ## 系统要求
 
-| 项目 | macOS（已发布） | Windows / Linux（测试中） |
+| 项目 | macOS | Windows / Linux |
 | --- | --- | --- |
 | 系统 | macOS 14 Sonoma 或更新版本 | Windows 10 21H2 及以上或 Windows 11（x64）；Ubuntu 22.04 及以上或 Debian 12 及以上（x64） |
 | 芯片 | Apple Silicon（M1 或更新），不支持 Intel Mac | 支持 AVX2 的 x64 处理器；可选 NVIDIA 显卡，用于 GPU 加速包 |
 | 内存 | 建议 16 GB 或以上 | 建议 16 GB 或以上 |
-| 磁盘 | 本地模型共约 4.5 GB，建议预留 6 GB 以上的可用空间 | 同左；可选的 GPU 加速包另需下载约 2–3 GB，解压后占用更多 |
+| 磁盘 | 本地模型共约 4.5 GB，建议预留 6 GB 以上的可用空间 | 同左；可选的 GPU 加速包另需约 6 GB（Windows）或 8.5 GB（Linux） |
 | 权限 | 麦克风；如果要采集电脑播放的声音（网课、视频），还需要“屏幕与系统录音”权限 | Windows：需要允许桌面应用使用麦克风；Linux：无需授权 |
 | 网络 | 只有下载模型、检查更新、使用云服务或 AI 笔记时才需要 | 同左 |
 
-在 Windows 和 Linux 上，没有安装 GPU 加速包时识别和翻译都在 CPU 上运行。处理器较慢时字幕可能会越来越落后于老师的讲课，这时可以安装 [GPU 加速包](#windows--linux测试中尚未公开发布)，或者改用云端识别服务。
+在 Windows 和 Linux 上，没有安装 GPU 加速包时识别和翻译都在 CPU 上运行。处理器较慢时字幕可能会越来越落后于老师的讲课，这时可以安装 [GPU 加速包](#windows--linux)，或者改用云端识别服务。
 
 ## 安装
 
-以下是 macOS 的安装步骤。Windows 和 Linux 请看 [Windows / Linux](#windows--linux测试中尚未公开发布)。
+以下是 macOS 的安装步骤。Windows 和 Linux 请看 [Windows / Linux](#windows--linux)。
 
-1. 从 [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases) 下载 `EchoLingo_0.3.0_aarch64.dmg`。
+1. 从 [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases) 下载 `EchoLingo_0.3.1_aarch64.dmg`。
 2. 打开 dmg，把 **EchoLingo** 拖进“应用程序”文件夹。
 3. 第一次打开。Beta 版还没有经过 Apple 公证，macOS 会拦截它：
    - **macOS 14**：在“应用程序”里按住 Control 点按（或右键点按）EchoLingo，选择“打开”，再在弹出的对话框里点“打开”。
@@ -71,23 +71,27 @@ EchoLingo 是一款面向课堂的实时同声字幕工具：把老师的讲课�
    > `launchctl setenv HF_ENDPOINT https://hf-mirror.com`，然后用 ⌘Q 完全退出 EchoLingo，重新打开后再点 **Download**。
    > 这个设置在注销或重启 Mac 后失效。想换回官方源，运行 `launchctl unsetenv HF_ENDPOINT` 后重新打开应用。
 
-## Windows / Linux（测试中，尚未公开发布）
+## Windows / Linux
 
-> **尚未公开发布**。Windows 和 Linux 版已经可以构建，但还没有在真实的 Windows 或 Linux 电脑上测试过，所以暂时不会出现在 Releases 页面。下面的步骤供拿到测试版本的用户参考；除这里说明的差别外，应用和设置的用法与本文其他部分相同。
+除这里说明的差别外，应用和设置的用法与本文其他部分相同。Windows 版已经在真实电脑上测试过；Linux 版目前只在自动构建环境中测试过，还没有在真实电脑上测试。
 
 **Windows 10 / 11（x64）**
 
-1. 运行 `EchoLingo_0.3.0_x64-setup.exe`。安装程序只为当前用户安装，不需要管理员权限；如果电脑上缺少 Microsoft Edge WebView2 运行时，安装程序会自动安装。
+1. 从 [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases) 下载并运行 `EchoLingo_0.3.1_x64-setup.exe`。安装程序只为当前用户安装，不需要管理员权限；如果电脑上缺少 Microsoft Edge WebView2 运行时，安装程序会自动安装。
 2. 安装程序还没有代码签名，Windows SmartScreen 可能提示“Windows 已保护你的电脑”。点“更多信息”，再点“仍要运行”。
 3. 从“开始”菜单打开 EchoLingo，按照[安装](#安装)第 4 步在 **Settings → Models** 下载本地模型。
 
 **Linux（Ubuntu 22.04+ / Debian 12+，x64）**
 
-1. 在下载目录里运行 `sudo apt install ./EchoLingo_0.3.0_amd64.deb` 安装。
-2. 从应用菜单打开 EchoLingo，或在终端运行 `echolingo-desktop`。目前只提供 .deb 包，AppImage 在路线图中。
-3. 从应用菜单打开 EchoLingo，同样在 **Settings → Models** 下载本地模型。
+1. 从 [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases) 下载 `EchoLingo_0.3.1_amd64.deb`，在下载目录里运行 `sudo apt install ./EchoLingo_0.3.1_amd64.deb` 安装。目前只提供 .deb 包，AppImage 在路线图中。
+2. 从应用菜单打开 EchoLingo，或在终端运行 `echolingo-desktop`，同样在 **Settings → Models** 下载本地模型。
 
-**NVIDIA GPU 加速包（可选）**。不安装时，识别和翻译都在 CPU 上运行。如果电脑有 NVIDIA GeForce RTX 20 系列、GTX 16 系列或更新的显卡，并且装了较新的驱动，可以打开 **Settings → Models → GPU acceleration**，点 **Download** 下载 GPU 加速包（约 2–3 GB）。加速包分段下载，每一段都会校验，安装后先做一次自检再启用；之后可以随时用 **Use GPU acceleration** 开关关闭。如果 GPU 运行时启动失败，EchoLingo 会自动退回 CPU，并在这张卡片上说明原因。AMD 和 Intel 显卡暂不支持。Linux 上用显卡翻译还需要 Vulkan 运行库（`sudo apt install libvulkan1`），没有它时翻译仍在 CPU 上运行。
+**NVIDIA GPU 加速包（可选）**。不安装时，识别和翻译都在 CPU 上运行，较慢的处理器可能跟不上讲课：在一台 i7-13700H 笔记本上，Qwen3-ASR 用 CPU 处理一段 11 秒的录音需要 2.07 倍的时长。同一台电脑用加速包（RTX 4060 Laptop）运行时，实时识别的延迟中位数为 0.1–0.2 秒、最长约 2 秒，Hy-MT 在 Vulkan 上每秒翻译约 135 个 token。
+
+- **要求**：NVIDIA 显卡，计算能力 7.5 及以上（GeForce GTX 16 系列、RTX 20 系列或更新），驱动版本 580.65 或更新。AMD 和 Intel 显卡暂不支持。Linux 上用显卡翻译还需要 Vulkan 运行库（`sudo apt install libvulkan1`），没有它时翻译仍在 CPU 上运行。
+- **磁盘空间**：Windows 上下载约 2.0 GB、解压后约 3.6 GB；Linux 上下载约 2.6 GB、解压后约 5.4 GB。安装时两者同时占用空间（装好后下载的文件会删除），都要算在本地模型之外。
+- **安装**：打开 **Settings → Models → GPU acceleration**，点 **Download**。加速包分段下载，每一段都会校验，安装后先做一次自检再启用；之后可以随时用 **Use GPU acceleration** 开关关闭。如果 GPU 运行时启动失败，EchoLingo 会自动退回 CPU，并在这张卡片上说明原因。
+- **每次更新应用后都要重新下载**：加速包和应用版本一一对应。更新 EchoLingo 后，在同一张卡片上重新下载即可；在此之前识别和翻译在 CPU 上运行。
 
 **与 Mac 版的差别**
 
@@ -190,10 +194,11 @@ EchoLingo 是一款面向课堂的实时同声字幕工具：把老师的讲课�
 ### 应用内更新
 
 - EchoLingo 默认在每次启动时检查一次有没有新版本，可以在 **Settings → General → Updates** 关闭。
-- 在 Mac 上可以直接在应用内更新：EchoLingo 下载新版本、校验它的签名，然后原地替换应用并重新启动。课程、设置、模型和密钥都会保留。
-- **从 0.2.0 升级**：0.2.0 还没有应用内更新，需要手动安装一次：下载 0.3.0 的 dmg，⌘Q 退出 EchoLingo，把新版本拖进“应用程序”文件夹替换旧版本。之后的版本都可以在应用内更新。
+- **macOS 和 Windows** 可以直接在应用内更新：EchoLingo 下载新版本、校验它的签名，然后原地替换应用并重新启动。课程、设置、模型和密钥都会保留。
+- **Linux**：有新版本时，EchoLingo 会提示并给出发布页面的链接。下载新的 .deb，像第一次安装时一样用 `sudo apt install` 安装即可，数据同样保留。
+- **从 0.2.0 升级**：0.2.0 还没有应用内更新，需要手动安装一次：下载最新的 dmg，⌘Q 退出 EchoLingo，把新版本拖进“应用程序”文件夹替换旧版本。之后的版本都可以在应用内更新。
+- 用了 GPU 加速包时，每次更新后都要重新下载加速包，见 [Windows / Linux](#windows--linux)。
 - 更新后，macOS 可能会要求重新授予麦克风或“屏幕与系统录音”权限，见[没有字幕，或者听不到声音](#没有字幕或者听不到声音)。
-- 目前只有 Mac 版提供应用内更新；Windows 和 Linux 测试版请手动下载新版本。
 
 ## 隐私
 
@@ -240,7 +245,7 @@ AI 笔记和标题永远不会发送音频。
 
 ### 模型下载很慢或失败
 
-在中国大陆可以试试 Hugging Face 镜像。macOS 上运行 `launchctl setenv HF_ENDPOINT https://hf-mirror.com`，⌘Q 退出后重新打开 EchoLingo，再点 **Download**；Windows 和 Linux 的设置方法见 [Windows / Linux](#windows--linux测试中尚未公开发布)。如果下载没有走你的代理，也可以用同样的方式设置 `HTTPS_PROXY`，例如 macOS 上 `launchctl setenv HTTPS_PROXY http://127.0.0.1:7890`、Windows 上 `setx HTTPS_PROXY http://127.0.0.1:7890`（换成你自己的代理地址）。下载失败或中断后，再点一次 **Download** 即可。
+在中国大陆可以试试 Hugging Face 镜像。macOS 上运行 `launchctl setenv HF_ENDPOINT https://hf-mirror.com`，⌘Q 退出后重新打开 EchoLingo，再点 **Download**；Windows 和 Linux 的设置方法见 [Windows / Linux](#windows--linux)。如果下载没有走你的代理，也可以用同样的方式设置 `HTTPS_PROXY`，例如 macOS 上 `launchctl setenv HTTPS_PROXY http://127.0.0.1:7890`、Windows 上 `setx HTTPS_PROXY http://127.0.0.1:7890`（换成你自己的代理地址）。下载失败或中断后，再点一次 **Download** 即可。
 
 ### 点 Start 后提示模型未就绪（required local model is not ready）
 
@@ -261,7 +266,7 @@ AI 笔记和标题永远不会发送音频。
 
 ### 字幕越来越慢（Windows / Linux）
 
-没有安装 GPU 加速包时，识别在 CPU 上运行，较慢的处理器可能跟不上实时速度。如果电脑有支持的 NVIDIA 显卡，可以安装 [GPU 加速包](#windows--linux测试中尚未公开发布)；也可以在 **Settings → Cloud providers** 设置一个云端识别服务：推理模式为 Auto 并允许音频上传后，本机模型达不到延迟目标时会改用它。
+没有安装 GPU 加速包时，识别在 CPU 上运行，较慢的处理器可能跟不上实时速度。如果电脑有支持的 NVIDIA 显卡，可以安装 [GPU 加速包](#windows--linux)；也可以在 **Settings → Cloud providers** 设置一个云端识别服务：推理模式为 Auto 并允许音频上传后，本机模型达不到延迟目标时会改用它。
 
 ### 悬浮字幕窗没有保持在最上层（Linux）
 
@@ -304,7 +309,6 @@ EchoLingo 通过 Secret Service 保存密钥。请安装或解锁 GNOME 钥匙�
 
 ## 路线图
 
-- **Windows 和 Linux 版**：在真实电脑上测试通过后公开发布。
 - 支持 AMD 和 Intel 显卡的 GPU 加速。
 - Linux 上的系统声音采集，以及适用于更多发行版的 AppImage 包。
 - Windows 代码签名和 Apple 公证，免去首次打开时的手动步骤。
@@ -340,7 +344,7 @@ npm run desktop:build                            # Windows 和 Linux：生成安
 APPLE_SIGNING_IDENTITY=- npm run desktop:build   # macOS：本机自签名构建
 ```
 
-构建产物位于 `target/release/bundle/`：macOS 是 `dmg/EchoLingo_0.3.0_aarch64.dmg`，Windows 是 `nsis/EchoLingo_0.3.0_x64-setup.exe`，Linux 是 `deb/EchoLingo_0.3.0_amd64.deb`。`APPLE_SIGNING_IDENTITY=-` 生成的是只适合自己使用的临时签名；公开分发需要 Developer ID 证书和 Apple 公证。
+构建产物位于 `target/release/bundle/`：macOS 是 `dmg/EchoLingo_0.3.1_aarch64.dmg`，Windows 是 `nsis/EchoLingo_0.3.1_x64-setup.exe`，Linux 是 `deb/EchoLingo_0.3.1_amd64.deb`。`APPLE_SIGNING_IDENTITY=-` 生成的是只适合自己使用的临时签名；公开分发需要 Developer ID 证书和 Apple 公证。
 
 运行测试：
 
@@ -355,9 +359,9 @@ npm run typecheck && npm run test:desktop   # 界面
 应用内更新只接受用 EchoLingo 更新签名密钥签过名的更新包。私钥约定保存在 `~/.tauri/echolingo-updater.key`（用 `npx tauri signer generate -w ~/.tauri/echolingo-updater.key` 生成，公钥是 `apps/desktop/src-tauri/tauri.conf.json` 里的 `plugins.updater.pubkey`）。请务必离线备份这个文件：丢失后，已安装的应用再也无法在应用内更新，只能手动重装。本地构建不需要私钥；CI 从仓库 secret `TAURI_SIGNING_PRIVATE_KEY` 读取私钥内容（私钥有密码时另设 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`），例如 `gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/echolingo-updater.key`。
 
 1. 更新版本号，写好 `.github/release-notes/vX.Y.Z.md`，推送标签 `vX.Y.Z`。
-2. CI 构建全部平台并创建两个草稿：`vX.Y.Z`（Mac 版 dmg、更新包 `.app.tar.gz` 及其 `.sig`、`SHA256SUMS.txt`，以及供检查的 `latest.json`）和 `windows-linux-vX.Y.Z`（Windows / Linux 安装包和 GPU 加速包，保持草稿）。
+2. CI 构建全部平台，并创建一个草稿 `vX.Y.Z`：Mac 版 dmg 和更新包 `.app.tar.gz`、Windows 安装程序、Linux .deb（后三者各带 `.sig` 签名）、GPU 加速包、`SHA256SUMS.txt`（校验值也附在发布说明末尾），以及供检查的 `latest.json`。
 3. 检查无误后，把 `vX.Y.Z` 发布为 pre-release。
-4. 运行 `python scripts/update_manifest.py --tag vX.Y.Z --publish`（需要已登录的 GitHub CLI `gh`）。它会校验签名密钥和下载链接，然后替换 `updater` 这个 pre-release 上的 `latest.json`，已安装的应用下次检查时就会看到新版本。
+4. 运行 `python scripts/update_manifest.py --tag vX.Y.Z --publish`（需要已登录的 GitHub CLI `gh`）。它会列出这个版本里带签名的 macOS、Windows 和 Linux 更新文件，校验签名密钥和下载链接，然后替换 `updater` 这个 pre-release 上的 `latest.json`，已安装的应用下次检查时就会看到新版本。
 
 `python scripts/smoke_update.py` 可以用临时密钥在本机 Mac 上完整演练一次应用内更新。
 

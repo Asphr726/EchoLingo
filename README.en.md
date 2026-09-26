@@ -2,17 +2,17 @@
 
 [简体中文](README.md) | English
 
-EchoLingo is a real-time lecture interpreter. It turns what the lecturer says into side-by-side captions in the original language and your language, sentence by sentence, and after class an AI model of your choice can turn the transcript into study notes. By default, all recognition and translation run on your own computer. The published download is for the Mac; Windows and Linux versions are in testing.
+EchoLingo is a real-time lecture interpreter. It turns what the lecturer says into side-by-side captions in the original language and your language, sentence by sentence, and after class an AI model of your choice can turn the transcript into study notes. By default, all recognition and translation run on your own computer. It runs on the Mac, Windows and Linux.
 
-[![Platform](https://img.shields.io/badge/platform-macOS%2014%2B%20%C2%B7%20Apple%20Silicon-lightgrey)](#requirements)
-[![Version](https://img.shields.io/badge/version-0.3.0%20Beta-orange)](https://github.com/Asphr726/EchoLingo/releases)
+[![Platform](https://img.shields.io/badge/platform-macOS%2014%2B%20%C2%B7%20Windows%20%C2%B7%20Linux-lightgrey)](#requirements)
+[![Version](https://img.shields.io/badge/version-0.3.1%20Beta-orange)](https://github.com/Asphr726/EchoLingo/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 ![EchoLingo live bilingual captions](docs/screenshots/live.png)
 
-> **v0.3.0 Beta**: the published download is for Apple Silicon Macs running macOS 14 or later. Windows and Linux builds are in testing and not published yet; see [Windows / Linux](#windows--linux-in-testing-not-yet-published). The app's interface is in English.
+> **v0.3.1 Beta**: for Apple Silicon Macs running macOS 14 or later, Windows 10 / 11 (x64) and Linux (Ubuntu 22.04+ / Debian 12+, x64); to install on Windows or Linux, see [Windows / Linux](#windows--linux). The app's interface is in English.
 
-[Highlights](#highlights) · [Requirements](#requirements) · [Install](#install) · [Windows / Linux](#windows--linux-in-testing-not-yet-published) · [Quick start](#quick-start) · [Guide](#guide) · [Privacy](#privacy) · [FAQ](#faq) · [Roadmap](#roadmap) · [Build from source](#build-from-source) · [License and acknowledgements](#license-and-acknowledgements)
+[Highlights](#highlights) · [Requirements](#requirements) · [Install](#install) · [Windows / Linux](#windows--linux) · [Quick start](#quick-start) · [Guide](#guide) · [Privacy](#privacy) · [FAQ](#faq) · [Roadmap](#roadmap) · [Build from source](#build-from-source) · [License and acknowledgements](#license-and-acknowledgements)
 
 ## Highlights
 
@@ -31,22 +31,22 @@ EchoLingo is a real-time lecture interpreter. It turns what the lecturer says in
 
 ## Requirements
 
-| Item | macOS (published) | Windows / Linux (in testing) |
+| Item | macOS | Windows / Linux |
 | --- | --- | --- |
 | System | macOS 14 Sonoma or later | Windows 10 21H2 or later, or Windows 11 (x64); Ubuntu 22.04 or later, or Debian 12 or later (x64) |
 | Chip | Apple Silicon (M1 or later); Intel Macs are not supported | An x64 processor with AVX2; optionally an NVIDIA graphics card for the GPU acceleration pack |
 | Memory | 16 GB or more recommended | 16 GB or more recommended |
-| Disk | The local models take about 4.5 GB; keep at least 6 GB free | The same; the optional GPU acceleration pack is another 2–3 GB download and takes more space once unpacked |
+| Disk | The local models take about 4.5 GB; keep at least 6 GB free | The same; the optional GPU acceleration pack needs about 6 GB more on Windows or 8.5 GB on Linux |
 | Permissions | Microphone; to capture sound playing on the Mac (online classes, videos), also Screen & System Audio Recording | Windows: desktop apps must be allowed to use the microphone; Linux: none |
 | Network | Only for downloading models, update checks, cloud providers and AI notes | The same |
 
-On Windows and Linux, recognition and translation run on the CPU unless the GPU acceleration pack is installed. On slower processors the captions may fall behind the lecture; the [GPU acceleration pack](#windows--linux-in-testing-not-yet-published) or a cloud recognizer solves that.
+On Windows and Linux, recognition and translation run on the CPU unless the GPU acceleration pack is installed. On slower processors the captions may fall behind the lecture; the [GPU acceleration pack](#windows--linux) or a cloud recognizer solves that.
 
 ## Install
 
-The steps below are for macOS. For Windows and Linux, see [Windows / Linux](#windows--linux-in-testing-not-yet-published).
+The steps below are for macOS. For Windows and Linux, see [Windows / Linux](#windows--linux).
 
-1. Download `EchoLingo_0.3.0_aarch64.dmg` from [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases).
+1. Download `EchoLingo_0.3.1_aarch64.dmg` from [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases).
 2. Open the dmg and drag **EchoLingo** into the Applications folder.
 3. Open it for the first time. The Beta is not notarized by Apple yet, so macOS blocks it at first:
    - **macOS 14**: in Applications, Control-click (or right-click) EchoLingo, choose **Open**, then choose **Open** again in the dialog.
@@ -71,23 +71,27 @@ The steps below are for macOS. For Windows and Linux, see [Windows / Linux](#win
    > `launchctl setenv HF_ENDPOINT https://hf-mirror.com` in Terminal, quit EchoLingo completely with ⌘Q, reopen it and click **Download** again.
    > The setting lasts until you log out or restart the Mac. To go back to the official source, run `launchctl unsetenv HF_ENDPOINT` and reopen the app.
 
-## Windows / Linux (in testing, not yet published)
+## Windows / Linux
 
-> **Not published yet.** Windows and Linux builds exist, but they have not been tested on real Windows or Linux computers yet, so they are not on the Releases page. The steps below are for testers who received a build; the app and its settings work as described in the rest of this guide unless noted here.
+The app and its settings work as described in the rest of this guide unless noted here. The Windows version has been tested on real hardware; the Linux version has so far only been tested on automated build machines, not on a real computer.
 
 **Windows 10 / 11 (x64)**
 
-1. Run `EchoLingo_0.3.0_x64-setup.exe`. It installs for your user account only and needs no administrator rights; if the Microsoft Edge WebView2 runtime is missing, the installer adds it.
+1. Download and run `EchoLingo_0.3.1_x64-setup.exe` from [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases). It installs for your user account only and needs no administrator rights; if the Microsoft Edge WebView2 runtime is missing, the installer adds it.
 2. The installer is not code-signed yet, so Windows SmartScreen may say "Windows protected your PC". Click **More info**, then **Run anyway**.
 3. Open EchoLingo from the Start menu and download the local models in **Settings → Models**, as in step 4 of [Install](#install).
 
 **Linux (Ubuntu 22.04+ / Debian 12+, x64)**
 
-1. In the folder you downloaded it to, install the package with `sudo apt install ./EchoLingo_0.3.0_amd64.deb`.
-2. Open EchoLingo from the application menu, or run `echolingo-desktop` in a terminal. Only a .deb package is available for now; an AppImage is on the roadmap.
-3. Open EchoLingo from the applications menu and download the local models in **Settings → Models**.
+1. Download `EchoLingo_0.3.1_amd64.deb` from [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases) and, in the folder you downloaded it to, install it with `sudo apt install ./EchoLingo_0.3.1_amd64.deb`. Only a .deb package is available for now; an AppImage is on the roadmap.
+2. Open EchoLingo from the application menu, or run `echolingo-desktop` in a terminal, and download the local models in **Settings → Models** in the same way.
 
-**NVIDIA GPU acceleration pack (optional).** Without it, recognition and translation run on the CPU. If the computer has an NVIDIA GeForce RTX 20-series or GTX 16-series card or newer with a recent driver, open **Settings → Models → GPU acceleration** and click **Download**. The pack (about 2–3 GB) is downloaded in parts, every part is checked, and a self-test runs before the pack is switched on; **Use GPU acceleration** turns it off again at any time. If the GPU runtime fails to start, EchoLingo falls back to the CPU and the card says why. AMD and Intel graphics cards are not supported yet. On Linux, GPU translation also needs the Vulkan loader (`sudo apt install libvulkan1`); without it translation stays on the CPU.
+**NVIDIA GPU acceleration pack (optional).** Without it, recognition and translation run on the CPU, and slower processors may fall behind the lecture: on an i7-13700H laptop, Qwen3-ASR on the CPU took 2.07 times as long as an 11-second clip to transcribe it. With the pack on the same computer (RTX 4060 Laptop), live recognition lagged 0.1–0.2 s at the median and about 2 s at most, and Hy-MT translated about 135 tokens per second on Vulkan.
+
+- **Requirements**: an NVIDIA graphics card with compute capability 7.5 or higher (GeForce GTX 16-series, RTX 20-series or newer) and driver 580.65 or later. AMD and Intel graphics cards are not supported yet. On Linux, GPU translation also needs the Vulkan loader (`sudo apt install libvulkan1`); without it translation stays on the CPU.
+- **Disk space**: on Windows the pack is about 2.0 GB to download and 3.6 GB unpacked; on Linux about 2.6 GB to download and 5.4 GB unpacked. Both take space while it installs (the download is deleted afterwards), on top of the local models.
+- **Install**: open **Settings → Models → GPU acceleration** and click **Download**. The pack is downloaded in parts, every part is checked, and a self-test runs before the pack is switched on; **Use GPU acceleration** turns it off again at any time. If the GPU runtime fails to start, EchoLingo falls back to the CPU and the card says why.
+- **Download it again after every app update**: each pack matches one version of EchoLingo. After an update, download it again on the same card; until then recognition and translation run on the CPU.
 
 **Differences from the Mac version**
 
@@ -190,10 +194,11 @@ The steps below are for macOS. For Windows and Linux, see [Windows / Linux](#win
 ### In-app updates
 
 - By default EchoLingo checks for a new version once at every launch. You can turn this off in **Settings → General → Updates**.
-- On the Mac, updates install from inside the app: EchoLingo downloads the new version, verifies its signature, replaces the app in place and restarts. Your sessions, settings, models and keys are kept.
-- **Coming from 0.2.0**: version 0.2.0 has no in-app updates, so install once by hand: download the 0.3.0 dmg, quit EchoLingo with ⌘Q and drag the new version into Applications to replace the old one. Later versions update from inside the app.
+- **macOS and Windows** update from inside the app: EchoLingo downloads the new version, verifies its signature, replaces the app in place and restarts. Your sessions, settings, models and keys are kept.
+- **Linux**: when a new version is out, EchoLingo tells you and links to its release page. Download the new .deb and install it with `sudo apt install` as the first time; your data is kept as well.
+- **Coming from 0.2.0**: version 0.2.0 has no in-app updates, so install once by hand: download the latest dmg, quit EchoLingo with ⌘Q and drag the new version into Applications to replace the old one. Later versions update from inside the app.
+- If you use the GPU acceleration pack, download it again after each update; see [Windows / Linux](#windows--linux).
 - After an update, macOS may ask again for the microphone or Screen & System Audio Recording permission; see [No captions, or no sound gets through](#no-captions-or-no-sound-gets-through).
-- For now only the Mac version updates from inside the app; download new Windows and Linux test builds by hand.
 
 ## Privacy
 
@@ -240,7 +245,7 @@ Keys are stored in the system secure store (macOS Keychain, Windows Credential M
 
 ### The model download is slow or fails
 
-In mainland China, try the Hugging Face mirror. On macOS, run `launchctl setenv HF_ENDPOINT https://hf-mirror.com`, quit EchoLingo with ⌘Q, reopen it and click **Download** again; for Windows and Linux, see [Windows / Linux](#windows--linux-in-testing-not-yet-published). If downloads do not go through your proxy, set `HTTPS_PROXY` the same way, for example `launchctl setenv HTTPS_PROXY http://127.0.0.1:7890` on macOS or `setx HTTPS_PROXY http://127.0.0.1:7890` on Windows (use your own proxy address). After a failed or interrupted download, click **Download** again.
+In mainland China, try the Hugging Face mirror. On macOS, run `launchctl setenv HF_ENDPOINT https://hf-mirror.com`, quit EchoLingo with ⌘Q, reopen it and click **Download** again; for Windows and Linux, see [Windows / Linux](#windows--linux). If downloads do not go through your proxy, set `HTTPS_PROXY` the same way, for example `launchctl setenv HTTPS_PROXY http://127.0.0.1:7890` on macOS or `setx HTTPS_PROXY http://127.0.0.1:7890` on Windows (use your own proxy address). After a failed or interrupted download, click **Download** again.
 
 ### Start says a required local model is not ready
 
@@ -261,7 +266,7 @@ Loading the models the first time takes 1–2 minutes. With "Preload local model
 
 ### Captions fall further and further behind (Windows / Linux)
 
-Without the GPU acceleration pack, recognition runs on the CPU, and slower processors may not keep up in real time. Install the [GPU acceleration pack](#windows--linux-in-testing-not-yet-published) if the computer has a supported NVIDIA card, or set a cloud recognizer under **Settings → Cloud providers**: with the route on Auto, it is used when the local model misses its latency target, once you allow audio upload.
+Without the GPU acceleration pack, recognition runs on the CPU, and slower processors may not keep up in real time. Install the [GPU acceleration pack](#windows--linux) if the computer has a supported NVIDIA card, or set a cloud recognizer under **Settings → Cloud providers**: with the route on Auto, it is used when the local model misses its latency target, once you allow audio upload.
 
 ### The floating caption does not stay on top (Linux)
 
@@ -304,7 +309,6 @@ Yes. Once the models are downloaded, local recognition and translation need no n
 
 ## Roadmap
 
-- **Windows and Linux**: published once they have been tested on real computers.
 - GPU acceleration on AMD and Intel graphics cards.
 - System audio capture on Linux, and an AppImage package for more distributions.
 - Code signing on Windows and Apple notarization, so the first launch needs no manual steps.
@@ -340,7 +344,7 @@ npm run desktop:build                            # Windows and Linux: installer 
 APPLE_SIGNING_IDENTITY=- npm run desktop:build   # macOS: local ad-hoc signed build
 ```
 
-The build ends up in `target/release/bundle/`: `dmg/EchoLingo_0.3.0_aarch64.dmg` on macOS, `nsis/EchoLingo_0.3.0_x64-setup.exe` on Windows, and `deb/EchoLingo_0.3.0_amd64.deb` on Linux. `APPLE_SIGNING_IDENTITY=-` produces an ad-hoc signature that is only suitable for your own Mac; public distribution needs a Developer ID certificate and Apple notarization.
+The build ends up in `target/release/bundle/`: `dmg/EchoLingo_0.3.1_aarch64.dmg` on macOS, `nsis/EchoLingo_0.3.1_x64-setup.exe` on Windows, and `deb/EchoLingo_0.3.1_amd64.deb` on Linux. `APPLE_SIGNING_IDENTITY=-` produces an ad-hoc signature that is only suitable for your own Mac; public distribution needs a Developer ID certificate and Apple notarization.
 
 Run the tests:
 
@@ -355,9 +359,9 @@ npm run typecheck && npm run test:desktop   # user interface
 In-app updates only accept update packages signed with the EchoLingo update signing key. By convention the private key lives in `~/.tauri/echolingo-updater.key` (created with `npx tauri signer generate -w ~/.tauri/echolingo-updater.key`; the public key is `plugins.updater.pubkey` in `apps/desktop/src-tauri/tauri.conf.json`). Keep an offline backup of this file: without it, installed copies can never update from inside the app again and have to be reinstalled by hand. Local builds do not need the key; CI reads its contents from the repository secret `TAURI_SIGNING_PRIVATE_KEY` (plus `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` if the key has a password), for example `gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/echolingo-updater.key`.
 
 1. Bump the version, write `.github/release-notes/vX.Y.Z.md` and push the tag `vX.Y.Z`.
-2. CI builds every platform and creates two drafts: `vX.Y.Z` (the Mac dmg, the update package `.app.tar.gz` and its `.sig`, `SHA256SUMS.txt`, and a `latest.json` to review) and `windows-linux-vX.Y.Z` (the Windows / Linux installers and GPU packs; it stays a draft).
+2. CI builds every platform and creates one draft, `vX.Y.Z`: the Mac dmg and update package `.app.tar.gz`, the Windows installer, the Linux .deb (the last three each with its `.sig`), the GPU packs, `SHA256SUMS.txt` (the checksums are also appended to the release notes), and a `latest.json` to review.
 3. Once it checks out, publish `vX.Y.Z` as a pre-release.
-4. Run `python scripts/update_manifest.py --tag vX.Y.Z --publish` (needs a signed-in GitHub CLI, `gh`). It checks the signing key and the download links, then replaces `latest.json` on the `updater` pre-release; installed copies see the new version at their next check.
+4. Run `python scripts/update_manifest.py --tag vX.Y.Z --publish` (needs a signed-in GitHub CLI, `gh`). It lists the signed macOS, Windows and Linux update files of that release, checks the signing key and the download links, then replaces `latest.json` on the `updater` pre-release; installed copies see the new version at their next check.
 
 `python scripts/smoke_update.py` rehearses a complete in-app update on your Mac with a throwaway key.
 
