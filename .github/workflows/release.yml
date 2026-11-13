@@ -29,7 +29,7 @@ jobs:
       matrix:
         include:
           - name: macos-arm64
-            os: macos-14
+            os: macos-15
             sidecar_mode: onefile
             sidecar: apps/desktop/src-tauri/binaries/echolingo-sidecar-aarch64-apple-darwin
             # Tauri makes the updater archive (.app.tar.gz) only for the `app` bundle type.
