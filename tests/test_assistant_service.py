@@ -1035,3 +1035,18 @@ async def test_deepseek_title_after_reasoning_hit_the_limit(caplog) -> None:
     assert "retrying once" in logged
     for forbidden in (secret, "zygomorphic", "flurbination", "quixotic", "Quixotic", "pondering"):
         assert forbidden not in logged
+
+
+@pytest.mark.asyncio
+async def test_visual_upload_requires_separate_consent(tmp_path):
+    from PIL import Image
+    path = tmp_path / "photo.png"
+    Image.new("RGB", (40, 40)).save(path)
+    client = FakeClient()
+    assistant, _ = make_service(client)
+    payload = notes_payload(units(2), visual_mode=True,
+                            attachments=[{"id": "a", "name": path.name, "path": str(path)}])
+    result = result_of(await run_task(assistant, "notes", payload))
+    assert not result["ok"]
+    assert result["result"]["code"] == "privacy_policy_denied"
+    assert client.calls == []

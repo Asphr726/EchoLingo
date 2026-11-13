@@ -926,8 +926,9 @@ export const api = {
     normalizeNotesState(await command<unknown>("get_session_notes", { sessionId })),
   /** Native picker in the shell; paths never reach the webview. */
   pickNoteAttachments: () => command<NoteAttachment[]>("pick_note_attachments"),
-  createSessionNotes: (sessionId: string, attachmentIds: string[]) =>
-    command<{ job_id: string }>("create_session_notes", { sessionId, attachmentIds }),
+  readNoteAsset: (sessionId: string, assetId: string) => command<string>("read_note_asset", { sessionId, assetId }),
+  createSessionNotes: (sessionId: string, attachmentIds: string[], visualUploadAllowed = false) =>
+    command<{ job_id: string }>("create_session_notes", { sessionId, attachmentIds, visualUploadAllowed }),
   cancelSessionNotes: (jobId: string) => command<void>("cancel_session_notes", { jobId }),
   generateSessionTitle: (sessionId: string) =>
     command<{ title: string; applied?: boolean }>("generate_session_title", { sessionId }),

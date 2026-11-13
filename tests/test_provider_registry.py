@@ -301,10 +301,11 @@ def test_assistant_presets_are_exported_in_the_catalog() -> None:
         "display_name": "Qwen (Alibaba Model Studio)",
         "default_model": "qwen-plus",
         "models": ["qwen-plus", "qwen-max", "qwen-turbo", "qwen-long"],
+        "vision_models": [],
     }
     assert registry.catalog()["schema_version"] == 1
     for entry in exported:
-        assert set(entry) == {"group_id", "display_name", "default_model", "models"}
+        assert set(entry) == {"group_id", "display_name", "default_model", "models", "vision_models"}
         assert entry["group_id"] in registry.CREDENTIAL_GROUPS
         if entry["group_id"] != "custom_openai":
             assert entry["default_model"] == entry["models"][0]

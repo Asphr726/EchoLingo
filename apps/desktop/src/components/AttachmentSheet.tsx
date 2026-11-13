@@ -28,13 +28,14 @@ export function AttachmentSheet({
   open: boolean;
   initial?: NoteAttachment[];
   onClose: () => void;
-  onCreate: (attachments: NoteAttachment[]) => void;
+  onCreate: (attachments: NoteAttachment[], visual: boolean) => void;
 }) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const primaryRef = useRef<HTMLButtonElement>(null);
   const addRef = useRef<HTMLButtonElement>(null);
   const [files, setFiles] = useState<NoteAttachment[]>(initial);
   const [picking, setPicking] = useState(false);
+  const [visual, setVisual] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
 
   useEffect(() => {
@@ -97,7 +98,7 @@ export function AttachmentSheet({
           </button>
         </header>
         <p id="attachment-sheet-body" className="attachment-sheet-body">
-          Slides or handouts help fix names, terms and formulas. Text is extracted on this computer; only the text is sent.
+          Slides or handouts help fix names, terms and formulas. Enable visual reading to understand PDF diagrams, scanned pages and photos. PowerPoint and Word use text extraction.
         </p>
         {count > 0 && (
           <ul className="attachment-list" aria-label="Files to attach">
@@ -134,11 +135,16 @@ export function AttachmentSheet({
             <Plus size={15} weight="bold" aria-hidden="true" />
             {picking ? "Choosing…" : "Add files…"}
           </button>
-          <span className="attachment-hint">PDF, PowerPoint, Word, Markdown, LaTeX or text · up to {MAX_ATTACHMENTS} files, 25{"\u00a0"}MB each</span>
+          <span className="attachment-hint">PDF, PNG, JPEG, WebP, PowerPoint, Word, Markdown, LaTeX or text · up to {MAX_ATTACHMENTS} files, 25{"\u00a0"}MB each</span>
         </div>
+        <label className="attachment-sheet-body">
+          <input type="checkbox" checked={visual} onChange={(event) => setVisual(event.target.checked)} />
+          Allow sending PDF pages and images to the selected AI provider for visual reading and automatic figures.
+          Every page is read; large documents take longer. Leave unchecked to use extracted text only.
+        </label>
         {notice && <p className="attachment-notice" role="status">{notice}</p>}
         <footer className="attachment-sheet-footer">
-          <button className="button button--quiet" type="button" onClick={() => onCreate([])}>
+          <button className="button button--quiet" type="button" onClick={() => onCreate([], false)}>
             Create without files
           </button>
           <button
@@ -146,7 +152,7 @@ export function AttachmentSheet({
             className="button button--primary"
             type="button"
             disabled={count === 0}
-            onClick={() => onCreate(files)}
+            onClick={() => onCreate(files, visual)}
           >
             {count === 0 ? "Create with files" : `Create with ${count} ${count === 1 ? "file" : "files"}`}
           </button>

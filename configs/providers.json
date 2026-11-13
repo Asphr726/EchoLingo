@@ -192,7 +192,8 @@
         "qwen-max",
         "qwen-turbo",
         "qwen-long"
-      ]
+      ],
+      "vision_models": []
     },
     {
       "default_model": "gpt-4o-mini",
@@ -202,7 +203,8 @@
         "gpt-4o-mini",
         "gpt-4o",
         "gpt-4.1-mini"
-      ]
+      ],
+      "vision_models": []
     },
     {
       "default_model": "deepseek-flash",
@@ -211,6 +213,9 @@
       "models": [
         "deepseek-flash",
         "deepseek-v4-pro"
+      ],
+      "vision_models": [
+        "deepseek-flash"
       ]
     },
     {
@@ -220,7 +225,8 @@
       "models": [
         "gemini-2.0-flash",
         "gemini-2.5-flash"
-      ]
+      ],
+      "vision_models": []
     },
     {
       "default_model": "llama-3.3-70b-versatile",
@@ -228,7 +234,8 @@
       "group_id": "groq",
       "models": [
         "llama-3.3-70b-versatile"
-      ]
+      ],
+      "vision_models": []
     },
     {
       "default_model": "openai/gpt-4o-mini",
@@ -236,7 +243,8 @@
       "group_id": "openrouter",
       "models": [
         "openai/gpt-4o-mini"
-      ]
+      ],
+      "vision_models": []
     },
     {
       "default_model": "Qwen/Qwen2.5-72B-Instruct",
@@ -245,13 +253,15 @@
       "models": [
         "Qwen/Qwen2.5-72B-Instruct",
         "deepseek-ai/DeepSeek-V3"
-      ]
+      ],
+      "vision_models": []
     },
     {
       "default_model": "",
       "display_name": "Custom OpenAI-compatible endpoint",
       "group_id": "custom_openai",
-      "models": []
+      "models": [],
+      "vision_models": []
     }
   ],
   "credential_groups": [
@@ -905,4 +915,3 @@
     }
   ]
 }
-

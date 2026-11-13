@@ -329,7 +329,7 @@ async def test_hello_accepted_advertises_assistant_capabilities() -> None:
     )
     accepted = websocket.sent[-1]
     assert accepted["type"] == "hello_accepted"
-    assert accepted["payload"]["capabilities"] == ["assistant.v1", "asr_context.v1"]
+    assert accepted["payload"]["capabilities"] == ["assistant.v1", "asr_context.v1", "assistant.vision.v1"]
 
 
 async def test_malformed_assistant_request_fails_without_closing_the_connection() -> None:

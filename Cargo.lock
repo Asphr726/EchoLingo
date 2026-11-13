@@ -1368,6 +1368,7 @@ version = "0.3.1"
 dependencies = [
  "app-core",
  "audio-core",
+ "base64 0.22.1",
  "chrono",
  "futures-util",
  "inference-ipc",

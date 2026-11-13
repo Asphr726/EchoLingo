@@ -136,6 +136,16 @@ def pyinstaller_command(
         "echolingo.assistant",
         "--collect-submodules",
         "pypdf",
+        "--collect-all",
+        "pypdfium2",
+        "--collect-all",
+        "pypdfium2_raw",
+        "--collect-submodules",
+        "PIL",
+        "--copy-metadata",
+        "pillow",
+        "--copy-metadata",
+        "pypdfium2",
         # The forced aligner reads qwen_asr's package data (Korean jieba
         # dictionary) when it loads.
         "--collect-data",

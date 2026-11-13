@@ -180,6 +180,7 @@ export interface AssistantPreset {
   display_name: string;
   default_model: string;
   models: string[];
+  vision_models?: string[];
 }
 
 export interface AssistantStatus {
@@ -199,7 +200,20 @@ export interface NoteAttachment {
   extension: string;
 }
 
+export interface NoteFigure {
+  id: string;
+  attachment_id: string;
+  name: string;
+  page: number;
+  caption: string;
+  box: number[];
+  width: number;
+  height: number;
+}
+
 export interface NoteAttachmentReport {
+  figures?: NoteFigure[];
+  visual_pages?: number;
   id?: string;
   name: string;
   pages?: number | null;

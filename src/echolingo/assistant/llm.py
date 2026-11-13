@@ -295,7 +295,7 @@ class ChatClient:
 
     def payload(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         model: str,
         max_tokens: int,
@@ -434,7 +434,7 @@ class ChatClient:
 
     async def stream_chat(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         model: str | None = None,
         max_tokens: int = 4096,
@@ -518,7 +518,7 @@ class ChatClient:
 
     async def stream_text(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         model: str | None = None,
         max_tokens: int = 4096,
@@ -599,7 +599,7 @@ class ChatClient:
 
     async def complete_streamed(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         model: str | None = None,
         max_tokens: int = 4096,
@@ -632,7 +632,7 @@ class ChatClient:
 
     async def complete(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         model: str | None = None,
         max_tokens: int = 1024,

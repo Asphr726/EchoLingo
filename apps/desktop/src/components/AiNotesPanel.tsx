@@ -131,7 +131,7 @@ export function AiNotesPanel({
     return () => window.cancelAnimationFrame(frame);
   }, [focusSection, onFocusHandled, view]);
 
-  const create = async (attachments: NoteAttachment[]) => {
+  const create = async (attachments: NoteAttachment[], visual = false) => {
     setSheetOpen(false);
     setPending("create");
     setActionError(null);
@@ -139,6 +139,7 @@ export function AiNotesPanel({
       const { job_id } = await api.createSessionNotes(
         session.id,
         attachments.map((file) => file.id),
+        visual,
       );
       onJob({
         job_id,
@@ -351,7 +352,7 @@ export function AiNotesPanel({
             {doc.blocks.length === 0 && running ? (
               <p className="notes-waiting">The first section appears here as soon as the model starts writing.</p>
             ) : (
-              <NotesMarkdown blocks={doc.blocks} lang={session.target_language} onJump={segments.length > 0 ? onJump : undefined} />
+              <NotesMarkdown sessionId={view === "saved" ? session.id : undefined} blocks={doc.blocks} lang={session.target_language} onJump={segments.length > 0 ? onJump : undefined} />
             )}
           </article>
         </div>
@@ -363,7 +364,7 @@ export function AiNotesPanel({
         open={sheetOpen}
         initial={previewInitialAttachments()}
         onClose={() => setSheetOpen(false)}
-        onCreate={(files) => void create(files)}
+        onCreate={(files, visual) => void create(files, visual)}
       />
     </div>
   );
@@ -435,6 +436,7 @@ function Provenance({ notes }: { notes: SessionNotes }) {
 function AttachmentChip({ attachment }: { attachment: NoteAttachmentReport }) {
   const details = [
     attachment.pages ? `${attachment.pages} ${attachment.pages === 1 ? "page" : "pages"}` : null,
+    attachment.visual_pages ? `${attachment.visual_pages} pages visually read` : null,
     attachment.chars ? `${attachment.chars.toLocaleString("en-US")} characters read` : null,
     attachment.truncated ? "truncated to fit" : null,
     attachment.warning ?? null,

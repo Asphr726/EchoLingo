@@ -71,6 +71,10 @@ export function stageLabel(job: Pick<AssistantJob, "stage" | "progress">): strin
   switch (job.stage) {
     case "extracting":
       return "Reading course materials…";
+    case "visual_reading":
+      return `Reading page images · ${progress.index ?? 0} / ${progress.total ?? "…"}`;
+    case "selecting_figures":
+      return "Checking diagram crops…";
     case "reading":
       return "Reading the transcript…";
     case "section": {
@@ -138,6 +142,12 @@ export function errorGuidance(code: string | null | undefined): ErrorGuidance {
       return { text: "EchoLingo could not reach the provider. Check the network connection, then try again." };
     case "provider_timeout":
       return { text: "The provider stopped responding. Try again in a moment." };
+    case "vision_unavailable":
+      return { text: "This model could not read images. Choose a visual model in Settings, or create notes again with visual reading unchecked to use text only.", section: "ai-assistant", actionLabel: "Choose model" };
+    case "visual_read_failed":
+      return { text: "Some page images could not be read. Retry or choose another visual model. Uncheck visual reading only if you want text-only notes." };
+    case "asset_error":
+      return { text: "The selected figures could not be saved. Try again with fewer attachments." };
     case "attachment_error":
     case "attachment_unreadable":
       return { text: "An attached file could not be read. Remove it or try a different export of the file." };

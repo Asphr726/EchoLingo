@@ -3317,6 +3317,15 @@ async fn history_delete(
         .delete(id)
         .await
         .map_err(|error| error.to_string())?;
+    assistant::collect_assets(
+        &app.path()
+            .app_local_data_dir()
+            .map_err(|e| e.to_string())?
+            .join("note-assets"),
+        state.store()?,
+        Some(id),
+    )
+    .await?;
     emit_history_changed(&app, &state, id, "deleted");
     Ok(())
 }
@@ -3339,6 +3348,7 @@ async fn history_export(
 
 #[tauri::command]
 async fn history_export_to_path(
+    app: AppHandle,
     state: State<'_, RuntimeState>,
     session_id: String,
     format: ExportFormat,
@@ -3347,7 +3357,7 @@ async fn history_export_to_path(
     let id = session_id
         .parse()
         .map_err(|_| "invalid session id".to_string())?;
-    let contents = state
+    let mut contents = state
         .store()?
         .export(id, format)
         .await
@@ -3358,6 +3368,19 @@ async fn history_export_to_path(
         .ok_or_else(|| "export destination has no parent".to_string())?;
     if !parent.is_dir() {
         return Err("export destination directory is unavailable".into());
+    }
+    if matches!(format, ExportFormat::Notes | ExportFormat::Markdown) {
+        assistant::export_assets(
+            &app.path()
+                .app_local_data_dir()
+                .map_err(|e| e.to_string())?
+                .join("note-assets"),
+            state.store()?,
+            id,
+            &destination,
+            &mut contents,
+        )
+        .await?;
     }
     let temporary = destination.with_extension("echolingo-export.tmp");
     std::fs::write(&temporary, contents).map_err(|error| error.to_string())?;
@@ -3429,6 +3452,7 @@ pub fn run() {
             assistant::assistant_probe,
             assistant::get_session_notes,
             assistant::pick_note_attachments,
+            assistant::read_note_asset,
             assistant::create_session_notes,
             assistant::cancel_session_notes,
             assistant::generate_session_title,
@@ -3474,6 +3498,12 @@ pub fn run() {
                 .store
                 .set(store)
                 .map_err(|_| std::io::Error::other("store already initialized"))?;
+            tauri::async_runtime::block_on(assistant::collect_assets(
+                &app_data_directory.join("note-assets"),
+                state.store().map_err(std::io::Error::other)?,
+                None,
+            ))
+            .map_err(std::io::Error::other)?;
             let preferences_path = app_data_directory.join("preferences.json");
             let model_root = app_data_directory.join("models");
             state

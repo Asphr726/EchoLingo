@@ -22,11 +22,13 @@ import math
 import os
 import re
 import time
+from pathlib import Path
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from ..errors import BackendError
 from . import prompts, terms as terms_module
+from .vision import VisualMaterials, VISUAL_TYPES
 from .attachments import ExtractedAttachment, extract_attachments, parse_attachment_items
 from .llm import AssistantError, ChatClient, add_usage, build_client, strip_reasoning
 from .output import (
@@ -493,6 +495,14 @@ class AssistantService:
                 events.progress("extracting", {"total": len(items)})
                 extracted = await extract_attachments(items)
             usage: dict[str, int] = {}
+            visual = VisualMaterials()
+            visual_items = [i for i in items if Path(i["path"]).suffix.lower().lstrip(".") in VISUAL_TYPES]
+            if payload.get("visual_mode") is True and visual_items:
+                if payload.get("consent", {}).get("visual_upload_allowed") is not True:
+                    raise AssistantError("privacy_policy_denied", "Allow sending page images before visual reading.")
+                visual_docs = await visual.read(client, visual_items, events, usage, extracted, prompts.format_transcript(lines))
+                visual_ids = {a.id for a in visual_docs}
+                extracted = [a for a in extracted if a.id not in visual_ids] + visual_docs
             single = fits_single_call(lines)
             logger.info(
                 "assistant notes: %d units, %d chars, %d attachment(s), %s",
@@ -503,18 +513,20 @@ class AssistantService:
             )
             if single:
                 markdown = await self._notes_single(
-                    client, session, language, lines, extracted, events, usage
+                    client, session, language, lines, extracted, events, usage, visual
                 )
             else:
                 markdown = await self._notes_windowed(
-                    client, session, language, lines, extracted, events, usage
+                    client, session, language, lines, extracted, events, usage, visual
                 )
-            markdown = clean_markdown(markdown)
+            markdown = visual.finalize(clean_markdown(markdown))
             if not markdown:
                 raise AssistantError(
                     "empty_response", f"{_display_name(client)} returned no notes."
                 )
             return {
+                "vision_version": 1,
+                "assets": visual.used(markdown),
                 "markdown": markdown,
                 "title": extract_title(markdown),
                 "provider": client.provider,
@@ -564,14 +576,20 @@ class AssistantService:
         extracted: Sequence[ExtractedAttachment],
         events: TaskEvents,
         usage: dict[str, int],
+        visual: VisualMaterials,
     ) -> str:
-        materials = budget_materials(extracted, MATERIALS_BUDGET_SINGLE)
+        materials = (
+            select_materials(extracted, prompts.format_transcript(lines), MATERIALS_BUDGET_SINGLE)
+            if any(item.visual_pages for item in extracted)
+            else budget_materials(extracted, MATERIALS_BUDGET_SINGLE)
+        )
         messages = _messages(
             prompts.notes_system_prompt(language),
             prompts.notes_user_message(
                 session, prompts.format_transcript(lines), materials, language
             ),
         )
+        messages = visual.augment(messages, materials)
         events.progress("reading")
         text = await self._stream(
             client,
@@ -593,6 +611,7 @@ class AssistantService:
         extracted: Sequence[ExtractedAttachment],
         events: TaskEvents,
         usage: dict[str, int],
+        visual: VisualMaterials,
     ) -> str:
         windows = plan_windows(lines)
         total = len(windows)
@@ -629,6 +648,7 @@ class AssistantService:
                     headings_so_far=headings,
                 ),
             )
+            messages = visual.augment(messages, materials)
             joiner.start_part()
             section = await self._stream(
                 client,

@@ -28,7 +28,7 @@ from xml.etree import ElementTree
 
 logger = logging.getLogger("echolingo.assistant.attachments")
 
-SUPPORTED_EXTENSIONS = frozenset({"pdf", "pptx", "docx", "txt", "md", "markdown", "tex", "csv"})
+SUPPORTED_EXTENSIONS = frozenset({"pdf", "pptx", "docx", "txt", "md", "markdown", "tex", "csv", "png", "jpg", "jpeg", "webp"})
 TEXT_EXTENSIONS = frozenset({"txt", "md", "markdown", "tex", "csv"})
 MAX_ATTACHMENTS = 5
 MAX_INPUT_BYTES = 25 * 1024 * 1024
@@ -79,6 +79,7 @@ class ExtractedAttachment:
     kind: str
     pages: int | None = None
     truncated: bool = False
+    visual_pages: int = 0
     warning: str | None = None
     segments: list[AttachmentSegment] = field(default_factory=list)
 
@@ -98,6 +99,7 @@ class ExtractedAttachment:
             "chars": self.chars,
             "truncated": self.truncated,
             "warning": self.warning,
+            **({"visual_pages": self.visual_pages} if self.visual_pages else {}),
         }
 
 
@@ -459,6 +461,8 @@ def extract_file(
             raise AttachmentError("The file could not be opened.") from error
         if len(data) > MAX_INPUT_BYTES:
             raise AttachmentError("The file is larger than 25 MB.")
+        if extension in {"png", "jpg", "jpeg", "webp"}:
+            raise AttachmentError("Image not read: enable visual reading to use this attachment.")
         _EXTRACTORS[extension](data, result, budget)
     except AttachmentError as error:
         result.warning = str(error)

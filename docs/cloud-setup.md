@@ -155,3 +155,56 @@ conda run -n echolingo-spike1 python -m echolingo --config configs/lecture.toml 
 `python -m echolingo.backends.registry`. Cloud providers need the matching
 upload permission, either from `--allow-audio-upload` /
 `--allow-transcript-upload` or from the config's `privacy` table.
+
+## Visual course materials in History notes
+
+In **History → Create notes → Add course materials**, attach PDF, PNG,
+JPEG or WebP and check **Allow sending PDF pages and images**. This is a
+separate, per-request grant: existing transcript consent alone never sends
+page images. Leaving it unchecked explicitly selects local text extraction;
+image-only attachments then report that they were not read. PPTX and DOCX
+continue to use local text extraction in either mode; export them to PDF to
+include shapes, drawings and slide layout.
+
+The sidecar renders every PDF page locally and reads batches of four through
+the selected model's OpenAI-compatible image content blocks. Text layers are
+included as reference data. DeepSeek `deepseek-flash` is registered for vision;
+`deepseek-v4-pro` is text-only. Unknown models first receive a synthetic red
+rectangle probe, without user material. See the [DeepSeek vision guide](https://api-docs.deepseek.com/guides/vision/).
+No provider Files API, public image hosting or additional model is used.
+Unsupported models and failed page reads require retry, model selection or an
+explicit text-only retry; there is no automatic text-only downgrade.
+
+The model identifies diagrams, graphs and handwriting, then a second visual
+check verifies crop completeness. Uncertain crops use the whole page. Notes
+remain grounded in the spoken transcript; course materials supply context
+and illustrations rather than unrelated chapters. Source filenames and page
+numbers are appended locally. Click a saved figure to enlarge it.
+
+Limits remain five files, 25 MB each (image attachments are limited to 40 megapixels), and at most 1000 pages per PDF (larger
+PDFs fail rather than silently skip pages). Up to three figures per page and
+32 candidates per job are considered; candidates are retained by transcript
+relevance and the attachment report warns when that limit is reached. Each
+writing window receives up to eight relevant candidates. Selected figure
+payloads must fit an 8 MiB encoded budget. Every page is visually read even
+when the candidate limit is reached. Time and API usage grow with page count;
+progress resets the visual task's 15-minute inactivity watchdog. Individual
+network calls retain their existing timeout. Handwriting and crop accuracy
+remain model-dependent.
+
+Only selected JPEG figures and source metadata are retained in application
+storage. Original PDFs and full page renders are not retained, except when a
+whole page is itself selected as a figure. Rust owns file access; the webview
+uses session/asset IDs and cannot load arbitrary filesystem or remote images.
+Figure metadata lives in the existing versioned notes attachment reports, so
+old notes need no database migration. Failed generation preserves saved notes;
+replacement, History deletion and startup collection remove unreferenced
+figures. Temporary rendering uses memory and creates no persistent page spool.
+
+Markdown exports write the `.md` plus an adjacent, uniquely named resource
+folder with relative image links. Move both together when opening in Obsidian
+or sharing. Complete-history Markdown exports include the same resources.
+The packaged sidecar must be rebuilt to include PDFium and Pillow; older
+sidecars are rejected for visual requests rather than saving text-only results.
+
+Executed checks and remaining live/package gates: [visual notes validation](visual-notes-validation.md).

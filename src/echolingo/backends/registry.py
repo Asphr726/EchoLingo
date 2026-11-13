@@ -663,6 +663,7 @@ class AssistantPreset:
     # Accepts ``stream_options.include_usage`` (Gemini's OpenAI layer and
     # unknown self-hosted servers may reject it with HTTP 400).
     stream_usage: bool = False
+    vision_models: tuple[str, ...] = ()
 
 
 # credential group -> (base_url, api key env) from the chat translation presets
@@ -693,6 +694,7 @@ def _assistant(
         api_key_env=key_env or key_field.env_var,
         key_required=key_field.required,
         stream_usage=stream_usage,
+        vision_models=("deepseek-flash",) if group_id == "deepseek" else (),
     )
     ASSISTANT_PRESETS[group_id] = preset
     return preset
@@ -1043,6 +1045,7 @@ def catalog() -> dict[str, Any]:
                 "display_name": preset.display_name,
                 "default_model": preset.default_model,
                 "models": list(preset.models),
+                "vision_models": list(preset.vision_models),
             }
             for preset in ASSISTANT_PRESETS.values()
         ],

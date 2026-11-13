@@ -35,8 +35,9 @@ use uuid::Uuid;
 pub(crate) const ASSISTANT_BUSY: &str = "An AI assistant task is running";
 pub(crate) const MAX_ATTACHMENTS: usize = 5;
 pub(crate) const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
-pub(crate) const ATTACHMENT_EXTENSIONS: &[&str] =
-    &["pdf", "pptx", "docx", "txt", "md", "markdown", "tex", "csv"];
+pub(crate) const ATTACHMENT_EXTENSIONS: &[&str] = &[
+    "pdf", "pptx", "docx", "txt", "md", "markdown", "tex", "csv", "png", "jpg", "jpeg", "webp",
+];
 /// Picked files remembered for a later `create_session_notes`; oldest go first.
 const MAX_REMEMBERED_ATTACHMENTS: usize = 64;
 /// A session is named automatically only once its transcript is this long.
@@ -487,7 +488,7 @@ pub(crate) struct JobProgress {
 pub(crate) async fn consume_assistant_events(
     events: &mut broadcast::Receiver<SidecarEvent>,
     request_id: Uuid,
-    deadline: Instant,
+    mut deadline: Instant,
     cancel: &mut watch::Receiver<bool>,
     mut emit: impl FnMut(&JobProgress),
 ) -> (JobProgress, Result<Value, AssistantError>) {
@@ -495,6 +496,7 @@ pub(crate) async fn consume_assistant_events(
     let mut last_emit: Option<Instant> = None;
     let mut pending = false;
     let mut cancel_open = true;
+    let mut visual_job = false;
     loop {
         if *cancel.borrow() {
             return (progress, Err(AssistantError::cancelled()));
@@ -525,6 +527,8 @@ pub(crate) async fn consume_assistant_events(
                 Ok(SidecarEvent::AssistantProgress { request_id: id, stage, detail })
                     if id == request_id =>
                 {
+                    visual_job |= stage == "visual_reading";
+                    if visual_job { deadline = Instant::now() + Duration::from_secs(900); }
                     progress.prepend_next = detail["placement"] == "prepend";
                     progress.stage = Some(stage);
                     progress.progress = (!detail.is_null()).then_some(detail);
@@ -1346,6 +1350,7 @@ pub async fn create_session_notes(
     state: State<'_, RuntimeState>,
     session_id: String,
     attachment_ids: Vec<String>,
+    visual_upload_allowed: Option<bool>,
 ) -> Result<Value, String> {
     let session_id = parse_session_id(&session_id)?;
     let llm = gate(&readiness(&state)?, true)?;
@@ -1368,7 +1373,8 @@ pub async fn create_session_notes(
     let glossary = state.preferences()?.session.glossary;
     let payload = json!({
         "llm": llm.payload(),
-        "consent": {"transcript_upload_allowed": true},
+        "consent": {"transcript_upload_allowed": true, "visual_upload_allowed": visual_upload_allowed == Some(true)},
+        "visual_mode": visual_upload_allowed == Some(true),
         "output_language": language,
         "session": session_payload(&detail),
         "glossary": glossary,
@@ -1390,11 +1396,44 @@ pub async fn create_session_notes(
             registry: &state.assistant,
             job_id,
         };
-        let (progress, outcome) =
+        let save_cancel = cancel.clone();
+        let (progress, mut outcome) =
             dispatch(&job_app, job_id, AssistantTask::Notes, payload, cancel).await;
+        if *save_cancel.borrow() { outcome = Err(AssistantError::cancelled()); }
         let stored = match outcome {
-            Ok(result) => match state.store() {
-                Ok(store) => store_notes_result(store, session_id, &language, &llm, &result).await,
+            Ok(mut result) => match state.store() {
+                Ok(store) => {
+                    let root = job_app
+                        .path()
+                        .app_local_data_dir()
+                        .map(|p| p.join("note-assets"))
+                        .map_err(AssistantError::storage);
+                    match root {
+                        Ok(root) => {
+                            let outcome = if visual_upload_allowed == Some(true)
+                                && result["vision_version"] != 1
+                            {
+                                Err(AssistantError::new(
+                                    "vision_unavailable",
+                                    "Update the inference sidecar before visual reading",
+                                ))
+                            } else {
+                                match publish_assets(&root, session_id, &mut result) {
+                                    Ok(()) => {
+                                        store_notes_result(
+                                            store, session_id, &language, &llm, &result,
+                                        )
+                                        .await
+                                    }
+                                    Err(error) => Err(error),
+                                }
+                            };
+                            let _ = collect_assets(&root, store, Some(session_id)).await;
+                            outcome
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
                 Err(error) => Err(AssistantError::storage(error)),
             },
             Err(error) => Err(error),
@@ -2463,4 +2502,252 @@ mod tests {
         assert_eq!(value["error"], json!({"code": "timeout", "message": "slow"}));
         assert!(value["session_id"].is_null());
     }
+    #[tokio::test]
+    async fn note_figures_persist_export_and_collect_by_session() {
+        let (directory, store, session) = store_with_session("Lecture").await;
+        let root = directory.path().join("assets");
+        let asset = Uuid::new_v4();
+        let mut result = json!({
+            "markdown": format!("# Notes\n![diagram](echolingo-asset:{asset})"),
+            "attachments": [{"id":"a", "name":"slides.pdf"}],
+            "assets": [{"id":asset, "attachment_id":"a", "name":"slides.pdf", "page":2,
+                        "data":"data:image/jpeg;base64,/9j/"}]
+        });
+        publish_assets(&root, session, &mut result).unwrap();
+        assert!(result.get("assets").is_none());
+        assert!(result["attachments"][0]["figures"][0].get("data").is_none());
+        let stored = store_notes_result(&store, session, "en", &qwen(), &result)
+            .await
+            .unwrap();
+        assert_eq!(figure_ids(&stored.notes), vec![asset.to_string()]);
+        collect_assets(&root, &store, Some(session)).await.unwrap();
+        assert!(root
+            .join(session.to_string())
+            .join(format!("{asset}.jpg"))
+            .is_file());
+        let mut markdown = stored.notes.markdown.clone();
+        export_assets(
+            &root,
+            &store,
+            session,
+            &directory.path().join("notes with spaces.md"),
+            &mut markdown,
+        )
+        .await
+        .unwrap();
+        assert!(markdown.contains("notes%20with%20spaces_assets_"));
+        assert!(!markdown.contains("echolingo-asset:"));
+        // Another in-flight session's files are untouched by scoped cleanup.
+        let other = root.join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("pending.jpg"), b"pending").unwrap();
+        store.delete(session).await.unwrap();
+        collect_assets(&root, &store, Some(session)).await.unwrap();
+        assert!(!root.join(session.to_string()).exists());
+        assert!(other.join("pending.jpg").exists());
+        collect_assets(&root, &store, None).await.unwrap();
+        assert!(!other.exists());
+    }
+
+    #[test]
+    fn note_figures_reject_model_supplied_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut result =
+            json!({"assets":[{"id":"../../escape", "data":"data:image/jpeg;base64,/9j/"}]});
+        assert!(publish_assets(directory.path(), Uuid::new_v4(), &mut result).is_err());
+    }
+}
+
+/// Persist only opaque UUID-named JPEGs; model-supplied paths are never used.
+fn publish_assets(root: &Path, session: Uuid, result: &mut Value) -> Result<(), AssistantError> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let assets = result["assets"].as_array().cloned().unwrap_or_default();
+    if assets.len() > 32 {
+        return Err(AssistantError::new("asset_error", "Too many figures"));
+    }
+    let directory = root.join(session.to_string());
+    std::fs::create_dir_all(&directory).map_err(AssistantError::storage)?;
+    let mut reports = Vec::new();
+    let mut total = 0;
+    for mut asset in assets {
+        let id = parse_session_id(asset["id"].as_str().unwrap_or(""))
+            .map_err(AssistantError::storage)?;
+        let data = asset["data"]
+            .as_str()
+            .and_then(|s| s.strip_prefix("data:image/jpeg;base64,"))
+            .ok_or_else(|| AssistantError::new("asset_error", "Invalid figure encoding"))?;
+        if data.len() > 6 * 1024 * 1024 {
+            return Err(AssistantError::new("asset_error", "Figure too large"));
+        }
+        let bytes = STANDARD.decode(data).map_err(AssistantError::storage)?;
+        total += bytes.len();
+        if total > 16 * 1024 * 1024 || !bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+            return Err(AssistantError::new(
+                "asset_error",
+                "Invalid figure or figure budget exceeded",
+            ));
+        }
+        let path = directory.join(format!("{id}.jpg"));
+        // Never overwrite an asset that may belong to an earlier generation.
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(AssistantError::storage)?;
+        file.write_all(&bytes).map_err(AssistantError::storage)?;
+        asset.as_object_mut().unwrap().remove("data");
+        reports.push(asset);
+    }
+    if let Some(attachments) = result["attachments"].as_array_mut() {
+        for attachment in attachments {
+            attachment["figures"] = json!(reports
+                .iter()
+                .filter(|r| r["attachment_id"] == attachment["id"])
+                .collect::<Vec<_>>());
+        }
+    }
+    result.as_object_mut().unwrap().remove("assets");
+    Ok(())
+}
+
+fn figure_ids(notes: &SessionNotes) -> Vec<String> {
+    notes
+        .attachments
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|a| a["figures"].as_array().into_iter().flatten())
+        .filter_map(|f| f["id"].as_str())
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .map(|id| id.to_string())
+        .collect()
+}
+
+/// Also runs on startup, recovering files left between filesystem and DB commit.
+pub(crate) async fn collect_assets(
+    root: &Path,
+    store: &TranscriptStore,
+    scope: Option<Uuid>,
+) -> Result<(), String> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(root).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let Ok(id) = entry.file_name().to_string_lossy().parse::<Uuid>() else {
+            continue;
+        };
+        if scope.is_some_and(|scope| scope != id) {
+            continue;
+        }
+        let keep = store
+            .notes(id)
+            .await
+            .map_err(|e| e.to_string())?
+            .map(|n| figure_ids(&n))
+            .unwrap_or_default();
+        for file in std::fs::read_dir(entry.path()).map_err(|e| e.to_string())? {
+            let file = file.map_err(|e| e.to_string())?;
+            let name = file.file_name();
+            let stem = Path::new(&name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if !keep.iter().any(|id| id == stem) {
+                let _ = std::fs::remove_file(file.path());
+            }
+        }
+        let _ = std::fs::remove_dir(entry.path());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn read_note_asset(
+    app: AppHandle,
+    state: State<'_, RuntimeState>,
+    session_id: String,
+    asset_id: String,
+) -> Result<String, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let session = parse_session_id(&session_id)?;
+    let asset = parse_session_id(&asset_id)?.to_string();
+    let notes = state
+        .store()?
+        .notes(session)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("Notes unavailable")?;
+    if !figure_ids(&notes).contains(&asset) {
+        return Err("Figure does not belong to these notes".into());
+    }
+    let path = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("note-assets")
+        .join(session.to_string())
+        .join(format!("{asset}.jpg"));
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    Ok(format!("data:image/jpeg;base64,{}", STANDARD.encode(bytes)))
+}
+
+pub(crate) async fn export_assets(
+    root: &Path,
+    store: &TranscriptStore,
+    id: Uuid,
+    destination: &Path,
+    contents: &mut String,
+) -> Result<(), String> {
+    let Some(notes) = store.notes(id).await.map_err(|e| e.to_string())? else {
+        return Ok(());
+    };
+    let assets = figure_ids(&notes);
+    if assets.is_empty() {
+        return Ok(());
+    }
+    // Unique directory avoids overwriting unrelated export resources.
+    let folder = format!(
+        "{}_assets_{}",
+        destination
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("notes"),
+        Uuid::new_v4()
+    );
+    let directory = destination
+        .parent()
+        .ok_or("Invalid export directory")?
+        .join(&folder);
+    std::fs::create_dir(&directory).map_err(|e| e.to_string())?;
+    let outcome = (|| {
+        for asset in assets {
+            std::fs::copy(
+                root.join(id.to_string()).join(format!("{asset}.jpg")),
+                directory.join(format!("{asset}.jpg")),
+            )
+            .map_err(|e| e.to_string())?;
+            // Encode the directory name for Markdown destinations with spaces.
+            let relative = folder
+                .bytes()
+                .map(|b| {
+                    if b.is_ascii_alphanumeric() || b"-_.".contains(&b) {
+                        (b as char).to_string()
+                    } else {
+                        format!("%{b:02X}")
+                    }
+                })
+                .collect::<String>();
+            *contents = contents.replace(
+                &format!("echolingo-asset:{asset}"),
+                &format!("{relative}/{asset}.jpg"),
+            );
+        }
+        Ok(())
+    })();
+    if outcome.is_err() {
+        let _ = std::fs::remove_dir_all(directory);
+    }
+    outcome
 }

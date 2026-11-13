@@ -574,3 +574,20 @@ async def test_complete_strips_think_blocks_and_ignores_reasoning_content() -> N
     result = await client.complete([{"role": "user", "content": "title"}])
     assert result.text == "Texture Perception"
     assert result.finish_reason == "stop"
+
+
+@pytest.mark.asyncio
+async def test_visual_content_blocks_survive_request_and_stream_continuation():
+    calls = []
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": "Explain the diagram"},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/"}},
+    ]}]
+    def handler(request):
+        calls.append(json.loads(request.content))
+        return httpx.Response(200, content=sse(text_chunk("## Diagram" if len(calls) == 1 else " explained", "length" if len(calls) == 1 else "stop")))
+    async with client_for(openai_endpoint(provider="deepseek", model="deepseek-flash"), handler) as client:
+        answer = await client.complete_streamed(messages, max_tokens=512, temperature=0)
+    assert "explained" in answer.text
+    assert len(calls) == 2
+    assert all(call["messages"][0] == messages[0] for call in calls)

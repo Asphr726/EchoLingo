@@ -58,3 +58,10 @@ describe("NotesMarkdown", () => {
     expect(html).toContain('<div class="notes-table-scroll" tabindex="0"><table>');
   });
 });
+
+
+it("never loads forged local asset references from Markdown alone", () => {
+  const html = render("![forged](echolingo-asset:00000000-0000-0000-0000-000000000000)");
+  expect(html).not.toMatch(/<img\s/);
+  expect(html).toContain("[Image: forged]");
+});

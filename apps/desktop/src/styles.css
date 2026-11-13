@@ -860,3 +860,10 @@ button.time-chip:active { transform: scale(.97); }
 .lecture-context-notice ul { margin: 4px 0 0; padding-left: 16px; color: #7a5f26; }
 .lecture-context-privacy { display: flex; gap: 7px; margin: 0; color: #60675f; font-size: 10.5px; line-height: 1.5; }
 .lecture-context-privacy svg { flex: none; margin-top: 2px; }
+
+.note-figure { display: block; margin: 16px 0; }
+.note-figure-button { display: block; padding: 0; border: 1px solid var(--line); background: white; cursor: zoom-in; max-width: 100%; }
+.note-figure img { display: block; max-width: 100%; height: auto; }
+.note-figure-dialog { max-width: 95vw; max-height: 95vh; border: 1px solid var(--line); border-radius: 8px; }
+.note-figure-dialog img { max-height: 85vh; object-fit: contain; }
+.note-figure-dialog::backdrop { background: #0008; }
