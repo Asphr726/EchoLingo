@@ -26,6 +26,8 @@ Executed validation:
   image export, scoped garbage collection and model-supplied path rejection.
 - PENDING LIVE VISUAL VALIDATION — actual DeepSeek course-material accuracy,
   handwriting interpretation, crop completeness and insertion placement.
-- PENDING PACKAGED VALIDATION — rebuild and smoke-test the self-contained
-  sidecar with PDFium/Pillow and verify embedded notices. No new installer or
-  release was built or distributed for this change.
+- PASS PACKAGED RUNTIME VALIDATION — the 0.4.0 macOS/Windows/Linux installers
+  and Windows/Linux GPU packs passed frozen-runtime and installation smoke
+  tests, including PDFium rendering and Pillow crop/JPEG encoding. Packaging
+  collects dependency metadata/notices. See [publication and cleanup record](releases/v0.4.0.md).
+  Real DeepSeek visual accuracy remains pending above.
