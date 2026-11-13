@@ -59,6 +59,9 @@ explicit signature.
   tests/test_assistant_service.py`: **115 passed**.
 - PASS after fix — `conda run -n echolingo-spike1 pytest -q`: **815 passed,
   3 skipped** (the existing optional VAD asset and opt-in real model gates).
-- PENDING — a new packaged release containing this fix and real DeepSeek
-  course-material quality validation. Existing 0.4.0 installations still
-  contain the defect; retrying or changing visual models does not resolve it.
+- PASS PACKAGED REGRESSION — [0.4.1 is published](releases/v0.4.1.md) with the
+  fix and an offline packaged `visual_requests` self-test that executes the
+  real client's capability probe, PDF page reading and crop verification.
+  All three platform builds and both GPU packs passed. Existing 0.4.0
+  installations still contain the defect; update to 0.4.1 before retrying.
+  Real DeepSeek course-material quality validation remains pending.
