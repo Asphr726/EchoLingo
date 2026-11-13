@@ -130,6 +130,57 @@ def check_visual_materials() -> str:
     return "PDFium render + Pillow crop/JPEG round trip"
 
 
+def check_visual_requests() -> str:
+    """Exercise packaged visual callers with the real client, without network."""
+    import tempfile
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    import httpx
+    import pypdf
+
+    from ..assistant.llm import ChatClient, LlmEndpoint
+    from ..assistant.vision import VisualMaterials
+
+    calls = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("thinking") != {"type": "disabled"}:
+            raise RuntimeError("visual request did not disable thinking")
+        prompt = body["messages"][0]["content"][0]["text"]
+        calls.append(prompt)
+        if prompt.startswith("Name the color"):
+            text = "red"
+        elif prompt.startswith("Reference data: first image"):
+            text = "YES"
+        else:
+            text = json.dumps({"pages": [{"page": 1, "description": "Test diagram",
+                "figures": [{"box": [.2, .2, .8, .8], "caption": "Test figure"}]}]})
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": text}, "finish_reason": "stop"}]})
+
+    async def read(path: Path) -> None:
+        # An unknown model forces the capability probe as well as page/crop calls.
+        endpoint = LlmEndpoint("deepseek", "Self-test", "https://example.invalid",
+                               "self-test-vision", "synthetic-test-key")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+            visual = VisualMaterials()
+            docs = await visual.read(ChatClient(endpoint, client=http),
+                [{"id": "self-test", "name": path.name, "path": str(path)}],
+                SimpleNamespace(progress=lambda *_args: None), {})
+            if len(calls) != 3 or docs[0].visual_pages != 1 or len(visual.figures) != 1:
+                raise RuntimeError("visual probe/page/crop request round trip failed")
+
+    with tempfile.TemporaryDirectory(prefix="echolingo-visual-self-test-") as directory:
+        path = Path(directory) / "synthetic.pdf"
+        writer = pypdf.PdfWriter()
+        writer.add_blank_page(width=72, height=72)
+        writer.write(path)
+        asyncio.run(read(path))
+    return "offline real ChatClient: visual probe + PDF page + crop check"
+
+
 def check_httpx() -> str:
     import httpx
 
@@ -264,6 +315,7 @@ def default_checks() -> dict[str, Check]:
         "pywebrtc_audio": check_pywebrtc_audio,
         "pypdf": check_pypdf,
         "visual_materials": check_visual_materials,
+        "visual_requests": check_visual_requests,
         "httpx": check_httpx,
         "websockets": check_websockets,
         "ssl": check_ssl,

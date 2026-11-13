@@ -104,7 +104,7 @@ def test_self_test_prints_one_json_object_and_exits_zero_when_all_checks_pass(
         "ok", "version", "platform", "frozen", "utf8_mode", "ssl_ca_certs", "checks", "cuda"
     }
     assert report["ok"] is True
-    assert report["version"] == __version__ == "0.4.0"
+    assert report["version"] == __version__ == "0.4.1"
     assert report["frozen"] is False
     assert isinstance(report["utf8_mode"], bool)
     assert isinstance(report["ssl_ca_certs"], int)
@@ -398,3 +398,8 @@ def test_entrypoint_switches_standard_streams_to_utf8(monkeypatch) -> None:
 
 def test_visual_materials_render_crop_and_jpeg_round_trip():
     assert 'PDFium render' in self_test.check_visual_materials()
+
+
+def test_visual_requests_use_real_client_without_network():
+    assert self_test.default_checks()['visual_requests'] is self_test.check_visual_requests
+    assert 'visual probe + PDF page + crop check' in self_test.check_visual_requests()
