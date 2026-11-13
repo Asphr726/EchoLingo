@@ -721,3 +721,10 @@ def test_sidecar_build_bundles_qwen_asr_package_data(tmp_path) -> None:
     build = load_script("build_sidecar")
     command = build.pyinstaller_command(ROOT, tmp_path, "onedir", tmp_path / "v", "/site/nagisa")
     assert command[command.index("--collect-data") + 1] == "qwen_asr"
+
+
+def test_sidecar_explicitly_includes_nagisa_six_runtime(tmp_path):
+    build = load_script("build_sidecar")
+    command = build.pyinstaller_command(ROOT, tmp_path, "onedir", tmp_path / "vad.onnx", "/nagisa")
+    imports = [command[i + 1] for i, value in enumerate(command[:-1]) if value == "--hidden-import"]
+    assert "six" in imports

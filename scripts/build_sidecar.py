@@ -132,6 +132,10 @@ def pyinstaller_command(
         "echolingo.backends",
         # The AI assistant (notes/titles) and pypdf's lazily imported filters
         # and crypto providers.
+        # nagisa/DyNet import six dynamically; do not rely on unrelated
+        # transitive imports to pull it into a frozen build.
+        "--hidden-import",
+        "six",
         "--collect-submodules",
         "echolingo.assistant",
         "--collect-submodules",
