@@ -103,7 +103,7 @@ async def ensure_vision(client, usage):
     try:
         reply = await client.complete([{"role": "user", "content": [
             {"type": "text", "text": "Name the color of the rectangle. Answer one English word."},
-            {"type": "image_url", "image_url": {"url": encoded(image)}}]}], max_tokens=128, temperature=0, disable_thinking=True)
+            {"type": "image_url", "image_url": {"url": encoded(image)}}]}], max_tokens=128, temperature=0)
         add_usage(usage, reply.usage)
         if "red" not in reply.text.lower():
             raise ValueError("Image probe did not identify the color")
@@ -138,7 +138,8 @@ class VisualMaterials:
                                         {"type": "image_url", "image_url": {"url": encoded(image)}}])
                     # Invalid structured output is retried once, without dropping images.
                     for attempt in range(2):
-                        answer = await client.complete([{"role": "user", "content": content}], max_tokens=8192, temperature=0, disable_thinking=True)
+                        # complete() already disables thinking for every request.
+                        answer = await client.complete([{"role": "user", "content": content}], max_tokens=8192, temperature=0)
                         add_usage(usage, answer.usage)
                         try:
                             pages = json_object(answer.text)["pages"]
@@ -172,7 +173,7 @@ class VisualMaterials:
                             check = await client.complete([{"role": "user", "content": [
                                 {"type": "text", "text": "Reference data: first image is the page, second is a crop. Does the crop preserve the complete diagram and its labels? Reply YES or NO only."},
                                 {"type": "image_url", "image_url": {"url": encoded(image)}},
-                                {"type": "image_url", "image_url": {"url": encoded(crop)}}]}], max_tokens=128, temperature=0, disable_thinking=True)
+                                {"type": "image_url", "image_url": {"url": encoded(crop)}}]}], max_tokens=128, temperature=0)
                             add_usage(usage, check.usage)
                             if check.text.strip().upper() != "YES":
                                 crop, box = image, [0, 0, 1, 1]

@@ -31,3 +31,34 @@ Executed validation:
   tests, including PDFium rendering and Pillow crop/JPEG encoding. Packaging
   collects dependency metadata/notices. See [publication and cleanup record](releases/v0.4.0.md).
   Real DeepSeek visual accuracy remains pending above.
+
+## Post-release visual request regression
+
+The published 0.4.0 build has a confirmed visual request integration defect:
+all three visual callers passed `disable_thinking` to `ChatClient.complete()`,
+which does not accept that keyword and already disables thinking internally.
+The page reader therefore raised `TypeError` before making any HTTP request,
+then surfaced the generic `visual_read_failed` message at page 1. The synthetic
+probe and crop check had the same invalid argument. The permissive fake client's
+`**kwargs` hid the mismatch in the original offline suite; packaged smoke tests
+covered rendering and encoding but did not call the visual reader.
+
+Removed the invalid argument at all three call sites. The regression now uses
+the production `ChatClient` with only HTTP transport mocked, real five-page PDF
+rendering, both the known Flash model and an unknown model's capability probe,
+and crop verification. It checks that the actual outgoing DeepSeek requests
+still disable thinking. The smaller fake now has the production method's
+explicit signature.
+
+- PASS before fix — deterministic reproduction produced the same page-1 error,
+  with `TypeError: ChatClient.complete() got an unexpected keyword argument
+  'disable_thinking'` as its cause and **zero HTTP requests**. New regressions
+  failed against the original implementation.
+- PASS after fix — `conda run -n echolingo-spike1 pytest -q
+  tests/test_assistant_vision.py tests/test_assistant_llm.py
+  tests/test_assistant_service.py`: **115 passed**.
+- PASS after fix — `conda run -n echolingo-spike1 pytest -q`: **815 passed,
+  3 skipped** (the existing optional VAD asset and opt-in real model gates).
+- PENDING — a new packaged release containing this fix and real DeepSeek
+  course-material quality validation. Existing 0.4.0 installations still
+  contain the defect; retrying or changing visual models does not resolve it.

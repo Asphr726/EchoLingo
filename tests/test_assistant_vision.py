@@ -3,12 +3,13 @@ import io
 import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from PIL import Image
 from pypdf import PdfWriter
 
 from echolingo.assistant.vision import VisualMaterials, encoded, valid_box, render_batch, ensure_vision
-from echolingo.assistant.llm import AssistantError, ChatResult
+from echolingo.assistant.llm import AssistantError, ChatClient, ChatResult, LlmEndpoint
 from echolingo.assistant.prompts import MaterialText
 
 
@@ -20,7 +21,7 @@ class Client:
         self.answers = iter(answers)
         self.calls = []
 
-    async def complete(self, messages, **kwargs):
+    async def complete(self, messages, *, model=None, max_tokens=1024, temperature=0.2):
         self.calls.append(messages)
         return ChatResult(next(self.answers), 'stop', {'prompt_tokens': 10}, 0)
 
@@ -31,6 +32,59 @@ class Events:
 
     def progress(self, stage, detail):
         self.stages.append((stage, detail))
+
+
+@pytest.mark.parametrize('model', ['deepseek-flash', 'custom-vision-model'])
+async def test_real_chat_client_reads_pdf_batches_and_checks_crops(tmp_path, model):
+    """Keep the production client at the visual caller seam; no permissive fake.
+
+    The unknown model also exercises the synthetic capability probe. Only the
+    HTTP transport is mocked, so request argument mismatches cannot be hidden.
+    """
+    path = tmp_path / 'slides.pdf'
+    writer = PdfWriter()
+    for _ in range(5):
+        writer.add_blank_page(width=200, height=100)
+    writer.write(path)
+    requests = []
+
+    def respond(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        assert body['thinking'] == {'type': 'disabled'}
+        assert body['stream'] is False
+        content = body['messages'][0]['content']
+        if content[0]['text'].startswith('Name the color'):
+            text = 'red'
+        elif content[0]['text'].startswith('Reference data: first image'):
+            assert sum(block['type'] == 'image_url' for block in content) == 2
+            text = 'YES'
+        else:
+            numbers = [int(block['text'].splitlines()[0].split()[1])
+                       for block in content[1:] if block['type'] == 'text']
+            assert sum(block['type'] == 'image_url' for block in content) == len(numbers)
+            text = json.dumps({'pages': [
+                {'page': n, 'description': f'Model diagram on page {n}',
+                 'figures': [{'box': [.2, .2, .8, .8], 'caption': 'Model'}] if n == 1 else []}
+                for n in numbers]})
+        return httpx.Response(200, json={
+            'choices': [{'message': {'content': text}, 'finish_reason': 'stop'}],
+            'usage': {'prompt_tokens': 10},
+        })
+
+    endpoint = LlmEndpoint('deepseek', 'DeepSeek', 'https://api.deepseek.com', model, 'test-key')
+    usage = {}
+    visual = VisualMaterials()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        client = ChatClient(endpoint, client=http)
+        docs = await visual.read(
+            client, [{'id': 'a', 'name': path.name, 'path': str(path)}], Events(), usage)
+    assert len(requests) == (3 if model == 'deepseek-flash' else 4)
+    assert usage['prompt_tokens'] == len(requests) * 10
+    assert docs[0].visual_pages == 5
+    assert [segment.number for segment in docs[0].segments] == [1, 2, 3, 4, 5]
+    assert len(visual.figures) == 1
+    assert visual.figures[0]['box'] == pytest.approx([.18, .18, .82, .82])
 
 
 def test_pdf_batches_include_blank_scanned_pages_and_rotation(tmp_path):
