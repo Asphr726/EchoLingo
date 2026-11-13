@@ -5,12 +5,12 @@
 EchoLingo is a real-time lecture interpreter. It turns what the lecturer says into side-by-side captions in the original language and your language, sentence by sentence, and after class an AI model of your choice can turn the transcript into study notes. By default, all recognition and translation run on your own computer. It runs on the Mac, Windows and Linux.
 
 [![Platform](https://img.shields.io/badge/platform-macOS%2014%2B%20%C2%B7%20Windows%20%C2%B7%20Linux-lightgrey)](#requirements)
-[![Version](https://img.shields.io/badge/version-0.3.1%20Beta-orange)](https://github.com/Asphr726/EchoLingo/releases)
+[![Version](https://img.shields.io/badge/version-0.4.0%20Beta-orange)](https://github.com/Asphr726/EchoLingo/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 ![EchoLingo live bilingual captions](docs/screenshots/live.png)
 
-> **v0.3.1 Beta**: for Apple Silicon Macs running macOS 14 or later, Windows 10 / 11 (x64) and Linux (Ubuntu 22.04+ / Debian 12+, x64); to install on Windows or Linux, see [Windows / Linux](#windows--linux). The app's interface is in English.
+> **v0.4.0 Beta**: for Apple Silicon Macs running macOS 14 or later, Windows 10 / 11 (x64) and Linux (Ubuntu 22.04+ / Debian 12+, x64); to install on Windows or Linux, see [Windows / Linux](#windows--linux). The app's interface is in English.
 
 [Highlights](#highlights) · [Requirements](#requirements) · [Install](#install) · [Windows / Linux](#windows--linux) · [Quick start](#quick-start) · [Guide](#guide) · [Privacy](#privacy) · [FAQ](#faq) · [Roadmap](#roadmap) · [Build from source](#build-from-source) · [License and acknowledgements](#license-and-acknowledgements)
 
@@ -46,7 +46,7 @@ On Windows and Linux, recognition and translation run on the CPU unless the GPU 
 
 The steps below are for macOS. For Windows and Linux, see [Windows / Linux](#windows--linux).
 
-1. Download `EchoLingo_0.3.1_aarch64.dmg` from [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases).
+1. Download `EchoLingo_0.4.0_aarch64.dmg` from [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases).
 2. Open the dmg and drag **EchoLingo** into the Applications folder.
 3. Open it for the first time. The Beta is not notarized by Apple yet, so macOS blocks it at first:
    - **macOS 14**: in Applications, Control-click (or right-click) EchoLingo, choose **Open**, then choose **Open** again in the dialog.
@@ -77,13 +77,13 @@ The app and its settings work as described in the rest of this guide unless note
 
 **Windows 10 / 11 (x64)**
 
-1. Download and run `EchoLingo_0.3.1_x64-setup.exe` from [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases). It installs for your user account only and needs no administrator rights; if the Microsoft Edge WebView2 runtime is missing, the installer adds it.
+1. Download and run `EchoLingo_0.4.0_x64-setup.exe` from [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases). It installs for your user account only and needs no administrator rights; if the Microsoft Edge WebView2 runtime is missing, the installer adds it.
 2. The installer is not code-signed yet, so Windows SmartScreen may say "Windows protected your PC". Click **More info**, then **Run anyway**.
 3. Open EchoLingo from the Start menu and download the local models in **Settings → Models**, as in step 4 of [Install](#install).
 
 **Linux (Ubuntu 22.04+ / Debian 12+, x64)**
 
-1. Download `EchoLingo_0.3.1_amd64.deb` from [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases) and, in the folder you downloaded it to, install it with `sudo apt install ./EchoLingo_0.3.1_amd64.deb`. Only a .deb package is available for now; an AppImage is on the roadmap.
+1. Download `EchoLingo_0.4.0_amd64.deb` from [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases) and, in the folder you downloaded it to, install it with `sudo apt install ./EchoLingo_0.4.0_amd64.deb`. Only a .deb package is available for now; an AppImage is on the roadmap.
 2. Open EchoLingo from the application menu, or run `echolingo-desktop` in a terminal, and download the local models in **Settings → Models** in the same way.
 
 **NVIDIA GPU acceleration pack (optional).** Without it, recognition and translation run on the CPU, and slower processors may fall behind the lecture: on an i7-13700H laptop, Qwen3-ASR on the CPU took 2.07 times as long as an 11-second clip to transcribe it. With the pack on the same computer (RTX 4060 Laptop), live recognition lagged 0.1–0.2 s at the median and about 2 s at most, and Hy-MT translated about 135 tokens per second on Vulkan.
@@ -344,7 +344,7 @@ npm run desktop:build                            # Windows and Linux: installer 
 APPLE_SIGNING_IDENTITY=- npm run desktop:build   # macOS: local ad-hoc signed build
 ```
 
-The build ends up in `target/release/bundle/`: `dmg/EchoLingo_0.3.1_aarch64.dmg` on macOS, `nsis/EchoLingo_0.3.1_x64-setup.exe` on Windows, and `deb/EchoLingo_0.3.1_amd64.deb` on Linux. `APPLE_SIGNING_IDENTITY=-` produces an ad-hoc signature that is only suitable for your own Mac; public distribution needs a Developer ID certificate and Apple notarization.
+The build ends up in `target/release/bundle/`: `dmg/EchoLingo_0.4.0_aarch64.dmg` on macOS, `nsis/EchoLingo_0.4.0_x64-setup.exe` on Windows, and `deb/EchoLingo_0.4.0_amd64.deb` on Linux. `APPLE_SIGNING_IDENTITY=-` produces an ad-hoc signature that is only suitable for your own Mac; public distribution needs a Developer ID certificate and Apple notarization.
 
 Run the tests:
 

@@ -5,12 +5,12 @@
 EchoLingo 是一款面向课堂的实时同声字幕工具：把老师的讲课声音实时转成原文与译文逐句对照的双语字幕，下课后还可以用你自己选择的 AI 模型把转录整理成学习笔记。默认所有识别和翻译都在你自己的电脑上完成。支持 Mac、Windows 和 Linux。
 
 [![Platform](https://img.shields.io/badge/platform-macOS%2014%2B%20%C2%B7%20Windows%20%C2%B7%20Linux-lightgrey)](#系统要求)
-[![Version](https://img.shields.io/badge/version-0.3.1%20Beta-orange)](https://github.com/Asphr726/EchoLingo/releases)
+[![Version](https://img.shields.io/badge/version-0.4.0%20Beta-orange)](https://github.com/Asphr726/EchoLingo/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 ![EchoLingo 实时双语字幕](docs/screenshots/live.png)
 
-> **v0.3.1 Beta**：支持 Apple Silicon Mac（macOS 14 及以上）、Windows 10 / 11（x64）和 Linux（Ubuntu 22.04+ / Debian 12+，x64），Windows 和 Linux 的安装方法见 [Windows / Linux](#windows--linux)。应用界面暂时只有英文，下文中的按钮和菜单名称都按界面上的英文原样写出。
+> **v0.4.0 Beta**：支持 Apple Silicon Mac（macOS 14 及以上）、Windows 10 / 11（x64）和 Linux（Ubuntu 22.04+ / Debian 12+，x64），Windows 和 Linux 的安装方法见 [Windows / Linux](#windows--linux)。应用界面暂时只有英文，下文中的按钮和菜单名称都按界面上的英文原样写出。
 
 [特色](#特色) · [系统要求](#系统要求) · [安装](#安装) · [Windows / Linux](#windows--linux) · [快速上手](#快速上手) · [使用指南](#使用指南) · [隐私](#隐私) · [常见问题](#常见问题) · [路线图](#路线图) · [从源码构建](#从源码构建) · [许可与致谢](#许可与致谢)
 
@@ -46,7 +46,7 @@ EchoLingo 是一款面向课堂的实时同声字幕工具：把老师的讲课�
 
 以下是 macOS 的安装步骤。Windows 和 Linux 请看 [Windows / Linux](#windows--linux)。
 
-1. 从 [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases) 下载 `EchoLingo_0.3.1_aarch64.dmg`。
+1. 从 [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases) 下载 `EchoLingo_0.4.0_aarch64.dmg`。
 2. 打开 dmg，把 **EchoLingo** 拖进“应用程序”文件夹。
 3. 第一次打开。Beta 版还没有经过 Apple 公证，macOS 会拦截它：
    - **macOS 14**：在“应用程序”里按住 Control 点按（或右键点按）EchoLingo，选择“打开”，再在弹出的对话框里点“打开”。
@@ -77,13 +77,13 @@ EchoLingo 是一款面向课堂的实时同声字幕工具：把老师的讲课�
 
 **Windows 10 / 11（x64）**
 
-1. 从 [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases) 下载并运行 `EchoLingo_0.3.1_x64-setup.exe`。安装程序只为当前用户安装，不需要管理员权限；如果电脑上缺少 Microsoft Edge WebView2 运行时，安装程序会自动安装。
+1. 从 [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases) 下载并运行 `EchoLingo_0.4.0_x64-setup.exe`。安装程序只为当前用户安装，不需要管理员权限；如果电脑上缺少 Microsoft Edge WebView2 运行时，安装程序会自动安装。
 2. 安装程序还没有代码签名，Windows SmartScreen 可能提示“Windows 已保护你的电脑”。点“更多信息”，再点“仍要运行”。
 3. 从“开始”菜单打开 EchoLingo，按照[安装](#安装)第 4 步在 **Settings → Models** 下载本地模型。
 
 **Linux（Ubuntu 22.04+ / Debian 12+，x64）**
 
-1. 从 [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases) 下载 `EchoLingo_0.3.1_amd64.deb`，在下载目录里运行 `sudo apt install ./EchoLingo_0.3.1_amd64.deb` 安装。目前只提供 .deb 包，AppImage 在路线图中。
+1. 从 [GitHub Releases](https://github.com/Asphr726/EchoLingo/releases) 下载 `EchoLingo_0.4.0_amd64.deb`，在下载目录里运行 `sudo apt install ./EchoLingo_0.4.0_amd64.deb` 安装。目前只提供 .deb 包，AppImage 在路线图中。
 2. 从应用菜单打开 EchoLingo，或在终端运行 `echolingo-desktop`，同样在 **Settings → Models** 下载本地模型。
 
 **NVIDIA GPU 加速包（可选）**。不安装时，识别和翻译都在 CPU 上运行，较慢的处理器可能跟不上讲课：在一台 i7-13700H 笔记本上，Qwen3-ASR 用 CPU 处理一段 11 秒的录音需要 2.07 倍的时长。同一台电脑用加速包（RTX 4060 Laptop）运行时，实时识别的延迟中位数为 0.1–0.2 秒、最长约 2 秒，Hy-MT 在 Vulkan 上每秒翻译约 135 个 token。
@@ -344,7 +344,7 @@ npm run desktop:build                            # Windows 和 Linux：生成安
 APPLE_SIGNING_IDENTITY=- npm run desktop:build   # macOS：本机自签名构建
 ```
 
-构建产物位于 `target/release/bundle/`：macOS 是 `dmg/EchoLingo_0.3.1_aarch64.dmg`，Windows 是 `nsis/EchoLingo_0.3.1_x64-setup.exe`，Linux 是 `deb/EchoLingo_0.3.1_amd64.deb`。`APPLE_SIGNING_IDENTITY=-` 生成的是只适合自己使用的临时签名；公开分发需要 Developer ID 证书和 Apple 公证。
+构建产物位于 `target/release/bundle/`：macOS 是 `dmg/EchoLingo_0.4.0_aarch64.dmg`，Windows 是 `nsis/EchoLingo_0.4.0_x64-setup.exe`，Linux 是 `deb/EchoLingo_0.4.0_amd64.deb`。`APPLE_SIGNING_IDENTITY=-` 生成的是只适合自己使用的临时签名；公开分发需要 Developer ID 证书和 Apple 公证。
 
 运行测试：
 

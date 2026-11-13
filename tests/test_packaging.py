@@ -366,7 +366,7 @@ def test_bundle_icons_exist() -> None:
 
 def test_desktop_versions_agree() -> None:
     version = _json(TAURI / "tauri.conf.json")["version"]
-    assert version == "0.3.1"
+    assert version == "0.4.0"
     assert _json(ROOT / "apps/desktop/package.json")["version"] == version
     lock = _json(ROOT / "package-lock.json")
     assert lock["packages"]["apps/desktop"]["version"] == version
@@ -544,31 +544,31 @@ def test_packaged_smoke_checks_the_linux_deb_signature(tmp_path, monkeypatch) ->
     monkeypatch.setattr(smoke, "subprocess", SimpleNamespace(run=completed))
     monkeypatch.setattr(smoke, "check_installed_tree", lambda *args: True)
     bundle = tmp_path / "bundle"
-    deb = bundle / "deb" / "EchoLingo_0.3.1_amd64.deb"
+    deb = bundle / "deb" / "EchoLingo_0.4.0_amd64.deb"
     deb.parent.mkdir(parents=True)
     deb.write_bytes(b"!<arch>\n")
 
     results = smoke.Results()
-    smoke.bundle_linux(bundle, "0.3.1", results, key_id, updater=False)
+    smoke.bundle_linux(bundle, "0.4.0", results, key_id, updater=False)
     assert results.failures == []
     results = smoke.Results()
-    smoke.bundle_linux(bundle, "0.3.1", results, key_id, updater=True)
+    smoke.bundle_linux(bundle, "0.4.0", results, key_id, updater=True)
     assert results.failures == [f"{deb.name}: no updater signature {deb.name}.sig"]
 
     signature = Path(f"{deb}.sig")
-    signature.write_text(_signature(key_id, "0.3.1"))
+    signature.write_text(_signature(key_id, "0.4.0"))
     results = smoke.Results()
-    smoke.bundle_linux(bundle, "0.3.1", results, key_id, updater=True)
+    smoke.bundle_linux(bundle, "0.4.0", results, key_id, updater=True)
     assert results.failures == []
-    assert f"- PASS {deb.name}.sig: signed by key 73D4256EED3D1630 for version 0.3.1" in results.lines
+    assert f"- PASS {deb.name}.sig: signed by key 73D4256EED3D1630 for version 0.4.0" in results.lines
     # A signature that is there is always checked.
     for text, message in (
-        (_signature(bytes(8), "0.3.1"), "signed by key 0000000000000000"),
-        (_signature(key_id, "0.3.0"), "signed for version 0.3.0, not 0.3.1"),
+        (_signature(bytes(8), "0.4.0"), "signed by key 0000000000000000"),
+        (_signature(key_id, "0.3.0"), "signed for version 0.3.0, not 0.4.0"),
     ):
         signature.write_text(text)
         results = smoke.Results()
-        smoke.bundle_linux(bundle, "0.3.1", results, key_id, updater=False)
+        smoke.bundle_linux(bundle, "0.4.0", results, key_id, updater=False)
         assert len(results.failures) == 1 and message in results.failures[0]
 
 
@@ -597,29 +597,29 @@ def test_packaged_smoke_checks_the_macos_updater_archive(tmp_path) -> None:
     assert any("codesign --verify --deep --strict" in line for line in results.lines)
 
     results = smoke.Results()
-    smoke.check_macos_updater(bundle, "0.3.1", key_id, results, required=True)
+    smoke.check_macos_updater(bundle, "0.4.0", key_id, results, required=True)
     assert results.failures == [
-        "EchoLingo_0.3.0_aarch64.app.tar.gz.sig was signed for version 0.3.0, not 0.3.1; "
+        "EchoLingo_0.3.0_aarch64.app.tar.gz.sig was signed for version 0.3.0, not 0.4.0; "
         "installed copies would reject this update",
-        "EchoLingo_0.3.0_aarch64.app.tar.gz: CFBundleShortVersionString '0.3.0' != '0.3.1'",
+        "EchoLingo_0.3.0_aarch64.app.tar.gz: CFBundleShortVersionString '0.3.0' != '0.4.0'",
     ]
 
     # Editing the signed bundle breaks its seal.
-    info["CFBundleShortVersionString"] = "0.3.1"
+    info["CFBundleShortVersionString"] = "0.4.0"
     with (app / "Contents/Info.plist").open("wb") as handle:
         plistlib.dump(info, handle)
     subprocess.run(["tar", "-czf", str(archive), "-C", str(app.parent), app.name], check=True)
-    Path(f"{archive}.sig").write_text(_signature(key_id, "0.3.1"))
+    Path(f"{archive}.sig").write_text(_signature(key_id, "0.4.0"))
     results = smoke.Results()
-    smoke.check_macos_updater(bundle, "0.3.1", key_id, results, required=True)
+    smoke.check_macos_updater(bundle, "0.4.0", key_id, results, required=True)
     assert len(results.failures) == 1 and "codesign" in results.failures[0]
 
     archive.unlink()
     results = smoke.Results()
-    smoke.check_macos_updater(bundle, "0.3.1", key_id, results, required=True)
+    smoke.check_macos_updater(bundle, "0.4.0", key_id, results, required=True)
     assert "no updater archive" in results.failures[0]
     results = smoke.Results()
-    smoke.check_macos_updater(bundle, "0.3.1", key_id, results, required=False)
+    smoke.check_macos_updater(bundle, "0.4.0", key_id, results, required=False)
     assert results.failures == []
 
 

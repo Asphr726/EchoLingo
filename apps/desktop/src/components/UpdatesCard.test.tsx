@@ -7,7 +7,7 @@ import { UpdatePill, UpdatesCard } from "./UpdatesCard";
 const now = Date.parse("2026-09-24T12:00:00Z");
 
 const idle: UpdateStatus = {
-  current_version: "0.3.1",
+  current_version: "0.4.0",
   state: "idle",
   available: null,
   last_checked_at: null,
@@ -59,7 +59,7 @@ function render(
 describe("UpdatesCard", () => {
   it("shows the version, the manual check and the launch preference before any check", () => {
     const html = render(idle, { checkAtLaunch: false });
-    expect(html).toContain("<strong>EchoLingo 0.3.1</strong>");
+    expect(html).toContain("<strong>EchoLingo 0.4.0</strong>");
     expect(html).toContain('<small role="status">Not checked yet</small>');
     expect(html).toMatch(/<button class="button" type="button">.*Check for updates<\/button>/);
     expect(html).toContain('<input type="checkbox"/><span>Check for updates when EchoLingo starts</span>');

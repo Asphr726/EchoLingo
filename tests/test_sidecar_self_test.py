@@ -104,7 +104,7 @@ def test_self_test_prints_one_json_object_and_exits_zero_when_all_checks_pass(
         "ok", "version", "platform", "frozen", "utf8_mode", "ssl_ca_certs", "checks", "cuda"
     }
     assert report["ok"] is True
-    assert report["version"] == __version__ == "0.3.1"
+    assert report["version"] == __version__ == "0.4.0"
     assert report["frozen"] is False
     assert isinstance(report["utf8_mode"], bool)
     assert isinstance(report["ssl_ca_certs"], int)
@@ -394,3 +394,7 @@ def test_entrypoint_switches_standard_streams_to_utf8(monkeypatch) -> None:
     print("講義 강의", file=stdout)
     stdout.flush()
     assert stdout.buffer.getvalue().decode("utf-8").strip() == "講義 강의"
+
+
+def test_visual_materials_render_crop_and_jpeg_round_trip():
+    assert 'PDFium render' in self_test.check_visual_materials()

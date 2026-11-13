@@ -246,7 +246,7 @@ const previewReleaseNotes = [
   "- History search matches titles written by the assistant.",
 ].join("\n");
 const previewUpdateIdle: UpdateStatus = {
-  current_version: "0.3.1",
+  current_version: "0.4.0",
   state: "idle",
   available: null,
   last_checked_at: null,

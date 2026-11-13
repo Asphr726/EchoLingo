@@ -101,6 +101,35 @@ def check_pypdf() -> str:
     return _version(pypdf)
 
 
+def check_visual_materials() -> str:
+    import io
+    import pypdf
+    import pypdfium2 as pdfium
+    from PIL import Image
+
+    writer = pypdf.PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    source = io.BytesIO()
+    writer.write(source)
+    with pdfium.PdfDocument(source.getvalue()) as document:
+        page = document[0]
+        try:
+            bitmap = page.render(scale=1)
+            try:
+                image = bitmap.to_pil().convert("RGB")
+            finally:
+                bitmap.close()
+        finally:
+            page.close()
+    encoded = io.BytesIO()
+    image.crop((0, 0, 36, 36)).save(encoded, format="JPEG")
+    with Image.open(io.BytesIO(encoded.getvalue())) as decoded:
+        decoded.load()
+        if decoded.size != (36, 36):
+            raise RuntimeError("visual material crop/encode round trip failed")
+    return "PDFium render + Pillow crop/JPEG round trip"
+
+
 def check_httpx() -> str:
     import httpx
 
@@ -234,6 +263,7 @@ def default_checks() -> dict[str, Check]:
         "samplerate": check_samplerate,
         "pywebrtc_audio": check_pywebrtc_audio,
         "pypdf": check_pypdf,
+        "visual_materials": check_visual_materials,
         "httpx": check_httpx,
         "websockets": check_websockets,
         "ssl": check_ssl,

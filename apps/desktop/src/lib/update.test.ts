@@ -12,7 +12,7 @@ import {
 } from "./update";
 
 const status: UpdateStatus = {
-  current_version: "0.3.1",
+  current_version: "0.4.0",
   state: "available",
   available: { version: "0.3.2", notes: null, date: null, release_url: "https://github.com/Asphr726/EchoLingo/releases/tag/v0.3.2" },
   last_checked_at: null,
